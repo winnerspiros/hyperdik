@@ -1077,10 +1077,50 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
         px_dec = max(0, int(5 - _log_price))
         sz = round_size(sz_dec, size_usd / px)
         
-        # Step 2: Pump/dump-aware entry — don't chase, wait for pullback
-        # Multi-timeframe check: if price already moved in our direction,
-        # either wait for a pullback (better entry) or block entirely (too late).
+        # Step 2: Tick-peak-aware entry — short at local peaks, buy at local bottoms
+        # Real price-action detection, not formula-based percentages
         _side_str = "BUY" if is_buy else "SELL"
+        
+        # ── TICK PEAK ENTRY: detect local tops/bottoms for better entries ──
+        _peak_entry = None
+        try:
+            _candles_1m = _fetch_candles_cached(coin, "1m", 120) or []
+            if _candles_1m:
+                _tick = detect_tick_peak(coin, px, _candles_1m)
+                if _tick and _tick.confidence >= 25:
+                    _match = (_tick.is_peak and not is_buy) or (not _tick.is_peak and is_buy)
+                    if _match and _tick.predicted_extreme > 0:
+                        _peak_extreme = float(_tick.predicted_extreme)
+                        _peak_dist = abs(px - _peak_extreme) / px * 100
+                        if _peak_dist > 0.1 and _peak_dist < 3.0:
+                            _peak_dir = "SHORT at peak" if not is_buy else "BUY at bottom"
+                            log.info(f"  📍 {coin}: TICK PEAK — {_peak_dir} conf={_tick.confidence}% "
+                                    f"extreme=${_peak_extreme:.4f} ({_peak_dist:.1f}% from mkt) "
+                                    f"action={_tick.action}")
+                            _peak_entry = _peak_extreme
+        except Exception as _tp_e:
+            log.debug(f"  tick_peak entry check: {type(_tp_e).__name__}")
+        
+        if _peak_entry:
+            # Use the detected peak/bottom as the entry limit — real price action
+            _limit_px = round_price(px_dec, _peak_entry, is_buy=is_buy)
+            log.info(f"  🎯 {coin}: peak-entry limit at ${_limit_px:.4f} — monitored, non-blocking")
+            result = hl.order(coin, is_buy, sz, _limit_px, order_type="gtc")
+            if isinstance(result, dict) and not result.get("status") == "err":
+                _oid = result.get("oid") or result.get("orderId") or 0 if isinstance(result, dict) else 0
+                if _oid:
+                    _PENDING_ZONE[coin.upper()] = {
+                        "oid": _oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
+                        "stop_price": stop_price, "tp_levels": tp_levels, "reason": reason,
+                        "leverage": leverage, "placed_at": time.time(),
+                        "timeout_s": 45, "label": "peak-entry",
+                    }
+                    return True
+            # Fallback to market if peak limit fails
+            result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
+            return bool(result and not (isinstance(result, dict) and result.get("status") == "err"))
+        
+        # Step 3: Pump/dump-aware entry — don't chase, wait for pullback
         _chase = _check_recent_move(coin, _side_str)
         
         if _chase["block"]:
@@ -1089,12 +1129,21 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
 
         # ── AI ENTRY ZONE: AI explicitly told us where to enter ──
         if entry_zone > 0 and not _chase["pullback"]:
-            # AI gave a price target — place limit, return immediately, monitor handles fill
-            # Cap zone distance at 2% from market — further than that gets rejected by exchange
+            # AI gave a price target — place limit in the FAVORABLE direction
+            # BUY: want lower price (buy dip) → zone should be ≤ market
+            # SHORT: want higher price (short pump) → zone should be ≥ market
             _zone_edge = abs(px - entry_zone) / px * 100
+            # Fix inverted zones: if SHORT zone is below market (or BUY zone above), flip it
+            if (not is_buy and entry_zone < px) or (is_buy and entry_zone > px):
+                _flip_dist = 0.02  # 2% in the favorable direction
+                _new_zone = px * (1 + _flip_dist) if not is_buy else px * (1 - _flip_dist)
+                log.info(f"  🔄 {coin}: AI zone=${entry_zone:.4f} is wrong direction for {'SHORT' if not is_buy else 'LONG'} — flipping to ${_new_zone:.4f}")
+                entry_zone = _new_zone
+                _zone_edge = _flip_dist * 100
+            # Cap zone distance at 2% from market — further gets rejected
             if _zone_edge > 2.0:
-                _adj_zone = px * (1 - 0.02) if is_buy else px * (1 + 0.02)
-                log.info(f"  🎯 {coin}: AI zone=${entry_zone:.6f} too far ({_zone_edge:.1f}%), capping at 2% → ${_adj_zone:.4f}")
+                _adj_zone = px * (1 + 0.02) if not is_buy else px * (1 - 0.02)
+                log.info(f"  🎯 {coin}: AI zone too far ({_zone_edge:.1f}%), capping at 2% → ${_adj_zone:.4f}")
                 entry_zone = _adj_zone
             _zone_limit = round_price(px_dec, entry_zone, is_buy=is_buy)
             log.info(f"  🎯 {coin}: AI zone=${entry_zone:.6f} ({_zone_edge:.1f}% from mkt ${px:.4f}) — limit order (non-blocking)")
