@@ -771,7 +771,14 @@ def _scan_batch(batch: list[dict], equity: float, market_context: str,
                recent_str: str, batch_id: int) -> list[dict]:
     """Scan one batch of candidates with AI — designed for ThreadPoolExecutor."""
     lines = []
+    vwap_ob_count = 0  # Count overbought (>+1%) coins for direction forcing
+    vwap_os_count = 0  # Count oversold (<-1%) coins
     for c in batch:
+        vwap_val = c.get('vwap_dist', 0) or 0
+        if vwap_val > 1.0:
+            vwap_ob_count += 1
+        elif vwap_val < -1.0:
+            vwap_os_count += 1
         oi_str = f" OI={c.get('oi_delta',0):+.1f}%" if c.get('oi_delta', 0) != 0 else ""
         fund_str = f" fund={c.get('funding',0):.4f}" if c.get('funding', 0) != 0 else ""
         vwap_str = f" VWAP={c.get('vwap_dist',0):+.1f}%" if c.get('vwap_dist', 0) != 0 else ""
@@ -814,6 +821,12 @@ def _scan_batch(batch: list[dict], equity: float, market_context: str,
         + f"⚠️ VWAP RULES: NEVER buy when VWAP>+1.5% (overbought). NEVER short when VWAP<-1.5% (oversold). "
         + f"Buy dips (VWAP<-1.5%), short pumps (VWAP>+1.5%). "
         + f"Skip: flat mom5(<0.3%), dead enriched, no CVD, m1h>5% exhausted, comp>0.3 extreme. "
+        + f"VWAP SCAN: {vwap_ob_count} overbought:{vwap_os_count} oversold | " 
+        + (f"⛔ ONLY PICK SHORTS — all coins overbought, do NOT pick any BUY/LONG" if vwap_ob_count > len(batch) * 0.7 else
+           f"⛔ ONLY PICK LONGS — all oversold" if vwap_os_count > len(batch) * 0.7 else
+           f"SHORTS preferred (more overbought)" if vwap_ob_count > vwap_os_count else
+           f"LONGS preferred (more oversold)" if vwap_os_count > vwap_ob_count else
+           f"balanced market") + ". "
         + f"Fields: entry_zone urgency(now/confirm/wait) invalidation risk_note reason entry_type(market/limit) scale(full/half) exit_at.\n"
         + f"OUTPUT keys: picks skip market_note strategy skip_reason. "
         + f"DO NOT use decision/reason keys."
