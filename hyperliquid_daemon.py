@@ -587,14 +587,13 @@ def _calc_momentum(coin: str, timeframe: str = "5m") -> float:
 
 _CHASE_THRESHOLDS = [
     # (timeframe, candle_limit, max_move_pct, edge_pct, wait_s, block_pct)
-    # For moves BELOW max_move_pct: use edge_pct limit, wait wait_s
-    # For moves ABOVE block_pct: BLOCK entirely
-    # Cascade: first threshold that triggers wins
-    ("1m",  3,  1.0, 0.003, 25,  3.0),
-    ("5m",  3,  2.0, 0.005, 35,  5.0),
-    ("15m", 3,  3.5, 0.008, 50,  7.0),
-    ("1h",  2,  6.0, 0.015, 70, 12.0),
-    ("4h",  1, 10.0, 0.025, 90, 20.0),
+    # candle_limit=2: look at last 2 candles for context
+    # Aug 8: tightened blocks — missed CELO 5% pump, entered at +2.2σ VWAP
+    ("1m",  2,  1.0, 0.003, 25,  2.5),
+    ("5m",  2,  1.5, 0.005, 35,  3.5),
+    ("15m", 2,  2.5, 0.008, 50,  5.0),
+    ("1h",  2,  4.0, 0.015, 70,  8.0),
+    ("4h",  2,  8.0, 0.025, 90, 15.0),
 ]
 
 
@@ -1105,6 +1104,7 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
                         "oid": _z_oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
                         "stop_price": stop_price, "tp_levels": tp_levels, "reason": reason,
                         "leverage": leverage, "placed_at": time.time(),
+                        "timeout_s": 90, "label": "zone",
                     }
                     log.info(f"  📝 {coin}: zone limit oid={_z_oid} queued — monitor will check fill")
                     return True  # Success — monitor handles fill + TP/SL
@@ -1114,57 +1114,45 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
         
         elif _chase["pullback"]:
             _edge = _chase["edge_pct"]
-            _wait_loops = max(1, _chase["wait_s"] // 2)  # 2s per loop
             limit_px = round_price(px_dec, px * (1 + _edge) if not is_buy else px * (1 - _edge), is_buy=is_buy)
-            log.warning(f"  📏 {coin}: {_chase['detail']} — limit at {_edge*100:.1f}% (${limit_px}), {_chase['wait_s']}s")
+            log.warning(f"  📏 {coin}: {_chase['detail']} — limit at {_edge*100:.1f}% (${limit_px}), {_chase['wait_s']}s (non-blocking)")
             result = hl.order(coin, is_buy, sz, limit_px, order_type="gtc")
             if isinstance(result, dict) and result.get("status") == "err":
                 log.warning(f"  DIRECT OPEN {coin}: pullback limit failed — {result.get('error', 'unknown')}, falling back to market")
                 result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
             else:
-                _bounce_oid = result.get("oid") or result.get("orderId") or 0 if isinstance(result, dict) else 0
-                _bounce_ok = False
-                for _w in range(_wait_loops):
-                    time.sleep(2)
-                    try:
-                        st = hl.get_user_state()
-                        for pp in st.get("assetPositions", []):
-                            if pp.get("position", {}).get("coin", "").upper() == coin.upper():
-                                if abs(float(pp["position"].get("szi", 0))) > 0.0001:
-                                    _bounce_ok = True; break
-                    except Exception: pass
-                    if _bounce_ok: break
-                if not _bounce_ok:
-                    try: hl.cancel_order(coin, _bounce_oid)
-                    except Exception: pass
-                    log.warning(f"  ⏰ {coin}: no pullback in {_chase['wait_s']}s — entering at market")
+                _oid = result.get("oid") or result.get("orderId") or 0 if isinstance(result, dict) else 0
+                if _oid:
+                    _PENDING_ZONE[coin.upper()] = {
+                        "oid": _oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
+                        "stop_price": stop_price, "tp_levels": tp_levels, "reason": reason,
+                        "leverage": leverage, "placed_at": time.time(),
+                        "timeout_s": _chase["wait_s"], "label": "pullback",
+                    }
+                    log.info(f"  📝 {coin}: pullback limit oid={_oid} queued ({_chase['wait_s']}s timeout)")
+                    return True
+                else:
                     result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
         elif (not is_buy and vwap_sigma < -0.5) or (is_buy and vwap_sigma > 0.5):
-            # Fallback: VWAP-extended but no recent-move trigger — use legacy bounce
-            _edge = 0.003  # 0.3%
+            _edge = 0.003
             limit_px = round_price(px_dec, px * (1 + _edge) if not is_buy else px * (1 - _edge), is_buy=is_buy)
-            log.warning(f"  📏 {coin}: VWAP={vwap_sigma:+.1f}σ extended — waiting for bounce, limit at {_edge*100:.1f}% (${limit_px})")
+            log.warning(f"  📏 {coin}: VWAP={vwap_sigma:+.1f}σ extended — limit at {_edge*100:.1f}% (${limit_px}), 20s (non-blocking)")
             result = hl.order(coin, is_buy, sz, limit_px, order_type="gtc")
             if isinstance(result, dict) and result.get("status") == "err":
                 log.warning(f"  DIRECT OPEN {coin}: bounce limit failed — {result.get('error', 'unknown')}, falling back to market")
                 result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
             else:
-                _bounce_oid = result.get("oid") or result.get("orderId") or 0 if isinstance(result, dict) else 0
-                _bounce_ok = False
-                for _w in range(10):  # 20s
-                    time.sleep(2)
-                    try:
-                        st = hl.get_user_state()
-                        for pp in st.get("assetPositions", []):
-                            if pp.get("position", {}).get("coin", "").upper() == coin.upper():
-                                if abs(float(pp["position"].get("szi", 0))) > 0.0001:
-                                    _bounce_ok = True; break
-                    except Exception: pass
-                    if _bounce_ok: break
-                if not _bounce_ok:
-                    try: hl.cancel_order(coin, _bounce_oid)
-                    except Exception: pass
-                    log.warning(f"  ⏰ {coin}: no bounce in 20s — entering at market")
+                _oid = result.get("oid") or result.get("orderId") or 0 if isinstance(result, dict) else 0
+                if _oid:
+                    _PENDING_ZONE[coin.upper()] = {
+                        "oid": _oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
+                        "stop_price": stop_price, "tp_levels": tp_levels, "reason": reason,
+                        "leverage": leverage, "placed_at": time.time(),
+                        "timeout_s": 20, "label": "bounce",
+                    }
+                    log.info(f"  📝 {coin}: bounce limit oid={_oid} queued (20s timeout)")
+                    return True
+                else:
                     result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
         else:
             # Normal entry — price hasn't moved much in our direction, good to enter
@@ -1729,11 +1717,12 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
             except Exception as pze:
                 log.warning(f"  ⚠️ {coin}: zone TP/SL failed: {pze}")
         
-        # ── PENDING ZONE TIMEOUT: cancel unfilled zone orders after 90s ──
+        # ── PENDING ZONE TIMEOUT: cancel unfilled orders after their timeout ──
         _expired_zones = []
         for zc, zd in list(_PENDING_ZONE.items()):
-            if time.time() - zd["placed_at"] > 90:
-                log.warning(f"  ⏰ {zc}: AI zone not hit in 90s — cancelling, entering at market")
+            _tmo = zd.get("timeout_s", 90)
+            if time.time() - zd["placed_at"] > _tmo:
+                log.warning(f"  ⏰ {zc}: {zd.get('label','limit')} not filled in {_tmo}s — cancelling, entering at market")
                 try: hl.cancel_order(zc, zd["oid"])
                 except Exception: pass
                 try:
@@ -1839,8 +1828,8 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
         _now_ts = time.time()
         entry_ts = _position_entry_times.get(cu, 0)
         if _monitor_positions._call_count <= 20:
-            log.info(f"  🔍 {cu} eval-state: age={_now_ts-entry_ts:.0f}s call=#{_monitor_positions._call_count} entry_ts={entry_ts:.0f} eligible={_now_ts-entry_ts > 60}")
-        if _now_ts - entry_ts > 60:
+            log.info(f"  🔍 {cu} eval-state: age={_now_ts-entry_ts:.0f}s call=#{_monitor_positions._call_count} entry_ts={entry_ts:.0f} eligible={_now_ts-entry_ts > 15}")
+        if _now_ts - entry_ts > 15:  # 15s warmup (was 60s — delayed exits too long)
             _last_eval = getattr(_monitor_positions, _eval_key, 0) if hasattr(_monitor_positions, _eval_key) else 0
             if _now_ts - _last_eval > 30:
                 try:
