@@ -4074,9 +4074,15 @@ def run(dry_run: bool = False):
 
                     regime_is_uptrend = sig.regime.value in ("trending_up",)
                     regime_is_downtrend = sig.regime.value in ("trending_down",)
-                    # ── VWAP MEAN REVERSION: buy dips, sell pumps ──
+                    # VWAP MEAN REVERSION: buy dips, sell pumps
                     _vwap_dip_long = sig.side == "BUY" and vwap_sigma < -1.5 and not regime_is_downtrend
                     _vwap_pump_short = sig.side == "SELL" and vwap_sigma > 1.5 and not regime_is_uptrend
+                    
+                    # EXTREME VWAP BLOCK: dont buy overbought, dont sell oversold
+                    if sig.side == "BUY" and vwap_sigma > 2.0:
+                        block_reason = f"VWAP:{vwap_sigma:+.1f} - extreme overbought, never BUY"
+                    elif sig.side == "SELL" and vwap_sigma < -2.0:
+                        block_reason = f"VWAP:{vwap_sigma:+.1f} - extreme oversold, never SELL"
                     if _vwap_dip_long:
                         log.info(f"  📉 {coin}: VWAP DIP BUY — VWAP={vwap_sigma:+.1f}σ oversold, mean reversion LONG")
                     elif _vwap_pump_short:
@@ -4827,6 +4833,13 @@ def run(dry_run: bool = False):
                         continue
                     if _bypass_ok and pred.confidence < 10:
                         log.info(f"  ⚡ {coin}: AI+MOMENTUM BYPASS — AI={ai_conf_final}% mom5={_mom5_surv:+.1f}% overrides unified={pred.confidence:.0f}%")
+                        # ── WEAK COMPOSITE GUARD: AI can't solo on near-zero comp + ML contradiction ──
+                        # LIT lesson: comp=+0.08, ML=DOWN@45% → AI forced BUY → immediate loss
+                        if abs(sig.composite_score) < 0.10 and ml_conf and ml_conf > 30:
+                            _ml_disagrees = (ml_dir == "down" and _trade_side == "BUY") or (ml_dir == "up" and _trade_side == "SELL")
+                            if _ml_disagrees:
+                                log.warning(f"  🛑 {coin}: WEAK COMP BLOCK — comp={sig.composite_score:+.2f} near zero + ML={ml_dir}@{ml_conf}% disagrees — AI can't solo override")
+                                continue
 
                     # ── Stage 3: Risk check ──
                     # Always refresh exposure state with current equity and positions
