@@ -2069,9 +2069,10 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                         _trend_kill = False
                         # ── Regime-aware: in downtrend, short at 4h high is CORRECT entry ──
                         # KAITO: small pump to resistance in downtrend → perfect short, killed by TREND-KILL
-                        _regime_str = sig.regime.value if hasattr(sig, 'regime') else ""
-                        _regime_downtrend = "down" in _regime_str.lower()
-                        _regime_uptrend = "up" in _regime_str.lower() and "not" not in _regime_str.lower()
+                        _regime_key = f"_regime_downtrend:{cu}"
+                        _regime_downtrend = getattr(_monitor_positions, _regime_key, False) if hasattr(_monitor_positions, _regime_key) else False
+                        _regime_uptrend_key = f"_regime_uptrend:{cu}"
+                        _regime_uptrend = getattr(_monitor_positions, _regime_uptrend_key, False) if hasattr(_monitor_positions, _regime_uptrend_key) else False
                         if side == "SHORT":
                             _trend_kill = _pct_low_4h < 3.0 or _pct_low_1h < 2.0
                             if _trend_kill and _regime_downtrend:
@@ -5460,6 +5461,12 @@ def run(dry_run: bool = False):
                             # ── Store fast-exit flag for positive timeout ──
                             if _fast_exit:
                                 setattr(_monitor_positions, f"_fast_exit:{coin.upper()}", True)
+                            # ── Store regime for trend-aware TREND-KILL ──
+                            _regime_val = sig.regime.value if sig and hasattr(sig, 'regime') else ""
+                            if "down" in _regime_val.lower():
+                                setattr(_monitor_positions, f"_regime_downtrend:{coin.upper()}", True)
+                            if "up" in _regime_val.lower() and "not" not in _regime_val.lower():
+                                setattr(_monitor_positions, f"_regime_uptrend:{coin.upper()}", True)
                             trail_states[coin] = TrailState(
                             symbol=coin,
                             is_long=is_buy,
