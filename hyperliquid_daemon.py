@@ -3148,16 +3148,10 @@ def run(dry_run: bool = False):
         log.warning(f"  Recovery failed: {e}")
 
     # ── Cleanup stale open orders on startup ──
+    # Use schedule_cancel instead of Info().open_orders() — lighter, no 429 risk
     try:
-        _info = hl.Info()
-        _open_orders = _info.open_orders(hl._main_wallet)
-        if _open_orders:
-            log.warning(f"  🧹 Found {len(_open_orders)} stale open orders — cancelling all")
-            for o in _open_orders:
-                try:
-                    hl.cancel_order(o.get('coin',''), o.get('oid',0))
-                except Exception: pass
-            log.info(f"  🧹 Cancelled stale orders")
+        hl.schedule_cancel(5000)  # Cancel ALL open orders in 5s
+        log.info(f"  🧹 Scheduled cancel of all open orders")
     except Exception as _co:
         log.debug(f"  Order cleanup skipped: {type(_co).__name__}")
 
