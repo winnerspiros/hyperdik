@@ -2090,10 +2090,14 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                     
                     # ── No other exit rules. Position runs to exchange TP or breakeven SL. ──
                     # ── POSITIVE TIMEOUT: free capital from stagnant positions ──
-                    # Aug 7: if position is net positive (even 0.01%) after 5 min, close to free capital.
-                    # Never close at a loss — negative positions stay open for recovery.
-                    if _net_pnl_mon > 0 and _hold_age_mon > 300:
-                        log.warning(f"  ⏰ {coin}: POSITIVE TIMEOUT — net={_net_pnl_mon:+.2f}% after {_hold_age_mon:.0f}s, closing to free capital")
+                    # Aug 7: if position is net positive (even 0.01%) after timeout, close to free capital.
+                    # Aug 8: fast-exit trades use 120s (2min), normal use 300s (5min).
+                    _fast_key = f"_fast_exit:{cu}"
+                    _is_fast = getattr(_monitor_positions, _fast_key, False) if hasattr(_monitor_positions, _fast_key) else False
+                    _pos_timeout = 120 if _is_fast else 300
+                    if _net_pnl_mon > 0 and _hold_age_mon > _pos_timeout:
+                        _label = "FAST-EXIT" if _is_fast else "POSITIVE TIMEOUT"
+                        log.warning(f"  ⏰ {coin}: {_label} — net={_net_pnl_mon:+.2f}% after {_hold_age_mon:.0f}s, closing to free capital")
                         try:
                             _MANUAL_CLOSES[coin] = time.time()
                             hl.market_close(coin)
@@ -5104,10 +5108,24 @@ def run(dry_run: bool = False):
                         _confluence = _enriched_agrees and ai_conf_val >= 80 and _ml_agrees and _unified_agrees
                         # Aug 7: enriched+AI agreement at high conf = skip debate
                         _ai_enr_agree = _enriched_agrees and ai_conf_val >= 80
+                        _confluence_bonus = 1.0; _confluence_lev = chosen_leverage
+                        _confluence_label = ""; _fast_exit = False
                         if _confluence:
                             log.info(f"  ⚡ {coin}: DEBATE SKIPPED — enriched+AI+ML+unified all agree on {_trade_side} (comp={sig.composite_score:+.2f})")
+                            _confluence_bonus = 1.75; _confluence_lev = min(chosen_leverage + 4, 12)
+                            _confluence_label = "4/4 CONFLUENCE"; _fast_exit = True
+                        elif _ai_enr_agree and _ml_agrees:
+                            log.info(f"  ⚡ {coin}: DEBATE SKIPPED — enriched+AI+ML agree on {_trade_side} (comp={sig.composite_score:+.2f})")
+                            _confluence_bonus = 1.35; _confluence_lev = min(chosen_leverage + 2, 10)
+                            _confluence_label = "3/4 enriched+AI+ML"; _fast_exit = True
+                        elif _ai_enr_agree and abs(sig.composite_score) >= 0.12:
+                            log.info(f"  ⚡ {coin}: DEBATE SKIPPED — enriched+AI agree at {ai_conf_val}% (comp={sig.composite_score:+.2f})")
+                            _confluence_bonus = 1.15; _confluence_lev = chosen_leverage
+                            _confluence_label = "enriched+AI strong"; _fast_exit = False
                         elif _ai_enr_agree and abs(sig.composite_score) >= 0.08:
-                            log.info(f"  ⚡ {coin}: DEBATE SKIPPED — enriched+AI agree at {ai_conf_val}% (comp={sig.composite_score:+.2f}) — bypassing debate")
+                            log.info(f"  ⚡ {coin}: DEBATE SKIPPED — enriched+AI agree at {ai_conf_val}% (comp={sig.composite_score:+.2f})")
+                            _confluence_bonus = 1.0; _confluence_lev = chosen_leverage
+                            _confluence_label = ""; _fast_exit = False
                         else:
                             _is_sell = _trade_side == "SELL"
                             if debate_verdict == "HOLD" and not _is_ft_debate:
@@ -5224,6 +5242,12 @@ def run(dry_run: bool = False):
                             if _scale_mult < 1.0:
                                 log.info(f"  📏 {coin}: AI scale={_ai_scale} → notional ${notional:.0f} → ${_sized_notional:.0f}")
                             
+                            # ── CONFLUENCE BOOST: more size + leverage when signals align ──
+                            _final_notional = _sized_notional * _confluence_bonus
+                            _final_leverage = _confluence_lev
+                            if _confluence_bonus > 1.0:
+                                log.info(f"  🔥 {coin}: {_confluence_label} → size ${_sized_notional:.0f}→${_final_notional:.0f} lev {chosen_leverage}x→{_final_leverage}x")
+                            
                             # Parse entry zone: AI may return "0.059-0.061" or "0.059"
                             _zone_px = 0.0
                             if _ai_entry_zone:
@@ -5236,8 +5260,8 @@ def run(dry_run: bool = False):
                             executed = _execute_direct_open(
                             coin=coin,
                             is_buy=is_buy,
-                            size_usd=_sized_notional,
-                            leverage=chosen_leverage,
+                            size_usd=_final_notional,
+                            leverage=_final_leverage,
                             stop_price=stop_price,
                             tp_levels=exit_plan.tp_levels if exit_plan.tp_levels else None,
                             reason=sig.reason,
@@ -5255,6 +5279,9 @@ def run(dry_run: bool = False):
                     if executed:
                             # Record signal for cooldown + trail (only after confirmed execution)
                             cooldown_state.record(coin)
+                            # ── Store fast-exit flag for positive timeout ──
+                            if _fast_exit:
+                                setattr(_monitor_positions, f"_fast_exit:{coin.upper()}", True)
                             trail_states[coin] = TrailState(
                             symbol=coin,
                             is_long=is_buy,
