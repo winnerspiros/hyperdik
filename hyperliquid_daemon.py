@@ -2057,14 +2057,22 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                         _pct_low_1h = ext.pct_low_1h if ext else 0  # % below 1h high
                         _pct_low_4h = ext.pct_low_4h if ext else 0  # % below 4h high
                         _trend_kill = False
+                        # ── Regime-aware: in downtrend, short at 4h high is CORRECT entry ──
+                        # KAITO: small pump to resistance in downtrend → perfect short, killed by TREND-KILL
+                        _regime_str = sig.regime.value if hasattr(sig, 'regime') else ""
+                        _regime_downtrend = "down" in _regime_str.lower()
+                        _regime_uptrend = "up" in _regime_str.lower() and "not" not in _regime_str.lower()
                         if side == "SHORT":
-                            # SHORT wrong: price near 4h HIGH (=uptrend). Below-high >10% = NOT near high.
-                            # Better: price near TOP of range = uptrend risk for short.
-                            _trend_kill = _pct_low_4h < 3.0 or _pct_low_1h < 2.0  # Within 3%/2% of high
+                            _trend_kill = _pct_low_4h < 3.0 or _pct_low_1h < 2.0
+                            if _trend_kill and _regime_downtrend:
+                                # Downtrend + near 4h high = resistance test = SHORT opportunity, not risk
+                                _trend_kill = False
                             _kill_metric = f"4h={_pct_low_4h:.1f}% below high"
                         else:
-                            # LONG wrong: price near 4h LOW (=downtrend)
-                            _trend_kill = _pct_4h < 3.0 or _pct_1h < 2.0  # Within 3%/2% of low
+                            _trend_kill = _pct_4h < 3.0 or _pct_1h < 2.0
+                            if _trend_kill and _regime_uptrend:
+                                # Uptrend + near 4h low = support test = LONG opportunity, not risk
+                                _trend_kill = False
                             _kill_metric = f"4h={_pct_4h:.1f}% above low"
 
                         if _trend_kill and _net_pnl_mon < -0.15:
