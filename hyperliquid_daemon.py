@@ -2057,7 +2057,8 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                             _trend_kill = _pct_4h < 3.0 or _pct_1h < 2.0  # Within 3%/2% of low
                             _kill_metric = f"4h={_pct_4h:.1f}% above low"
 
-                        if _trend_kill:
+                        if _trend_kill and _net_pnl_mon < -0.15:
+                            # Minimum loss 0.15% — don't kill flat positions (S coin: killed at -0.01%)
                             exit_reason = f"TREND-KILL: {side} wrong — {_kill_metric}, net={_net_pnl_mon:+.2f}%"
                         elif drop_from_peak_pct > 0.3 and (mom1 * (-1 if side == "SHORT" else 1)) < -0.1:
                             # Bleeding: peak was better, now dropping, mom going the wrong way
@@ -3095,6 +3096,20 @@ def run(dry_run: bool = False):
             log.info(f"  Recovery: restored state for {len(existing)} existing positions")
     except Exception as e:
         log.warning(f"  Recovery failed: {e}")
+
+    # ── Cleanup stale open orders on startup ──
+    try:
+        _info = hl.Info()
+        _open_orders = _info.open_orders(hl._main_wallet)
+        if _open_orders:
+            log.warning(f"  🧹 Found {len(_open_orders)} stale open orders — cancelling all")
+            for o in _open_orders:
+                try:
+                    hl.cancel_order(o.get('coin',''), o.get('oid',0))
+                except Exception: pass
+            log.info(f"  🧹 Cancelled stale orders")
+    except Exception as _co:
+        log.debug(f"  Order cleanup skipped: {type(_co).__name__}")
 
     last_cycle = 0
     last_monitor = 0
