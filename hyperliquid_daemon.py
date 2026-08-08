@@ -1764,30 +1764,12 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
         cu_upper = coin.upper()
         if cu_upper in _PENDING_ZONE:
             pz = _PENDING_ZONE.pop(cu_upper)
-            log.info(f"  ✅ {coin}: AI zone limit filled — placing TP/SL")
+            log.info(f"  ✅ {coin}: pending limit filled — placing TP/SL")
             try:
                 _place_retry_tpsl(coin, pz["is_buy"], pz["size_usd"],
                                   pz["stop_price"], pz["tp_levels"] or [])
             except Exception as pze:
-                log.warning(f"  ⚠️ {coin}: zone TP/SL failed: {pze}")
-        
-        # ── PENDING ZONE TIMEOUT: cancel unfilled orders after their timeout ──
-        _expired_zones = []
-        for zc, zd in list(_PENDING_ZONE.items()):
-            _tmo = zd.get("timeout_s", 90)
-            if time.time() - zd["placed_at"] > _tmo:
-                log.warning(f"  ⏰ {zc}: {zd.get('label','limit')} not filled in {_tmo}s — cancelling, entering at market")
-                try: hl.cancel_order(zc, zd["oid"])
-                except Exception: pass
-                try:
-                    hl.market_open(zc, zd["is_buy"], zd["size_usd"], slippage=0.005, order_type="Ioc")
-                    _place_retry_tpsl(zc, zd["is_buy"], zd["size_usd"],
-                                     zd["stop_price"], zd["tp_levels"] or [])
-                except Exception as zce:
-                    log.warning(f"  ⏰ {zc}: zone fallback failed: {zce}")
-                _expired_zones.append(zc)
-        for zc in _expired_zones:
-            _PENDING_ZONE.pop(zc, None)
+                log.warning(f"  ⚠️ {coin}: pending TP/SL failed: {pze}")
 
         entry = float(p.get("entryPx", 0))
         liq = float(p.get("liquidationPx") or 0)
@@ -2918,6 +2900,32 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
             del trail_states[c]
         if c in position_tps:
             del position_tps[c]
+
+    # ── GLOBAL PENDING ORDER TIMEOUT: runs regardless of position state ──
+    # Aug 8: was inside position loop, so orders for coins WITHOUT positions
+    # never timed out. Now runs at function level so ALL pending orders get checked.
+    _now_pt = time.time()
+    for zc, zd in list(_PENDING_ZONE.items()):
+        _tmo = zd.get("timeout_s", 90)
+        if _now_pt - zd["placed_at"] > _tmo:
+            log.warning(f"  ⏰ {zc}: pending {zd.get('label','limit')} not filled in {_tmo}s — cancelling, entering at market")
+            try: hl.cancel_order(zc, zd["oid"])
+            except Exception: pass
+            try:
+                hl.market_open(zc, zd["is_buy"], zd["size_usd"], slippage=0.005, order_type="Ioc")
+                _place_retry_tpsl(zc, zd["is_buy"], zd["size_usd"],
+                                 zd["stop_price"], zd["tp_levels"] or [])
+            except Exception as _zce:
+                log.warning(f"  ⏰ {zc}: pending fallback failed: {_zce}")
+            _PENDING_ZONE.pop(zc, None)
+    
+    # ── Also clean up stale orders >5min old (safety net) ──
+    for zc in list(_PENDING_ZONE.keys()):
+        if _now_pt - _PENDING_ZONE[zc]["placed_at"] > 300:
+            try: hl.cancel_order(zc, _PENDING_ZONE[zc]["oid"])
+            except Exception: pass
+            log.warning(f"  🧹 {zc}: stale pending order cleaned up (5min)")
+            _PENDING_ZONE.pop(zc, None)
 
 
 # ============================================================
