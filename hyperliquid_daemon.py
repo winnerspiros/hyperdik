@@ -253,6 +253,7 @@ _forager_skip_cooldown: dict[str, float] = {}  # coin → timestamp, 10-min fora
 _global_pause_until: float = 0.0  # Don't open ANY position until this timestamp
 _ai_trade_plan: dict[str, dict] = {}  # coin → {direction, confidence, target_pct, stop_pct, hold_min}
 _PENDING_ZONE: dict[str, dict] = {}  # coin → {oid, is_buy, size_usd, ...} non-blocking zone orders
+_REVERSE_COUNT: dict[str, int] = {}  # coin → reverse count — cap at 1 per session (death spiral guard)
 # ── STOP-LOSS COOLING ──
 _last_stop_loss_at: dict[str, float] = {}  # coin → timestamp
 STOP_LOSS_COOLING_SECONDS = 60  # Ignore signals for 60s after a stop loss
@@ -2077,7 +2078,11 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                             _reset_signal_dominance(coin)
                             
                             # Only reverse on TREND-KILL (trend signal, not timeout-based)
-                            if exit_reason.startswith("TREND-KILL") and _loss_pct < 2.0:
+                            # Cap at 1 reverse per coin — SUI death spiral: 3x TREND-KILL loop
+                            _rev_count_key = cu.upper()
+                            _rev_count = _REVERSE_COUNT.get(_rev_count_key, 0)
+                            if exit_reason.startswith("TREND-KILL") and _loss_pct < 2.0 and _rev_count < 1:
+                                _REVERSE_COUNT[_rev_count_key] = _rev_count + 1
                                 # Open 50% size in opposite direction, targeting loss recovery
                                 _rev_side = "SELL" if _orig_side == "BUY" else "BUY"
                                 _rev_buy = _rev_side == "BUY"
