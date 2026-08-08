@@ -1042,6 +1042,28 @@ def _place_retry_tpsl(coin: str, is_buy: bool, size_usd: float,
         log.warning(f"  DIRECT OPEN {coin}: retry TP/SL failed ({e})")
 
 
+def _extract_oid(result) -> int:
+    """Extract order ID from Hyperliquid response — handles nested SDK structure."""
+    if isinstance(result, dict):
+        oid = result.get("oid") or result.get("orderId")
+        if not oid:
+            try:
+                statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+                if statuses:
+                    s0 = statuses[0]
+                    for status_type in ("filled", "resting", "triggered"):
+                        inner = s0.get(status_type, {})
+                        if isinstance(inner, dict) and inner.get("oid"):
+                            oid = inner["oid"]
+                            break
+                    if not oid:
+                        oid = s0.get("oid") or 0
+            except Exception:
+                pass
+        return oid or 0
+    return 0
+
+
 def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int,
                          stop_price: float, tp_levels: list[dict] | None = None,
                          reason: str = "", vwap_sigma: float = 0.0,
@@ -1118,7 +1140,7 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
             log.info(f"  🎯 {coin}: peak-entry limit at ${_limit_px:.4f} — monitored, non-blocking")
             result = hl.order(coin, is_buy, sz, _limit_px, order_type="gtc")
             if isinstance(result, dict) and not result.get("status") == "err":
-                _oid = result.get("oid") or result.get("orderId") or 0 if isinstance(result, dict) else 0
+                _oid = _extract_oid(result)
                 if _oid:
                     _PENDING_ZONE[coin.upper()] = {
                         "oid": _oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
@@ -1163,7 +1185,7 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
                 log.warning(f"  DIRECT OPEN {coin}: zone limit failed — {result.get('error', 'unknown')}, falling back")
                 result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
             else:
-                _z_oid = result.get("oid") or result.get("orderId") or 0 if isinstance(result, dict) else 0
+                _z_oid = _extract_oid(result)
                 if _z_oid:
                     _PENDING_ZONE[coin.upper()] = {
                         "oid": _z_oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
@@ -1186,7 +1208,7 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
                 log.warning(f"  DIRECT OPEN {coin}: pullback limit failed — {result.get('error', 'unknown')}, falling back to market")
                 result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
             else:
-                _oid = result.get("oid") or result.get("orderId") or 0 if isinstance(result, dict) else 0
+                _oid = _extract_oid(result)
                 if _oid:
                     _PENDING_ZONE[coin.upper()] = {
                         "oid": _oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
@@ -1207,7 +1229,7 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
                 log.warning(f"  DIRECT OPEN {coin}: bounce limit failed — {result.get('error', 'unknown')}, falling back to market")
                 result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
             else:
-                _oid = result.get("oid") or result.get("orderId") or 0 if isinstance(result, dict) else 0
+                _oid = _extract_oid(result)
                 if _oid:
                     _PENDING_ZONE[coin.upper()] = {
                         "oid": _oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
@@ -1226,27 +1248,15 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
             log.error(f"  DIRECT OPEN {coin}: {result.get('error', 'unknown')}")
             return False
 
-        oid = 0
+        oid = _extract_oid(result)
         exchange_error = None
-        if isinstance(result, dict):
-            oid = result.get("oid") or result.get("orderId")
-            if not oid:
-                try:
-                    statuses = result.get("response", {}).get("data", {}).get("statuses", [])
-                    if statuses:
-                        s0 = statuses[0]
-                        if "error" in s0:
-                            exchange_error = s0["error"]
-                        else:
-                            for status_type in ("filled", "resting", "triggered"):
-                                inner = s0.get(status_type, {})
-                                if isinstance(inner, dict) and inner.get("oid"):
-                                    oid = inner["oid"]
-                                    break
-                            if not oid:
-                                oid = s0.get("oid") or 0
-                except Exception:
-                    pass
+        if isinstance(result, dict) and not oid:
+            try:
+                statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+                if statuses and "error" in statuses[0]:
+                    exchange_error = statuses[0]["error"]
+            except Exception:
+                pass
         if exchange_error:
             log.error(f"  DIRECT OPEN {coin}: exchange rejected — {exchange_error}")
             return False
