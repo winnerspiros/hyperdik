@@ -2085,9 +2085,35 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                     if exit_reason:
                         log.warning(f"  💀 {coin}: {exit_reason}")
                         try:
+                            # ── REVERSE ON TREND-KILL: flip direction to recover loss ──
+                            _orig_side = side
+                            _orig_szi = abs(szi)
+                            _orig_entry = entry
+                            _loss_pct = abs(_net_pnl_mon)
                             _MANUAL_CLOSES[coin] = time.time()
                             hl.market_close(coin)
                             _reset_signal_dominance(coin)
+                            
+                            # Only reverse on TREND-KILL (trend signal, not timeout-based)
+                            if exit_reason.startswith("TREND-KILL") and _loss_pct < 2.0:
+                                # Open 50% size in opposite direction, targeting loss recovery
+                                _rev_side = "SELL" if _orig_side == "BUY" else "BUY"
+                                _rev_buy = _rev_side == "BUY"
+                                _rev_size_pct = 0.50  # 50% of original position
+                                _rev_notional = _orig_szi * mid * leverage * _rev_size_pct
+                                _rev_tp_pct = _loss_pct * 1.1  # Recover loss + 10% buffer
+                                _rev_sl_pct = 0.3  # Tight SL — don't compound losses
+                                _rev_tp = mid * (1 + _rev_tp_pct / 100) if _rev_buy else mid * (1 - _rev_tp_pct / 100)
+                                _rev_sl = mid * (1 - _rev_sl_pct / 100) if _rev_buy else mid * (1 + _rev_sl_pct / 100)
+                                log.info(f"  🔄 {coin}: REVERSE {_rev_side} — {_rev_size_pct*100:.0f}% size "
+                                       f"${_rev_notional:.1f} @ {leverage}x, TP to recover {_loss_pct:+.2f}% loss")
+                                try:
+                                    _rev_result = hl.market_open(coin, _rev_buy, _rev_notional, slippage=0.005, order_type="Ioc")
+                                    if _rev_result and not (isinstance(_rev_result, dict) and _rev_result.get("status") == "err"):
+                                        _place_retry_tpsl(coin, _rev_buy, _rev_notional, _rev_sl, [{"price": _rev_tp, "fraction": 1.0}])
+                                        log.info(f"  ✅ {coin}: REVERSE opened — TP={_rev_tp:.4f} SL={_rev_sl:.4f}")
+                                except Exception as _re:
+                                    log.warning(f"  🔄 {coin}: reverse failed: {_re}")
                             continue
                         except Exception as de:
                             log.warning(f"  💀 {coin}: close failed: {de}")
