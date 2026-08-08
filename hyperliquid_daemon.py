@@ -4094,10 +4094,11 @@ def run(dry_run: bool = False):
                     _vwap_pump_short = sig.side == "SELL" and vwap_sigma > 1.5 and not regime_is_uptrend
                     
                     # EXTREME VWAP BLOCK: dont buy overbought, dont sell oversold
-                    if sig.side == "BUY" and vwap_sigma > 2.0:
-                        block_reason = f"VWAP:{vwap_sigma:+.1f} - extreme overbought, never BUY"
-                    elif sig.side == "SELL" and vwap_sigma < -2.0:
-                        block_reason = f"VWAP:{vwap_sigma:+.1f} - extreme oversold, never SELL"
+                    # OP lesson: SHORT at -1.9σ (oversold) ×3, LONG at +2.5σ (overbought) ×3
+                    if sig.side == "BUY" and vwap_sigma > 1.5:
+                        block_reason = f"VWAP:{vwap_sigma:+.1f}σ — overbought, never BUY"
+                    elif sig.side == "SELL" and vwap_sigma < -1.5:
+                        block_reason = f"VWAP:{vwap_sigma:+.1f}σ — oversold, never SELL"
                     if _vwap_dip_long:
                         log.info(f"  📉 {coin}: VWAP DIP BUY — VWAP={vwap_sigma:+.1f}σ oversold, mean reversion LONG")
                     elif _vwap_pump_short:
