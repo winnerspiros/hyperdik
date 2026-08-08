@@ -2059,22 +2059,23 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
 
                     if _net_pnl_mon < 0 and not exit_reason:
                         # Check broader trend using extremes (already fetched, no API call)
-                        # ext.pct_4h = % above 4h low (high = trending up)
-                        # ext.pct_1h = % above 1h low (high = trending up)
-                        _pct_1h = ext.pct_1h if ext else 0
-                        _pct_4h = ext.pct_4h if ext else 0
+                        _pct_1h = ext.pct_1h if ext else 0   # % above 1h low
+                        _pct_4h = ext.pct_4h if ext else 0   # % above 4h low
+                        _pct_low_1h = ext.pct_low_1h if ext else 0  # % below 1h high
+                        _pct_low_4h = ext.pct_low_4h if ext else 0  # % below 4h high
                         _trend_kill = False
                         if side == "SHORT":
-                            # SHORT is wrong if price is near top of 4h range (strong uptrend)
-                            _trend_kill = _pct_4h > 10.0 or _pct_1h > 4.0
+                            # SHORT wrong: price near 4h HIGH (=uptrend). Below-high >10% = NOT near high.
+                            # Better: price near TOP of range = uptrend risk for short.
+                            _trend_kill = _pct_low_4h < 3.0 or _pct_low_1h < 2.0  # Within 3%/2% of high
+                            _kill_metric = f"4h={_pct_low_4h:.1f}% below high"
                         else:
-                            # LONG is wrong if price is near bottom of 4h range (strong downtrend)
-                            _pct_low_4h = ext.pct_low_4h if ext else 0
-                            _pct_low_1h = ext.pct_low_1h if ext else 0
-                            _trend_kill = _pct_low_4h > 10.0 or _pct_low_1h > 4.0
+                            # LONG wrong: price near 4h LOW (=downtrend)
+                            _trend_kill = _pct_4h < 3.0 or _pct_1h < 2.0  # Within 3%/2% of low
+                            _kill_metric = f"4h={_pct_4h:.1f}% above low"
 
                         if _trend_kill:
-                            exit_reason = f"TREND-KILL: {side} wrong — 4h={_pct_4h:+.1f}% from low, net={_net_pnl_mon:+.2f}%"
+                            exit_reason = f"TREND-KILL: {side} wrong — {_kill_metric}, net={_net_pnl_mon:+.2f}%"
                         elif drop_from_peak_pct > 0.3 and (mom1 * (-1 if side == "SHORT" else 1)) < -0.1:
                             # Bleeding: peak was better, now dropping, mom going the wrong way
                             exit_reason = f"BLEED: down {drop_from_peak_pct:.2f}% from peak, mom turning against, net={_net_pnl_mon:+.2f}%"
@@ -2118,15 +2119,15 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                                                     # ── TREND-AWARE DOUBLE-DOWN ──
                                                     # Aug 8: only add if broader trend isn't screaming against us.
                                                     # Use extremes (already fetched) instead of candle cache (cold after restart).
-                                                    _pct_1h = ext.pct_1h if ext else 0
-                                                    _pct_4h = ext.pct_4h if ext else 0
+                                                    _pct_1h = ext.pct_1h if ext else 0       # % above 1h low
+                                                    _pct_4h = ext.pct_4h if ext else 0       # % above 4h low
+                                                    _pct_low_1h = ext.pct_low_1h if ext else 0  # % below 1h high
+                                                    _pct_low_4h = ext.pct_low_4h if ext else 0  # % below 4h high
                                                     _trend_against = False
                                                     if side == "SHORT":
-                                                        _trend_against = _pct_4h > 10.0 or _pct_1h > 4.0
+                                                        _trend_against = _pct_low_4h < 3.0 or _pct_low_1h < 2.0
                                                     else:
-                                                        _pct_low_4h = ext.pct_low_4h if ext else 0
-                                                        _pct_low_1h = ext.pct_low_1h if ext else 0
-                                                        _trend_against = _pct_low_4h > 10.0 or _pct_low_1h > 4.0
+                                                        _trend_against = _pct_4h < 3.0 or _pct_1h < 2.0
 
                                                     if _trend_against:
                                                         log.warning(f"  🚫 {coin}: NO DOUBLE-DOWN — trend against us "
