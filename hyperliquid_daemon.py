@@ -944,6 +944,16 @@ def _execute_direct_close(coin: str, size_fraction: float = 1.0, reason: str = "
         if size_fraction >= 0.95:
             result = hl.market_close(coin)
             log.info(f"  DIRECT CLOSE: {coin} full — {reason}")
+            # ── Cancel any orphaned TP/SL orders for this coin ──
+            try:
+                _info = hl.Info()
+                _ords = _info.open_orders(hl._main_wallet)
+                if _ords:
+                    for o in _ords:
+                        if o.get('coin','').upper() == coin.upper():
+                            hl.cancel_order(coin, o.get('oid',0))
+                            log.debug(f"  🧹 {coin}: cancelled orphan order oid={o.get('oid')}")
+            except Exception: pass
             # ── Record PnL for performance tracking ──
             try:
                 # Get entry price from position data for PnL calc
@@ -2932,6 +2942,27 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
             except Exception: pass
             log.warning(f"  🧹 {zc}: stale pending order cleaned up (5min)")
             _PENDING_ZONE.pop(zc, None)
+    
+    # ── ORPHAN ORDER CLEANUP: cancel TP/SL for coins with no position ──
+    # Every 60s to avoid API spam
+    _orphan_key = "_last_orphan_cleanup"
+    _last_orphan = getattr(_monitor_positions, _orphan_key, 0) if hasattr(_monitor_positions, _orphan_key) else 0
+    if _now_pt - _last_orphan > 60:
+        try:
+            _info = hl.Info()
+            _all_orders = _info.open_orders(hl._main_wallet)
+            if _all_orders:
+                _held = {p.get('coin','').upper(): abs(float(p.get('szi',0))) for p in positions if abs(float(p.get('szi',0))) > 0.0001}
+                for o in _all_orders:
+                    oc = o.get('coin','').upper()
+                    if oc not in _held:
+                        try:
+                            hl.cancel_order(oc, o.get('oid',0))
+                            log.info(f"  🧹 {oc}: orphan order cancelled (no position)")
+                        except Exception: pass
+            setattr(_monitor_positions, _orphan_key, _now_pt)
+        except Exception as _oe:
+            pass
 
 
 # ============================================================
