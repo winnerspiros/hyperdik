@@ -1111,47 +1111,35 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
         sz = round_size(sz_dec, size_usd / px)
         
         # Step 2: Tick-peak-aware entry — short at local peaks, buy at local bottoms
-        # Real price-action detection, not formula-based percentages
         _side_str = "BUY" if is_buy else "SELL"
         
-        # ── TICK PEAK ENTRY: detect local tops/bottoms for better entries ──
-        _peak_entry = None
-        try:
-            _candles_1m = _fetch_candles_cached(coin, "1m", 120) or []
-            if _candles_1m:
-                _tick = detect_tick_peak(coin, px, _candles_1m)
-                if _tick and _tick.confidence >= 25:
-                    _match = (_tick.is_peak and not is_buy) or (not _tick.is_peak and is_buy)
-                    if _match and _tick.predicted_extreme > 0:
-                        _peak_extreme = float(_tick.predicted_extreme)
-                        _peak_dist = abs(px - _peak_extreme) / px * 100
-                        if _peak_dist > 0.1 and _peak_dist < 3.0:
-                            _peak_dir = "SHORT at peak" if not is_buy else "BUY at bottom"
-                            log.info(f"  📍 {coin}: TICK PEAK — {_peak_dir} conf={_tick.confidence}% "
-                                    f"extreme=${_peak_extreme:.4f} ({_peak_dist:.1f}% from mkt) "
-                                    f"action={_tick.action}")
-                            _peak_entry = _peak_extreme
-        except Exception as _tp_e:
-            log.debug(f"  tick_peak entry check: {type(_tp_e).__name__}")
-        
-        if _peak_entry:
-            # Use the detected peak/bottom as the entry limit — real price action
-            _limit_px = round_price(px_dec, _peak_entry, is_buy=is_buy)
-            log.info(f"  🎯 {coin}: peak-entry limit at ${_limit_px:.4f} — monitored, non-blocking")
-            result = hl.order(coin, is_buy, sz, _limit_px, order_type="gtc")
-            if isinstance(result, dict) and not result.get("status") == "err":
-                _oid = _extract_oid(result)
-                if _oid:
+        # ── AI ENTRY ZONE: if AI zone is close (<1%), use limit. Otherwise market. ──
+        if entry_zone > 0 and abs(px - entry_zone) / px < 0.01:
+            _zone_limit = round_price(px_dec, entry_zone, is_buy=is_buy)
+            log.info(f"  🎯 {coin}: AI zone=${entry_zone:.4f} close ({abs(px-entry_zone)/px*100:.1f}%) — limit, 45s timeout")
+            result = hl.order(coin, is_buy, sz, _zone_limit, order_type="gtc")
+            if isinstance(result, dict) and result.get("status") == "err":
+                log.warning(f"  DIRECT OPEN {coin}: zone limit failed — {result.get('error', 'unknown')}, falling back")
+                result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
+            else:
+                _z_oid = _extract_oid(result)
+                if _z_oid:
                     _PENDING_ZONE[coin.upper()] = {
-                        "oid": _oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
+                        "oid": _z_oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
                         "stop_price": stop_price, "tp_levels": tp_levels, "reason": reason,
                         "leverage": leverage, "placed_at": time.time(),
-                        "timeout_s": 45, "label": "peak-entry",
+                        "timeout_s": 45, "label": "zone",
                     }
+                    log.info(f"  📝 {coin}: zone limit oid={_z_oid} queued (45s)")
                     return True
-            # Fallback to market if peak limit fails
+                else:
+                    log.warning(f"  DIRECT OPEN {coin}: no oid from zone limit — falling back")
+                    result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
+        
+        elif entry_zone > 0:
+            # AI zone too far — just enter at market
+            log.info(f"  🎯 {coin}: AI zone=${entry_zone:.4f} too far ({abs(px-entry_zone)/px*100:.1f}%) — market entry")
             result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
-            return bool(result and not (isinstance(result, dict) and result.get("status") == "err"))
         
         # Step 3: Pump/dump-aware entry — don't chase, wait for pullback
         _chase = _check_recent_move(coin, _side_str)
