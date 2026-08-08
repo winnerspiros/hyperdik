@@ -1090,8 +1090,13 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
         # ── AI ENTRY ZONE: AI explicitly told us where to enter ──
         if entry_zone > 0 and not _chase["pullback"]:
             # AI gave a price target — place limit, return immediately, monitor handles fill
-            _zone_limit = round_price(px_dec, entry_zone, is_buy=is_buy)
+            # Cap zone distance at 2% from market — further than that gets rejected by exchange
             _zone_edge = abs(px - entry_zone) / px * 100
+            if _zone_edge > 2.0:
+                _adj_zone = px * (1 - 0.02) if is_buy else px * (1 + 0.02)
+                log.info(f"  🎯 {coin}: AI zone=${entry_zone:.6f} too far ({_zone_edge:.1f}%), capping at 2% → ${_adj_zone:.4f}")
+                entry_zone = _adj_zone
+            _zone_limit = round_price(px_dec, entry_zone, is_buy=is_buy)
             log.info(f"  🎯 {coin}: AI zone=${entry_zone:.6f} ({_zone_edge:.1f}% from mkt ${px:.4f}) — limit order (non-blocking)")
             result = hl.order(coin, is_buy, sz, _zone_limit, order_type="gtc")
             if isinstance(result, dict) and result.get("status") == "err":
