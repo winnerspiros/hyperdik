@@ -4179,7 +4179,13 @@ def run(dry_run: bool = False):
                     _bull_aligned = _bull_market and ai_dir_raw == "long"
                     _min_composite = 0.03 if _bull_aligned else (0.03 if ai_dir_raw == "short" else 0.10)
                     if ai_conf_val >= 80 and block_reason:
-                        if _ml_hard_block:
+                        # ── UN-OVERRIDABLE GATES: VWAP extremes, data consensus — no AI bypass ──
+                        _cannot_override = ("VWAP:+" in block_reason and "overbought" in block_reason) or \
+                                          ("VWAP:-" in block_reason and "oversold" in block_reason) or \
+                                          ("all data layers dead" in block_reason)
+                        if _cannot_override:
+                            log.info(f"  🛑 {coin}: UN-OVERRIDABLE — {block_reason} (AI={ai_conf_val}% cannot bypass VWAP extreme)")
+                        elif _ml_hard_block:
                             _ai_plan_ml = _ai_trade_plan.get(coin.upper(), {})
                             _ai_conf_ml = _ai_plan_ml.get("confidence", 0)
                             if _ai_conf_ml >= 80:  # Aug 7: 85→80 — zero-loss exits protect downside

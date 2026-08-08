@@ -811,6 +811,8 @@ def _scan_batch(batch: list[dict], equity: float, market_context: str,
         + f"RULES: tgt>=1.0 stop=0.5-0.6 hold=30-45m. SHORTS=LONGS equally. FEE 0.42%@6x. "
         + f"LONG: m1>0.5%+m5 pos+CVD rising+comp>0.05. "
         + f"SHORT: m1<-0.5%+m5 neg+CVD falling+comp<-0.05. "
+        + f"⚠️ VWAP RULES: NEVER buy when VWAP>+1.5% (overbought). NEVER short when VWAP<-1.5% (oversold). "
+        + f"Buy dips (VWAP<-1.5%), short pumps (VWAP>+1.5%). "
         + f"Skip: flat mom5(<0.3%), dead enriched, no CVD, m1h>5% exhausted, comp>0.3 extreme. "
         + f"Fields: entry_zone urgency(now/confirm/wait) invalidation risk_note reason entry_type(market/limit) scale(full/half) exit_at.\n"
         + f"OUTPUT keys: picks skip market_note strategy skip_reason. "
