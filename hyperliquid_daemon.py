@@ -252,6 +252,7 @@ cooldown_state = CooldownState(cooldown_seconds=1800)  # 30-min signal cooldown
 _forager_skip_cooldown: dict[str, float] = {}  # coin → timestamp, 10-min forager skip
 _global_pause_until: float = 0.0  # Don't open ANY position until this timestamp
 _ai_trade_plan: dict[str, dict] = {}  # coin → {direction, confidence, target_pct, stop_pct, hold_min}
+_PENDING_ZONE: dict[str, dict] = {}  # coin → {oid, is_buy, size_usd, ...} non-blocking zone orders
 # ── STOP-LOSS COOLING ──
 _last_stop_loss_at: dict[str, float] = {}  # coin → timestamp
 STOP_LOSS_COOLING_SECONDS = 60  # Ignore signals for 60s after a stop loss
@@ -1033,7 +1034,9 @@ def _place_retry_tpsl(coin: str, is_buy: bool, size_usd: float,
 
 def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int,
                          stop_price: float, tp_levels: list[dict] | None = None,
-                         reason: str = "", vwap_sigma: float = 0.0) -> bool:
+                         reason: str = "", vwap_sigma: float = 0.0,
+                         entry_zone: float = 0.0, entry_type: str = "market",
+                         invalidation: str = "") -> bool:
     """Execute a new position DIRECTLY on Hyperliquid, bypassing the
     pending_actions -> validator -> executor pipeline.
 
@@ -1084,8 +1087,32 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
         if _chase["block"]:
             log.warning(f"  🚫 {coin}: CHASE BLOCK — {_chase['detail']}")
             return False
+
+        # ── AI ENTRY ZONE: AI explicitly told us where to enter ──
+        if entry_zone > 0 and not _chase["pullback"]:
+            # AI gave a price target — place limit, return immediately, monitor handles fill
+            _zone_limit = round_price(px_dec, entry_zone, is_buy=is_buy)
+            _zone_edge = abs(px - entry_zone) / px * 100
+            log.info(f"  🎯 {coin}: AI zone=${entry_zone:.6f} ({_zone_edge:.1f}% from mkt ${px:.4f}) — limit order (non-blocking)")
+            result = hl.order(coin, is_buy, sz, _zone_limit, order_type="gtc")
+            if isinstance(result, dict) and result.get("status") == "err":
+                log.warning(f"  DIRECT OPEN {coin}: zone limit failed — {result.get('error', 'unknown')}, falling back")
+                result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
+            else:
+                _z_oid = result.get("oid") or result.get("orderId") or 0 if isinstance(result, dict) else 0
+                if _z_oid:
+                    _PENDING_ZONE[coin.upper()] = {
+                        "oid": _z_oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
+                        "stop_price": stop_price, "tp_levels": tp_levels, "reason": reason,
+                        "leverage": leverage, "placed_at": time.time(),
+                    }
+                    log.info(f"  📝 {coin}: zone limit oid={_z_oid} queued — monitor will check fill")
+                    return True  # Success — monitor handles fill + TP/SL
+                else:
+                    log.warning(f"  DIRECT OPEN {coin}: no oid from zone limit — falling back")
+                    result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
         
-        if _chase["pullback"]:
+        elif _chase["pullback"]:
             _edge = _chase["edge_pct"]
             _wait_loops = max(1, _chase["wait_s"] // 2)  # 2s per loop
             limit_px = round_price(px_dec, px * (1 + _edge) if not is_buy else px * (1 - _edge), is_buy=is_buy)
@@ -1691,6 +1718,34 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
         if abs(szi) < 0.0001:
             continue
 
+        # ── PENDING ZONE ORDER CHECK: did AI's limit fill? ──
+        cu_upper = coin.upper()
+        if cu_upper in _PENDING_ZONE:
+            pz = _PENDING_ZONE.pop(cu_upper)
+            log.info(f"  ✅ {coin}: AI zone limit filled — placing TP/SL")
+            try:
+                _place_retry_tpsl(coin, pz["is_buy"], pz["size_usd"],
+                                  pz["stop_price"], pz["tp_levels"] or [])
+            except Exception as pze:
+                log.warning(f"  ⚠️ {coin}: zone TP/SL failed: {pze}")
+        
+        # ── PENDING ZONE TIMEOUT: cancel unfilled zone orders after 90s ──
+        _expired_zones = []
+        for zc, zd in list(_PENDING_ZONE.items()):
+            if time.time() - zd["placed_at"] > 90:
+                log.warning(f"  ⏰ {zc}: AI zone not hit in 90s — cancelling, entering at market")
+                try: hl.cancel_order(zc, zd["oid"])
+                except Exception: pass
+                try:
+                    hl.market_open(zc, zd["is_buy"], zd["size_usd"], slippage=0.005, order_type="Ioc")
+                    _place_retry_tpsl(zc, zd["is_buy"], zd["size_usd"],
+                                     zd["stop_price"], zd["tp_levels"] or [])
+                except Exception as zce:
+                    log.warning(f"  ⏰ {zc}: zone fallback failed: {zce}")
+                _expired_zones.append(zc)
+        for zc in _expired_zones:
+            _PENDING_ZONE.pop(zc, None)
+
         entry = float(p.get("entryPx", 0))
         liq = float(p.get("liquidationPx") or 0)
         mid = float(mids.get(coin, 0))
@@ -1945,15 +2000,64 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                             _reset_signal_dominance(coin)
                             continue
                     
+                    # ── DEAD-MAN TIMEOUT: never-green positions bleed forever ──
+                    # Aug 8: the "zero-loss" system has a blind spot — trades that never
+                    # reach breakeven are held indefinitely. This catches them.
+                    # INSTEAD of hardcoded timeouts: decide based on trend + bleed.
+                    #  1. 4h trend strongly against? Close now. No point waiting.
+                    #  2. Bleeding (peak dropping + mom against)? Position is deteriorating.
+                    #  3. Never green after 5min? Last-resort close.
+                    _ever_green_key = f"_ever_green:{cu}"
+                    _ever_green = getattr(_monitor_positions, _ever_green_key, False) if hasattr(_monitor_positions, _ever_green_key) else False
+                    _fee_covered_at = ROUNDTRIP_FEE_PCT * leverage
+                    if _net_pnl_mon >= _fee_covered_at:
+                        _ever_green = True
+                        setattr(_monitor_positions, _ever_green_key, True)
+
+                    if _net_pnl_mon < 0 and not exit_reason:
+                        # Check broader trend using extremes (already fetched, no API call)
+                        # ext.pct_4h = % above 4h low (high = trending up)
+                        # ext.pct_1h = % above 1h low (high = trending up)
+                        _pct_1h = ext.pct_1h if ext else 0
+                        _pct_4h = ext.pct_4h if ext else 0
+                        _trend_kill = False
+                        if side == "SHORT":
+                            # SHORT is wrong if price is near top of 4h range (strong uptrend)
+                            _trend_kill = _pct_4h > 10.0 or _pct_1h > 4.0
+                        else:
+                            # LONG is wrong if price is near bottom of 4h range (strong downtrend)
+                            _pct_low_4h = ext.pct_low_4h if ext else 0
+                            _pct_low_1h = ext.pct_low_1h if ext else 0
+                            _trend_kill = _pct_low_4h > 10.0 or _pct_low_1h > 4.0
+
+                        if _trend_kill:
+                            exit_reason = f"TREND-KILL: {side} wrong — 4h={_pct_4h:+.1f}% from low, net={_net_pnl_mon:+.2f}%"
+                        elif drop_from_peak_pct > 0.3 and (mom1 * (-1 if side == "SHORT" else 1)) < -0.1:
+                            # Bleeding: peak was better, now dropping, mom going the wrong way
+                            exit_reason = f"BLEED: down {drop_from_peak_pct:.2f}% from peak, mom turning against, net={_net_pnl_mon:+.2f}%"
+                        elif not _ever_green and _hold_age_mon > 300:
+                            exit_reason = f"NEVER-GREEN: underwater {_net_pnl_mon:+.2f}% for {_hold_age_mon:.0f}s, never hit breakeven"
+
+                    if exit_reason:
+                        log.warning(f"  💀 {coin}: {exit_reason}")
+                        try:
+                            _MANUAL_CLOSES[coin] = time.time()
+                            hl.market_close(coin)
+                            _reset_signal_dominance(coin)
+                            continue
+                        except Exception as de:
+                            log.warning(f"  💀 {coin}: close failed: {de}")
+                    
                     # ── UNDERWATER MANAGEMENT: add to position or cut losses ──
                     # Aug 7: if position never reached breakeven, manage it actively.
                     # Two strategies: add at better price (flat market), or cut (moving against).
+                    # Aug 8: lowered mom5 emergency threshold from 2% to 1% — 2% was too rare.
                     _underwater = _net_pnl_mon < 0 and _hold_age_mon > 300
                     _added_key = f"_added:{cu}"
                     _already_added = getattr(_monitor_positions, _added_key, False) if hasattr(_monitor_positions, _added_key) else False
                     
                     if _underwater:
-                        _mom_against = (side == "LONG" and mom5 < -2.0) or (side == "SHORT" and mom5 > 2.0)
+                        _mom_against = (side == "LONG" and mom5 < -1.0) or (side == "SHORT" and mom5 > 1.0)
                         _mom_neutral = abs(mom5 or 0) < 0.5
                         
                         if _mom_against:
@@ -1968,15 +2072,32 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                                 log.warning(f"  🚨 {coin}: emergency close failed: {e}")
                         
                         elif _mom_neutral and not _already_added:
-                            # Flat market — add to position at better price
-                            log.warning(f"  ➕ {coin}: ADDING TO POSITION — underwater {_net_pnl_mon:+.2f}%, market flat, doubling at better price")
-                            try:
-                                setattr(_monitor_positions, _added_key, True)
-                                _add_size = size_usd if 'size_usd' in dir() else 20
-                                hl.market_open(coin, side=="LONG", _add_size, slippage=0.005, order_type="Ioc")
-                                log.warning(f"  ➕ {coin}: added \${_add_size:.0f} to position")
-                            except Exception as e:
-                                log.warning(f"  ➕ {coin}: add failed: {e}")
+                                                    # ── TREND-AWARE DOUBLE-DOWN ──
+                                                    # Aug 8: only add if broader trend isn't screaming against us.
+                                                    # Use extremes (already fetched) instead of candle cache (cold after restart).
+                                                    _pct_1h = ext.pct_1h if ext else 0
+                                                    _pct_4h = ext.pct_4h if ext else 0
+                                                    _trend_against = False
+                                                    if side == "SHORT":
+                                                        _trend_against = _pct_4h > 10.0 or _pct_1h > 4.0
+                                                    else:
+                                                        _pct_low_4h = ext.pct_low_4h if ext else 0
+                                                        _pct_low_1h = ext.pct_low_1h if ext else 0
+                                                        _trend_against = _pct_low_4h > 10.0 or _pct_low_1h > 4.0
+
+                                                    if _trend_against:
+                                                        log.warning(f"  🚫 {coin}: NO DOUBLE-DOWN — trend against us "
+                                                                   f"(1h range={_pct_1h:+.1f}% 4h={_pct_4h:+.1f}%), letting exit system handle it")
+                                                    else:
+                                                        log.warning(f"  ➕ {coin}: ADDING TO POSITION — underwater {_net_pnl_mon:+.2f}%, "
+                                                                   f"market flat, 1h={_pct_1h:+.1f}% 4h={_pct_4h:+.1f}%, doubling at better price")
+                                                        try:
+                                                            setattr(_monitor_positions, _added_key, True)
+                                                            _add_size = size_usd if 'size_usd' in dir() else 20
+                                                            hl.market_open(coin, side=="LONG", _add_size, slippage=0.005, order_type="Ioc")
+                                                            log.warning(f"  ➕ {coin}: added ${_add_size:.0f} to position")
+                                                        except Exception as e:
+                                                            log.warning(f"  ➕ {coin}: add failed: {e}")
                     
                     # ── No other exit rules. Position runs to exchange TP or breakeven SL. ──
                     # ── POSITIVE TIMEOUT: free capital from stagnant positions ──
@@ -3141,13 +3262,14 @@ def run(dry_run: bool = False):
                 # Dynamic: micro accounts get 1-2, scaling up with equity
                 max_pos = max(1, min(BASE_MAX_POSITIONS, int(total_eq / 35)))
                 slots_left = max_pos - len(active)
-                # Micro account guard: cap total new positions to 1 per cycle
-                # Also: if equity < $50, only 1 total position allowed
-                if total_eq < 50:
+                # Micro account guard: cap total positions based on equity
+                # $25+: 2 positions (so one dud doesn't paralyze)
+                # $50+: 3 positions
+                if total_eq < 25:
                     max_pos = 1
                     slots_left = max(0, max_pos - len(active))
-                elif total_eq < 100:
-                    max_pos = 2  # Allow 2 positions at $50-100 so one dud doesn't paralyze
+                elif total_eq < 50:
+                    max_pos = 2
                     slots_left = max(0, max_pos - len(active))
                 cap_new_per_cycle = 1 if total_eq < 200 else slots_left
                 slots_left = min(slots_left, cap_new_per_cycle)
@@ -4206,12 +4328,28 @@ def run(dry_run: bool = False):
                             ai_dir = "BUY" if ai_dir.lower() == "long" else "SELL" if ai_dir.lower() == "short" else ai_dir.upper()
                             # ⚠️ KAITO lesson: fast-track forced BUY when unified=DOWN(35%), ML=DOWN(48%).
                             # Fast-track must respect unified when it has a clear opposing direction.
-                            if _is_fast_track and pred_conf > 20:
+                            # Aug 8 ZERO-LOSS: also check ML — if ML strongly disagrees, data beats AI.
+                            # INJ lesson: unified=flat(4%), ML=flat(4%), enriched=HOLD, only AI wanted it.
+                            # Three data layers said no → AI cannot fast-track.
+                            if _is_fast_track:
                                 _ft_opposes = (pred.direction == "down" and ai_dir == "BUY") or \
                                               (pred.direction == "up" and ai_dir == "SELL")
+                                _ml_opposes = (ml_conf and ml_conf >= 30 and (
+                                    (ml_dir == "down" and ai_dir == "BUY") or
+                                    (ml_dir == "up" and ai_dir == "SELL")))
                                 if _ft_opposes:
                                     log.info(f"  🛑 {coin}: AI override blocked — fast-track {ai_dir} but unified "
-                                            f"says {pred.direction}@{pred_conf:.0f}% (opposing direction)")
+                                            f"says {pred.direction}@{pred_conf:.0f}% (opposing)")
+                                    continue
+                                if _ml_opposes:
+                                    log.info(f"  🛑 {coin}: AI override blocked — fast-track {ai_dir} but ML "
+                                            f"says {ml_dir}@{ml_conf:.0f}% (data beats AI)")
+                                    continue
+                                # ── ALL-DATA DEAD: enriched=HOLD, unified≤5%, ML≤10% → AI can't solo
+                                _all_dead = pred_conf <= 5 and (not ml_conf or ml_conf <= 10) and sig.side == "HOLD"
+                                if _all_dead:
+                                    log.info(f"  🛑 {coin}: AI override blocked — all data layers dead "
+                                            f"(unified={pred_conf:.0f}% ML={ml_conf or 0:.0f}% enriched=HOLD), AI can't solo")
                                     continue
                             if ai_dir in ("BUY", "SELL"):
                                 # ── COMPOSITE GATE: enriched signal quality must back the trade ──
@@ -5083,15 +5221,41 @@ def run(dry_run: bool = False):
                             
                             # ── ENTER IMMEDIATELY — exit system handles protection ──
                             # Breakeven-lock covers losses. Tiered profit-lock captures wins.
+                            # ── AI GUIDANCE: entry zone, scale, entry type from AI trade plan ──
+                            _ai_guidance = _ai_trade_plan.get(coin.upper(), {})
+                            _ai_entry_zone = _ai_guidance.get("entry_zone", "")
+                            _ai_scale = _ai_guidance.get("scale", "full")
+                            _ai_entry_type = _ai_guidance.get("entry_type", "market")
+                            _ai_invalidation = _ai_guidance.get("invalidation", "")
+                            
+                            # Scale position size based on AI guidance
+                            _scale_map = {"full": 1.0, "half": 0.5, "quarter": 0.25, "third": 0.33}
+                            _scale_mult = _scale_map.get(_ai_scale.lower(), 1.0)
+                            _sized_notional = notional * _scale_mult
+                            if _scale_mult < 1.0:
+                                log.info(f"  📏 {coin}: AI scale={_ai_scale} → notional ${notional:.0f} → ${_sized_notional:.0f}")
+                            
+                            # Parse entry zone: AI may return "0.059-0.061" or "0.059"
+                            _zone_px = 0.0
+                            if _ai_entry_zone:
+                                try:
+                                    _zone_parts = str(_ai_entry_zone).replace("$","").replace(" ","").split("-")
+                                    _zone_px = float(_zone_parts[0])
+                                except Exception:
+                                    _zone_px = 0.0
+                            
                             executed = _execute_direct_open(
                             coin=coin,
                             is_buy=is_buy,
-                            size_usd=notional,  # Use daemon's notional, not risk check's
-                            leverage=chosen_leverage,  # Use daemon's leverage, not risk check's
+                            size_usd=_sized_notional,
+                            leverage=chosen_leverage,
                             stop_price=stop_price,
                             tp_levels=exit_plan.tp_levels if exit_plan.tp_levels else None,
                             reason=sig.reason,
                             vwap_sigma=vwap_sigma,
+                            entry_zone=_zone_px,
+                            entry_type=_ai_entry_type,
+                            invalidation=_ai_invalidation,
                             )
                     except Exception as _exec_exc:
                             log.error(f"  💥 {coin}: execution crashed — {type(_exec_exc).__name__}: {_exec_exc}")
