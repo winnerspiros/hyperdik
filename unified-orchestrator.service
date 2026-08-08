@@ -1,0 +1,39 @@
+[Unit]
+Description=Unified Crypto Trading Orchestrator — Revolut X + Hyperliquid
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/revolut-x-trader
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONOPTIMIZE=2
+Environment=PYTHONMALLOC=malloc
+Environment=MALLOC_TRIM_THRESHOLD_=65536
+Environment=HOME=/home/ubuntu
+ExecStart=/usr/bin/python3 /home/ubuntu/revolut-x-trader/unified_orchestrator.py
+Restart=always
+RestartSec=30
+KillSignal=SIGTERM
+TimeoutStopSec=120
+StandardOutput=append:/home/ubuntu/revolut-x-trader/logs/orchestrator.log
+StandardError=append:/home/ubuntu/revolut-x-trader/logs/orchestrator.log
+
+# Health check via heartbeat file
+ExecStartPost=/bin/bash -c 'sleep 10 && test -f /tmp/unified_orchestrator.heartbeat || exit 1'
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=false
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/home/ubuntu/revolut-x-trader /tmp /home/ubuntu/.config/revolut-x /home/ubuntu/.hyperliquid
+
+# Resource limits
+MemoryMax=512M
+CPUQuota=200%
+
+[Install]
+WantedBy=multi-user.target

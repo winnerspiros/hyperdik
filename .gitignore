@@ -1,0 +1,56 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Logs (can be huge)
+logs/
+*.log
+
+# PID files
+*.pid
+/tmp/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Sensitive data (keys live in ~/.hyperliquid/)
+*.key
+*.pem
+config.json
+key.json
+creds.json
+.env
+.env.*
+
+# Runtime data (regenerated, large)
+data/pending_actions/
+data/predictions/*_advisory.json
+data/ml_models/*.json
+
+# Database files (large, regenerated)
+*.db
+*.sqlite
+*.sqlite3
+!data/universe_coins.json
+!data/learned_weights.json
+!data/auto_tune.json
+!data/continuous_weights.json
+!data/optimal_params.json
+!data/hyperliquid_optimal_params.json
+!data/strategy_calendar.json

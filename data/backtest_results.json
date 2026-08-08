@@ -1,0 +1,28 @@
+{
+  "BTC": {
+    "coin": "BTC",
+    "signals": 400,
+    "entries": 5,
+    "exits": 29,
+    "win_rate": 0.897,
+    "profit_factor": 1.818,
+    "total_pnl": 34.68,
+    "avg_win": 2.96,
+    "avg_loss": 14.14,
+    "max_drawdown_pct": 0.4,
+    "sharpe": 20.295,
+    "return_pct": 0.35,
+    "final_equity": 10034.68,
+    "regime_stats": {
+      "sideways": {
+        "signals": 5,
+        "trades": 29
+      }
+    },
+    "blocked_reasons": {
+      "low_conviction": 138,
+      "no_signal": 244,
+      "position_exists": 13
+    }
+  }
+}
