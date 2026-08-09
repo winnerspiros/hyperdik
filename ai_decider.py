@@ -184,7 +184,7 @@ def _call_llm(prompt: str, model: str = MODEL_CHEAP,
     req = urllib.request.Request(API_URL, data=payload, headers={
         "Content-Type": "application/json",
         "Authorization": f"Bearer {OPENROUTER_KEY}",
-        "X-Title": "hyperliquid-trader",       # OpenRouter analytics tag
+        "X-Title": "hyperdik",       # OpenRouter analytics tag
             })
 
     try:

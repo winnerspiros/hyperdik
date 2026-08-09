@@ -1,4 +1,4 @@
-# HYPERDIK — Hyperliquid AI Trading Bot
+# HYPERDIK — HYPERDIK
 
 <p align="center">
   <img src="assets/hyperdik-logo.jpg" alt="HYPERDIK" width="384">
@@ -37,8 +37,8 @@ A fully autonomous trading bot that scans 177 perpetual futures markets every 5 
 
 ```bash
 # Clone
-git clone https://github.com/winnerspiros/hyperliquid-trading-bot.git
-cd hyperliquid-trading-bot
+git clone https://github.com/winnerspiros/hyperdik.git
+cd hyperdik
 
 # Setup
 python3 -m venv .venv && source .venv/bin/activate

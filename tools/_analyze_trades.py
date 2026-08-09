@@ -1,7 +1,7 @@
 import re
 from collections import defaultdict
 
-with open('/home/ubuntu/hyperliquid-trader/logs/hyperliquid_daemon.log') as f:
+with open('/home/ubuntu/hyperdik/logs/hyperliquid_daemon.log') as f:
     lines = f.readlines()
 
 trades = []

@@ -2,7 +2,7 @@
 # Hyperliquid Daemon Startup — no Revolut X, Hyperliquid only
 # Cleans stale action files and starts the HL daemon.
 
-TRADER_DIR="/home/ubuntu/hyperliquid-trader"
+TRADER_DIR="/home/ubuntu/hyperdik"
 LOG="$TRADER_DIR/logs/boot.log"
 
 echo "--- BOOT $(date '+%Y-%m-%d %H:%M:%S') ---" >> "$LOG"

@@ -2,7 +2,7 @@
 # Watchdog v9 — Hyperliquid daemon monitor
 # Systemd is the primary manager. This is a fallback only.
 # systemd handles restarts with proper delay. Don't interfere.
-TRADER_DIR="/home/ubuntu/hyperliquid-trader"
+TRADER_DIR="/home/ubuntu/hyperdik"
 LOG="$TRADER_DIR/logs/watchdog.log"
 LOCK_FILE="/tmp/hyperliquid_daemon.lock"
 PIDFILE="/tmp/hyperliquid_daemon.pid"

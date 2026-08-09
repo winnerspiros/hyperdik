@@ -89,7 +89,7 @@ if _env_path.exists():
     except Exception:
         pass
 # Also try the project-specific .env as fallback
-for _p in [ROOT / ".env", Path("/home/ubuntu/hyperliquid-trader/.env")]:
+for _p in [ROOT / ".env", Path("/home/ubuntu/hyperdik/.env")]:
     if _p.exists():
         try:
             with open(_p) as _f:
