@@ -1,4 +1,4 @@
-# 🤖 HYPERDIK
+# HYPERDIK
 
 <p align="center">
   <img src="assets/hyperdik-logo.jpg" alt="HYPERDIK" width="384">
