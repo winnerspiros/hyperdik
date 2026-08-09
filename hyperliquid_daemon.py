@@ -40,6 +40,36 @@ from datetime import datetime, timezone
 ROOT = Path(__file__).parent
 sys.path.insert(0, str(ROOT))
 
+
+# ── Load config.yaml (feature toggles) ──
+CONFIG = {}
+_config_path = Path(__file__).parent / "config.yaml"
+if _config_path.exists():
+    try:
+        import yaml
+        with open(_config_path) as _f:
+            CONFIG = yaml.safe_load(_f) or {}
+    except ImportError:
+        try:
+            with open(_config_path) as _f:
+                for _line in _f:
+                    _line = _line.strip()
+                    if ":" in _line and not _line.startswith("#") and not _line.startswith("-"):
+                        _key, _val = _line.split(":", 1)
+                        _key = _key.strip(); _val = _val.strip().strip('"\'')
+                        if _val.lower() in ("true","yes","on"): _val = True
+                        elif _val.lower() in ("false","no","off"): _val = False
+                        CONFIG[_key] = _val
+        except Exception:
+            pass
+def _cfg(path, default=None):
+    """config('evolution.enabled') → navigate nested dict"""
+    keys = path.split("."); d = CONFIG
+    for k in keys:
+        if isinstance(d, dict): d = d.get(k)
+        else: return default
+    return d if d is not None else default
+
 # ── Load API keys from ~/.hermes/.env before any AI module imports ──
 # The daemon process may not inherit env vars from the parent shell.
 # AI modules (ai_decider, ai_validator, etc.) read from os.environ at import time,
