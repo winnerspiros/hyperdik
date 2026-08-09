@@ -47,4 +47,5 @@ data/continuous_weights.json
 data/pending_actions/
 data/predictions/
 data/ml_models/
+*.db
 *.sqlite
