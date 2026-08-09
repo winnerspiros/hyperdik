@@ -1127,7 +1127,7 @@ def _call_llm_web(prompt: str, model: str = MODEL_CHEAP,
         ],
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "plugins": [{"id": "web", "max_results": 5}],
+        "transforms": ["prompt-caching-v1"], "plugins": [{"id": "web", "max_results": 5}],
         "provider": {"order": ["Groq", "DeepInfra", "Together"], "allow_fallbacks": True},
     }).encode()
 

@@ -62,12 +62,14 @@ python3 -B hyperliquid_daemon.py
 
 ## 🤖 AI Models
 
-| Model | Role | Cost | Use |
-|---|---|---|---|
-| **Qwen 235B MoE** | Decisions, sizing, exits | $0.64/M tok | Every trade decision |
-| **Llama 4 Maverick** | Coin picks, market assessment | $1.00/M tok | Per-cycle scan |
-| **Llama 4 Scout** | Auto-fallback on rate limits | $0.40/M tok | Rarely triggered |
-| **GPT‑4.1** | Evolution, post-trade analysis | $2.00/M tok | Every ~1.7h |
+| Model | Role | Prompt | Completion |
+|---|---|---|---|---|
+| **Qwen 235B MoE** | Decisions, sizing, exits | $0.64/M | $1.28/M |
+| **Llama 4 Maverick** | Coin picks, market scan | $1.00/M | $3.00/M |
+| **Llama 4 Scout** | Fallback (rate-limit) | $0.40/M | $0.80/M |
+| **GPT‑4.1** | Evolution, post-trade | $2.00/M | $8.00/M |
+
+*All via OpenRouter. Prompt caching active (90% off repeated system prompts).*
 
 All via OpenRouter. GPT‑4.1 runs web-enabled (5 searches per run, 1M context window) — it reads the entire codebase and rewrites prompts, parameters, and logic autonomously.
 
@@ -75,10 +77,12 @@ All via OpenRouter. GPT‑4.1 runs web-enabled (5 searches per run, 1M context w
 
 | Component | Frequency | ~Cost/day |
 |---|---|---|
-| Live trading AI (Qwen + Llama) | ~2,880 calls/day | ~$3–6 |
-| Post-trade analysis (GPT‑4.1) | Per trade close | ~$0.50 |
+| Live trading AI (Qwen + Llama) | ~2,880 calls/day | ~$1.10 |
+| Post-trade analysis (GPT‑4.1) | Per trade close | ~$0.30 |
 | Evolution (GPT‑4.1 + web) | Every ~1.7h (~14/day) | ~$0.50 |
-| **Total** | | **~$4–7/day** |
+| **Total** | | **~$1.90/day** |
+
+*Prompt caching (90% off repeated system prompts) active on all calls. Web search adds ~$0.005/result.*
 
 ---
 
