@@ -1,5 +1,4 @@
-# hyperliquid-trader — Module Map
-# Flat layout by design: subdirectories would require ~325 import path updates
+# HYPERDIK — Module Map
 
 ## AI / Decision Making
 ai_decider.py              — AI coin selection, exit evaluation, debate (Qwen 235B + Llama 4 Maverick)
