@@ -440,7 +440,7 @@ MAX_SESSION_VOLUME_PER_COIN = 1.50  # Max 150% of equity per coin per session (w
 def _reset_session_volume_if_new_day() -> None:
     """Reset session volume tracking at midnight UTC."""
     global _last_session_date
-    today = datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.now(datetime.UTC).strftime("%Y-%m-%d")
     if today != _last_session_date:
         _session_volume.clear()
         _last_session_date = today
