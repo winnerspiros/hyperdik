@@ -1,0 +1,49 @@
+# HYPERDIK — Feature Toggles
+# Copy to config.yaml and edit. All values shown are defaults.
+
+# ── AI Models ──
+ai:
+  enabled: true                     # Master switch — disables ALL AI (coin picks, sizing, exits, evolution)
+  openrouter_key_env: "OPENROUTER_API_KEY"
+
+# ── Trading ──
+trading:
+  enabled: true                     # Execute real orders. Set false for dry-run/watch-only.
+  max_positions: 3
+  base_leverage: 6
+  position_size_pct: 0.20           # 20% of equity per position
+
+# ── Post-Trade Analysis ──
+analysis:
+  enabled: true                     # AI analyzes every closed trade (web search, background thread)
+  model: "openai/gpt-4.1"
+
+# ── Evolution (autonomous optimizer) ──
+evolution:
+  enabled: true                     # Every ~1.7h: AI reads all data, suggests code/prompt changes
+  model: "openai/gpt-4.1"          # GPT-4.1 — 1M context, best code gen
+  apply_changes: true               # Actually write changes to files (set false for suggest-only)
+  auto_restart: true                # Restart daemon after code changes
+  auto_git: true                    # Git commit after each evolution run
+
+# ── Prompt Optimizer ──
+prompt_optimizer:
+  enabled: true                     # Meta-prompts AI to improve trading prompts every ~200 cycles
+  min_trials: 30                    # Minimum trades before optimizing prompts
+
+# ── Entry ──
+entry:
+  micro_peak: true                  # 150ms WebSocket sampling for 4s before market entry
+  vwap_chase_block: true            # Block entries far from VWAP
+
+# ── Exit ──
+exit:
+  never_green_ai_recheck: true      # Ask AI before killing flat positions (extends 300s→600s)
+  breakeven_lock: true              # Move SL to entry once net ≥ fees
+  trend_kill: true                  # Close positions with 4h strongly against
+  bleed_detection: true             # Close positions where peak is dropping + momentum turning
+
+# ── Monitoring ──
+monitoring:
+  log_level: "INFO"                 # DEBUG, INFO, WARNING, ERROR
+  cycle_seconds: 5                  # Main loop interval

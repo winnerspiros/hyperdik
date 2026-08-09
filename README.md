@@ -177,6 +177,50 @@ Standalone utilities — run separately, not imported by the daemon:
 
 ---
 
+
+---
+
+## ⚙️ Configuration
+
+Copy `config.yaml` and edit. All features can be toggled on/off:
+
+```yaml
+ai:
+  enabled: true              # Master switch — disables ALL AI
+
+trading:
+  enabled: true              # Set false for dry-run/watch-only
+  max_positions: 3
+  base_leverage: 6
+
+evolution:
+  enabled: true              # Autonomous optimizer (every ~1.7h)
+  model: "openai/gpt-4.1"    # GPT-4.1 — 1M context, best code gen
+  apply_changes: true        # Actually write changes to files
+
+analysis:
+  enabled: true              # AI analyzes every closed trade
+
+prompt_optimizer:
+  enabled: true              # Auto-improves AI prompts
+
+entry:
+  micro_peak: true           # 150ms WebSocket sampling before entry
+
+exit:
+  never_green_ai_recheck: true
+  breakeven_lock: true
+  trend_kill: true
+```
+
+---
+
+## 📄 License
+
+MIT — see [LICENSE](LICENSE)
+
+---
+
 ## 💡 Approach
 
 > 🧠 **AI is the brain** — send maximum data, trust its decisions over mechanical gates
