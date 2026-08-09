@@ -143,25 +143,25 @@ def build_evolution_prompt(ctx: dict) -> str:
 🏆 Best: {perf.get('best_coin')} | 💀 Worst: {perf.get('worst_coin')}
 
 === COMPLETE TRADE HISTORY ===
-{json.dumps(files.get('trade_memory', []), indent=2)[:8000]}
+{json.dumps(files.get('trade_memory', []), indent=2)[:20000]}
 
 === PER-COIN PERFORMANCE ===
-{json.dumps(perf.get('per_coin', {}), indent=2)[:4000]}
+{json.dumps(perf.get('per_coin', {}), indent=2)[:15000]}
 
 === CURRENT PARAMETERS ===
-{json.dumps(files.get('daemon_params', {}), indent=2)[:2000]}
+{json.dumps(files.get('daemon_params', {}), indent=2)[:10000]}
 
 === AI PROMPT SNIPPETS (what we tell the trading AI) ===
-{json.dumps(files.get('ai_prompts', {}), indent=2)[:5000]}
+{json.dumps(files.get('ai_prompts', {}), indent=2)[:15000]}
 
 === RECENT DAEMON LOGS ===
-{files.get('daemon_log_tail', 'N/A')[:4000]}
+{files.get('daemon_log_tail', 'N/A')[:15000]}
 
 === LEARNED WEIGHTS ===
-{json.dumps(files.get('learned_weights', {}), indent=2)[:3000]}
+{json.dumps(files.get('learned_weights', {}), indent=2)[:12000]}
 
 === CONTINUOUS WEIGHTS ===
-{json.dumps(files.get('continuous_weights', {}), indent=2)[:2000]}
+{json.dumps(files.get('continuous_weights', {}), indent=2)[:10000]}
 
 === WEB SEARCH TASKS ===
 1. Search for: "{perf.get('best_coin',['UNKNOWN'])[0] if perf.get('best_coin') else 'BTC'} crypto news price action today"

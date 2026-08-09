@@ -46,7 +46,7 @@ if not OPENROUTER_KEY:
 # VWAP-aware reasoning, specific picks). $0.64/M, 2.0s avg. Scout is fallback.
 MODEL_CHEAP = "qwen/qwen3-235b-a22b-2507"    # Qwen 235B MoE $0.64/M — best decisions
 MODEL_SMART = "qwen/qwen3-235b-a22b-2507"
-MODEL_PREMIUM = "qwen/qwen3-235b-a22b-2507"
+MODEL_PREMIUM = "openai/gpt-4.1"              # GPT-4.1 $2/M — evolution, code gen, 1M ctx
 MODEL_PICKS = "meta-llama/llama-4-maverick"   # Llama 4 Maverick $1.00/M — proven picks
 MODEL_DEEP = MODEL_CHEAP
 MODEL_FALLBACK = "meta-llama/llama-4-scout"    # $0.40/M — fast fallback if Qwen rate-limited
@@ -1127,7 +1127,7 @@ def _call_llm_web(prompt: str, model: str = MODEL_CHEAP,
         ],
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "plugins": [{"id": "web", "max_results": 3}],
+        "plugins": [{"id": "web", "max_results": 5}],
         "provider": {"order": ["Groq", "DeepInfra", "Together"], "allow_fallbacks": True},
     }).encode()
 
@@ -1188,7 +1188,7 @@ def analyze_closed_trade(trade_data: dict, market_context: str = "") -> dict:
         "Focus on: better entry timing, sizing adjustments, trend detection, missed signals."
     )
 
-    result = _call_llm_web(prompt, model=MODEL_CHEAP, max_tokens=400)
+    result = _call_llm_web(prompt, model=MODEL_PREMIUM, max_tokens=500)
     result["coin"] = coin
     result["pnl_pct"] = pnl_pct
     return result
@@ -1214,7 +1214,7 @@ def run_evolution_analysis(evo_requests: list) -> list:
         return [{"analysis": "empty_prompt", "suggestions": []}]
     
     # Use PREMIUM model — evolution runs rarely, worth the best quality
-    result = _call_llm_web(prompt, model=MODEL_CHEAP, max_tokens=1200, temperature=0.4)
+    result = _call_llm_web(prompt, model=MODEL_PREMIUM, max_tokens=2000, temperature=0.4)
     
     # Apply AI-suggested changes to actual files
     changes = result.get("changes", [])
