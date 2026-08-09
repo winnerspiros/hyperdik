@@ -93,7 +93,7 @@ Every ~1.7 hours, GPT‑4.1 reads the full system state and improves it autonomo
 - **Searches** 5 web queries for market context, strategy research, coin-specific news
 - **Writes** code changes — rewrites AI prompts, modifies parameters, adjusts logic
 - **Deploys** auto git-commits, restarts daemon if code changed
-- **Cost** ~$0.04 per run (~$0.50/day)
+- **Cost** ~$0.50/day
 
 **Prompt optimizer** runs alongside: records which prompts win, meta-prompts GPT‑4.1 for better versions, A/B tests, graduates winners.
 
