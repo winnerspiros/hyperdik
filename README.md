@@ -1,34 +1,41 @@
-# HYPERDIK
+# 🤖 HYPERDIK
 
 <p align="center">
   <img src="assets/hyperdik-logo.jpg" alt="HYPERDIK" width="384">
 </p>
 
-[![Python](https://img.shields.io/badge/Python-3.12+-blue)](https://python.org)
-[![Hyperliquid](https://img.shields.io/badge/Exchange-Hyperliquid-green)](https://hyperliquid.xyz)
-[![AI](https://img.shields.io/badge/AI-Qwen_235B_%2B_Llama_4-purple)](https://openrouter.ai)
-[![Status](https://img.shields.io/badge/Status-Live-brightgreen)]()
+<p align="center">
+  <a href="https://python.org"><img src="https://img.shields.io/badge/Python-3.12+-blue" alt="Python"></a>
+  <a href="https://hyperliquid.xyz"><img src="https://img.shields.io/badge/Exchange-Hyperliquid-green" alt="Hyperliquid"></a>
+  <a href="https://openrouter.ai"><img src="https://img.shields.io/badge/AI-Qwen_235B_%2B_GPT--4.1-purple" alt="AI"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow" alt="License"></a>
+</p>
 
-## 🧠 What It Does
+Autonomous perpetual futures trading bot — 177 markets, 5-second cycles, three AI models.
 
-A fully autonomous trading bot that scans 177 perpetual futures markets every 5 seconds, picks the best trades using three AI models, and executes with microsecond-precision entry timing and a multi-layer exit system.
+---
+
+## 🧠 Architecture
 
 ```
-  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
-  │ 📡 DATA  │───▶│ 🧠 AI    │───▶│ 📊 SIGNAL│───▶│ ⚡ TRADE │
-  │ 177 mids │    │ Qwen 235B│    │ 5 layers │    │ micro-peak│
-  │ WS ticks │    │ Maverick │    │ 7 gates  │    │ 6x-12x   │
-  │ OI·CVD   │    │ Scout    │    │ ensemble │    │ TP/SL     │
-  └──────────┘    └──────────┘    └──────────┘    └─────┬────┘
-                                                        │
-                      ┌─────────────────────────────────┘
-                      ▼
-               ┌──────────┐    ┌──────────┐
-               │ 🛡️ EXIT  │───▶│ 📈 LEARN │
-               │ breakeven │    │ outcomes │
-               │ profit-lock│   │ weights  │
-               │ trend-kill│    │ memory   │
-               └──────────┘    └──────────┘
+  ┌───────────┐     ┌────────────┐     ┌───────────┐     ┌────────────┐
+  │  📡 DATA  │────▶│  🧠 AI     │────▶│ ⚡ EXECUTE │────▶│  🛡️ EXIT  │
+  │           │     │            │     │           │     │            │
+  │ WS mids   │     │ Coin picks │     │ Micro-peak│     │ Breakeven  │
+  │ OI · CVD  │     │ Sizing     │     │ 6-12× lev │     │ Profit lock│
+  │ Orderbook │     │ Exit eval  │     │ Market IOC│     │ AI re-check│
+  │ F&G · News│     │ GPT-4.1 🔍 │     │ TP/SL set │     │ Trend-kill │
+  └───────────┘     └─────┬──────┘     └───────────┘     └─────┬──────┘
+                          │                                    │
+                          ▼                                    ▼
+                   ┌──────────────┐                   ┌──────────────┐
+                   │ 🧬 EVOLUTION │                   │ 📈 ANALYTICS │
+                   │              │                   │              │
+                   │ Full rewrite │                   │ Post-trade   │
+                   │ Auto-deploy  │                   │ Prompt optim │
+                   │ Git commit   │                   │ Weight learn │
+                   │ Auto-restart │                   │ Accuracy log │
+                   └──────────────┘                   └──────────────┘
 ```
 
 ---
@@ -36,28 +43,18 @@ A fully autonomous trading bot that scans 177 perpetual futures markets every 5 
 ## 🚀 Quick Start
 
 ```bash
-# Clone
-git clone https://github.com/winnerspiros/hyperdik.git
-cd hyperdik
-
-# Setup
+git clone https://github.com/winnerspiros/hyperdik.git && cd hyperdik
 python3 -m venv .venv && source .venv/bin/activate
 pip install hyperliquid-python-sdk eth-account xgboost numpy scikit-learn pandas
 
-# Wallet (required)
-mkdir -p ~/.hyperliquid
-cat > ~/.hyperliquid/config.json << 'EOF'
-{
-  "api_wallet": "0xYOUR_API_WALLET",
-  "api_private_key": "0xYOUR_PRIVATE_KEY",
-  "main_wallet": "0xYOUR_MAIN_WALLET"
-}
+# Hyperliquid wallet
+mkdir -p ~/.hyperliquid && cat > ~/.hyperliquid/config.json << 'EOF'
+{"api_wallet": "0xYOUR_API", "api_private_key": "0xYOUR_KEY", "main_wallet": "0xYOUR_MAIN"}
 EOF
 
-# AI (optional — enables coin selection)
+# OpenRouter API key (optional — enables AI)
 export OPENROUTER_API_KEY=your_key_here
 
-# Go
 python3 -B hyperliquid_daemon.py
 ```
 
@@ -65,172 +62,110 @@ python3 -B hyperliquid_daemon.py
 
 ## 🤖 AI Models
 
-| Model | Role | Cost |
-|---|---|---|
-| **Qwen 235B MoE** | Decisions, sizing, exits | $0.64/M tok |
-| **Llama 4 Maverick** | Coin picks, market read | $1.00/M tok |
-| **Llama 4 Scout** | Fallback (rate-limit recovery) | $0.40/M tok |
+| Model | Role | Cost | Use |
+|---|---|---|---|
+| **Qwen 235B MoE** | Decisions, sizing, exits | $0.64/M tok | Every trade decision |
+| **Llama 4 Maverick** | Coin picks, market assessment | $1.00/M tok | Per-cycle scan |
+| **Llama 4 Scout** | Auto-fallback on rate limits | $0.40/M tok | Rarely triggered |
+| **GPT‑4.1** | Evolution, post-trade analysis | $2.00/M tok | Every ~1.7h |
 
-All via [OpenRouter](https://openrouter.ai) — one API key, three models. Scout only activates when Qwen gets rate-limited.
+All via OpenRouter. GPT‑4.1 runs web-enabled (5 searches per run, 1M context window) — it reads the entire codebase and rewrites prompts, parameters, and logic autonomously.
+
+### Estimated Daily Costs
+
+| Component | Frequency | ~Cost/day |
+|---|---|---|
+| Live trading AI (Qwen + Llama) | ~2,880 calls/day | ~$3–6 |
+| Post-trade analysis (GPT‑4.1) | Per trade close | ~$0.50 |
+| Evolution (GPT‑4.1 + web) | Every ~1.7h (~14/day) | ~$0.50 |
+| **Total** | | **~$4–7/day** |
 
 ---
 
-## ⚙️ How Trades Happen
+## ⚙️ How Trades Work
 
-### 📥 Entry
+### Entry
+1. **AI scans** 40 coins per cycle, picks top 2–3 with direction, confidence, target, stop
+2. **5 signal layers** vote: composite · enriched ML · funding · whale · VWAP
+3. **7 quality gates**: VWAP extremes · ML contradiction · composite floor · EV gate · regime · survival · chase block
+4. **Micro-peak timing**: WebSocket mids at 150ms for up to 4s — catches best tick
 
-1. **AI Scan** — 40 coins per cycle (rotating window), picks top 2-3 with direction, confidence, target, stop
-2. **5 Signal Layers** vote: composite · enriched · unified ML · funding · whale
-3. **7 Quality Gates**: VWAP extremes · ML contradiction · composite floor · EV gate · regime guard · survival · chase block
-4. **Micro-Peak Timing** — samples WebSocket mids at 150ms for 4s, catches the best tick before entering
-
-### 📤 Exit
-
-| Trigger | Action |
+### Exit
+| Trigger | What happens |
 |---|---|
-| 🔒 Breakeven lock | Net ≥ fees → SL to entry, can't lose |
-| 💰 Profit lock | 0.25% · 0.50% · 1.50% · 3.00% peaks → partial close |
-| 🧠 AI re-check | Flat 5min → ask AI before kill (extends to 10min) |
-| 📉 Trend-kill | 4h strongly against → immediate |
+| 🔒 Breakeven lock | Net ≥ fees → SL moved to entry → **can't lose** |
+| 💰 Profit tiers | 0.25% · 0.50% · 1.50% · 3.00% → escalating partial closes |
+| 🧠 AI re-check | 5 min flat → AI asked before kill (extends to 10 min if yes) |
+| 📉 Trend-kill | 4h strongly against → immediate close |
 | 🩸 Bleed | Peak dropping + momentum turning → cut |
 | 🚨 Liquidation | <1% distance → force escape |
 
 ---
 
+## 🧬 Evolution — Autonomous Self-Optimization
+
+Every ~1.7 hours, GPT‑4.1 reads the **entire system state** and autonomously improves it:
+
+- **Reads**: full trade history, per-coin PnL, signal weights, AI prompts, daemon params, recent logs
+- **Searches**: 5 web queries for market context, strategy research, coin-specific news
+- **Writes**: actual code changes — rewrites AI prompts, modifies parameters, adjusts logic
+- **Deploys**: auto git-commits, restarts the daemon if code changed
+- **Cost**: ~$0.04 per run (~$0.50/day)
+
+**Prompt optimizer** runs alongside — records which prompt versions produce winning trades, then meta-prompts GPT‑4.1 to generate better prompts. A/B tests variants and graduates winners.
+
+Toggle it all in `config.yaml`.
+
+---
+
 ## 📦 Modules
 
-### 🧠 AI & Decision
-| Module | Purpose |
+| Layer | Files |
 |---|---|
-| `ai_decider.py` | Coin selection, exits, sizing, AI debate |
-| `ai_validator.py` | Second opinion on every prediction |
-| `market_intel.py` | Fear & Greed · trending coins · BTC dom · news |
+| 🧠 **AI** | `ai_decider.py` · `ai_validator.py` · `market_intel.py` |
+| 🔮 **Prediction** | `continuous_predictor.py` · `unified_predictor.py` · `perfect_predictor.py` · `ml_predictor.py` · `cryptogat_predictor.py` · `kronos_predictor.py` |
+| 📊 **Signals** | `hyperliquid_strategy.py` · `unified_direction.py` · `vwap_signal.py` · `oi_delta.py` · `cvd_engine.py` · `cvd_divergence.py` · `taker_ratio.py` · `volume_delta.py` · `imbalance_trend.py` · `market_regime.py` · `market_structure.py` · `hurst_detector.py` · `chart_patterns.py` · `funding_acceleration.py` · `hyperliquid_funding_sniper.py` |
+| 📡 **Data** | `context_enricher.py` · `market_analyzer.py` · `price_extremes.py` · `correlation_tracker.py` · `cross_exchange.py` · `sector_rotation.py` · `economic_calendar.py` |
+| 🛡️ **Risk** | `hyperliquid_risk.py` · `hrp_sizing.py` · `ev_gate.py` |
+| ⚡ **Execution** | `hyperliquid_client.py` · `hyperliquid_execution.py` · `action_executor.py` · `hyperliquid_ws.py` |
+| 🧬 **Evolution** | `hyperliquid_evolution.py` → GPT‑4.1 autonomous optimizer · `prompt_optimizer.py` → meta-prompt improvement |
+| 🔧 **Extensions** | `hyperliquid_delta_neutral.py` · `hyperliquid_learner.py` · `hyperliquid_whale.py` |
+| 💀 **Liquidation** | `liquidation_zones.py` · `liquidation_monitor.py` |
+| ⛰️ **Peaks** | `peak_exhaustion_detector.py` · `pump_detector.py` |
+| 🏠 **Main** | `hyperliquid_daemon.py` — 6,000 lines, the main loop |
 
-### 🔮 Prediction
-| Module | Purpose |
-|---|---|
-| `continuous_predictor.py` | **Primary** — 15 layers, 6 horizons |
-| `unified_predictor.py` | ML + structure + flow + macro |
-| `perfect_predictor.py` | 3-signal: funding · OB · multi-TF |
-| `ml_predictor.py` | XGBoost + LSTM models |
-| `cryptogat_predictor.py` | Graph Attention Network |
-| `kronos_predictor.py` | Transformer trajectory |
-
-### 📊 Signals
-`hyperliquid_strategy.py` · `unified_direction.py` · `vwap_signal.py` · `oi_delta.py` · `cvd_engine.py` · `cvd_divergence.py` · `taker_ratio.py` · `volume_delta.py` · `imbalance_trend.py` · `market_regime.py` · `market_structure.py` · `hurst_detector.py` · `chart_patterns.py` · `funding_acceleration.py` · `hyperliquid_funding_sniper.py`
-
-### 📡 Data
-`context_enricher.py` · `market_analyzer.py` · `price_extremes.py` · `correlation_tracker.py` · `cross_exchange.py` · `sector_rotation.py` · `economic_calendar.py`
-
-### 🛡️ Risk
-`hyperliquid_risk.py` · `hrp_sizing.py` · `ev_gate.py`
-
-### ⚡ Execution
-`hyperliquid_client.py` · `hyperliquid_execution.py` · `action_executor.py` · `hyperliquid_ws.py`
-
-### 🔧 Extensions
-`hyperliquid_delta_neutral.py` · `hyperliquid_evolution.py` · `hyperliquid_learner.py` · `hyperliquid_whale.py`
-
-### 💀 Liquidation
-`liquidation_zones.py` · `liquidation_monitor.py`
-
-### ⛰️ Peak Detection
-`peak_exhaustion_detector.py` · `pump_detector.py`
-
-### 🏠 Main
-`hyperliquid_daemon.py` — the brain stem (5,900 lines)
-
-> 📖 Full details in [`STRUCTURE.md`](STRUCTURE.md)
-
----
-
-## 🧰 Tools (`tools/`)
-
-Standalone utilities — run separately, not imported by the daemon:
-
-| Tool | What |
-|---|---|
-| `auto_retrain_ml.py` | Retrain 177 XGBoost models |
-| `hyperliquid_backtest.py` | Full pipeline backtesting |
-| `market_predictor.py` | LLM strategic forecaster |
-| `sim_fast.py` | Parameter simulation |
-| `optimize_grid.py` | Grid search 200+ combos |
-| `performance_metrics.py` | Sharpe · drawdown · win rate |
-| `prediction_memory.py` | Accuracy tracking |
-| `_analyze_trades.py` | Log-based trade review |
-| `train_ml_models.py` | Manual model training |
-| `onchain_metrics.py` | Mayer Multiple · on-chain |
-| `kraken_client.py` | Kraken Futures API |
-
----
-
-## 🎯 Parameters
-
-| What | Value |
-|---|---|
-| Leverage | 6× default, 10-12× on confluence |
-| Position size | 20% equity, 35% on 4/4 agreement |
-| Entry | Market IOC 0.5% slippage · micro-peak 4s @ 150ms |
-| Max positions | 3 |
-| Coins scanned | 40/cycle from 177 |
-| Cycle time | 5 seconds |
-
----
-
+📖 Full map in [`STRUCTURE.md`](STRUCTURE.md)
 
 ---
 
 ## ⚙️ Configuration
 
-Copy `config.yaml` and edit. All features can be toggled on/off:
+All features toggleable in `config.yaml`:
 
 ```yaml
-ai:
-  enabled: true              # Master switch — disables ALL AI
-
-trading:
-  enabled: true              # Set false for dry-run/watch-only
-  max_positions: 3
-  base_leverage: 6
-
-evolution:
-  enabled: true              # Autonomous optimizer (every ~1.7h)
-  model: "openai/gpt-4.1"    # GPT-4.1 — 1M context, best code gen
-  apply_changes: true        # Actually write changes to files
-
-analysis:
-  enabled: true              # AI analyzes every closed trade
-
-prompt_optimizer:
-  enabled: true              # Auto-improves AI prompts
-
-entry:
-  micro_peak: true           # 150ms WebSocket sampling before entry
-
-exit:
-  never_green_ai_recheck: true
-  breakeven_lock: true
-  trend_kill: true
+ai.enabled:        true   # Master AI switch
+trading.enabled:   true   # Set false for dry-run
+evolution.enabled: true   # GPT-4.1 autonomous optimizer
+analysis.enabled:  true   # Post-trade AI review
+entry.micro_peak:  true   # 150ms WS sampling
+exit.breakeven_lock: true # Never lose on fees
 ```
+
+---
+
+## 🎯 Defaults
+
+| What | Value |
+|---|---|
+| Leverage | 6× (10–12× on full confluence) |
+| Position size | 20% equity (35% on confluence) |
+| Max positions | 3 |
+| Entry | Market IOC · 0.5% slippage · micro-peak 4s |
+| Cycle | 5 seconds |
+| Markets | 177 perpetuals, rotating 40/cycle |
 
 ---
 
 ## 📄 License
 
 MIT — see [LICENSE](LICENSE)
-
----
-
-## 💡 Approach
-
-> 🧠 **AI is the brain** — send maximum data, trust its decisions over mechanical gates
->
-> 🎯 **Better model > tighter gates** — a smarter AI fixes bad decisions, not stricter thresholds
->
-> 📈 **Catch trends early** — don't chase pumps, ride the move from the start
->
-> 🪙 **Trade the alts** — BTC/ETH for macro context only
->
-> ⚡ **Every basis point counts** — micro-peak entry for better prices
->
-> 🔄 **Stay active** — inaction is also a loss
