@@ -49,3 +49,4 @@ data/predictions/
 data/ml_models/
 *.db
 *.sqlite
+data/delta_neutral_state.json
