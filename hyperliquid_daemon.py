@@ -5900,6 +5900,14 @@ def run(dry_run: bool = False):
                     from hyperliquid_ws import trim_field as _ws_trim
                     _ws_trim("funding_updates", -5)
             except Exception:
+                # ── Log rotation: keep last 500 lines, max 1MB ──
+                try:
+                    log_path = ROOT / "logs" / "hyperliquid_daemon.log"
+                    if log_path.exists() and log_path.stat().st_size > 1_000_000:
+                        kept = log_path.read_text().split("\n")[-500:]
+                        log_path.write_text("\n".join(kept) + "\n")
+                except Exception:
+                    pass
                 pass
 
             # Persist arb state every 10 cycles

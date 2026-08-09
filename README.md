@@ -138,6 +138,21 @@ Toggle it all in `config.yaml`.
 
 ---
 
+
+---
+
+## 💻 System Requirements
+
+| Resource | Minimum | Recommended |
+|---|---|---|
+| RAM | 256 MB | 512 MB |
+| CPU | 1 vCPU | 2 vCPU |
+| Storage | 100 MB | 500 MB |
+| Python | 3.10+ | 3.12+ |
+| Network | 1 Mbps | 10 Mbps |
+
+**Storage notes**: All files are capped — AI cache (200 entries, ~150KB), logs (500 lines, ~1MB), trade memory (500 entries). WebSocket buffers trimmed to 20 fills / 5 funding updates. No unbounded growth.
+
 ## ⚙️ Configuration
 
 All features toggleable in `config.yaml`:
