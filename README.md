@@ -18,7 +18,7 @@ Autonomous perpetual futures trading — 177 markets, 5-second cycles, three AI 
 | **Exchange** | [Hyperliquid](https://hyperliquid.xyz) perpetual futures |
 | **Models** | Qwen 235B · Llama 4 Maverick · Llama 4 Scout · GPT‑4.1 |
 | **Markets** | 177 coins, rotating 40 per cycle |
-| **Cycle** | 5 seconds |
+| **Cycle** | 3 seconds (configurable) |
 | **License** | [MIT](LICENSE) |
 | **Daily cost** | ~$1.90 |
 
@@ -164,7 +164,7 @@ exit.breakeven_lock:true   # Never lose on fees alone
 | Position size | 20% equity (35% on confluence) |
 | Max positions | 3 |
 | Entry | Market IOC · 0.5% slippage · micro-peak 4s |
-| Cycle | 5 seconds |
+| Cycle | 3 seconds (configurable) |
 | Markets | 177 perpetuals, rotating 40 per cycle |
 
 

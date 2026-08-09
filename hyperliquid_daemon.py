@@ -669,6 +669,9 @@ def _micro_peak_entry_wait(coin: str, is_buy: bool, px: float, max_wait: float =
     if _seen_favorable:
         return _best
     return px
+
+
+def _check_recent_move(coin: str, side: str) -> dict:
     """Check if price already moved significantly in the trade direction.
     
     Returns dict with:
@@ -1231,8 +1234,8 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
         if _chase["block"]:
             log.warning(f"  🚫 {coin}: CHASE BLOCK — {_chase['detail']}")
             return False
-
-            result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
+        
+        result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
         if isinstance(result, dict) and result.get("status") == "err":
             log.error(f"  DIRECT OPEN {coin}: {result.get('error', 'unknown')}")
             return False
@@ -2211,25 +2214,54 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                             _rev_count_key = cu.upper()
                             _rev_count = _REVERSE_COUNT.get(_rev_count_key, 0)
                             if exit_reason.startswith("TREND-KILL") and _loss_pct < 2.0 and _rev_count < 1:
-                                _REVERSE_COUNT[_rev_count_key] = _rev_count + 1
-                                # Open 50% size in opposite direction, targeting loss recovery
+                                # ── MACRO GATE: don't reverse against broad market direction ──
+                                _btc_mid = float(mids.get("BTC", 0))
+                                _eth_mid = float(mids.get("ETH", 0))
+                                _btc_ext = get_extremes("BTC", mids) if _btc_mid > 0 else None
+                                _eth_ext = get_extremes("ETH", mids) if _eth_mid > 0 else None
+                                _fg = _get_fear_greed()
                                 _rev_side = "SELL" if _orig_side == "BUY" else "BUY"
-                                _rev_buy = _rev_side == "BUY"
-                                _rev_size_pct = 0.50  # 50% of original position
-                                _rev_notional = _orig_szi * mid * leverage * _rev_size_pct
-                                _rev_tp_pct = _loss_pct * 1.1  # Recover loss + 10% buffer
-                                _rev_sl_pct = 0.3  # Tight SL — don't compound losses
-                                _rev_tp = mid * (1 + _rev_tp_pct / 100) if _rev_buy else mid * (1 - _rev_tp_pct / 100)
-                                _rev_sl = mid * (1 - _rev_sl_pct / 100) if _rev_buy else mid * (1 + _rev_sl_pct / 100)
-                                log.info(f"  🔄 {coin}: REVERSE {_rev_side} — {_rev_size_pct*100:.0f}% size "
-                                       f"${_rev_notional:.1f} @ {leverage}x, TP to recover {_loss_pct:+.2f}% loss")
-                                try:
-                                    _rev_result = hl.market_open(coin, _rev_buy, _rev_notional, slippage=0.005, order_type="Ioc")
-                                    if _rev_result and not (isinstance(_rev_result, dict) and _rev_result.get("status") == "err"):
-                                        _place_retry_tpsl(coin, _rev_buy, _rev_notional, _rev_sl, [{"price": _rev_tp, "fraction": 1.0}])
-                                        log.info(f"  ✅ {coin}: REVERSE opened — TP={_rev_tp:.4f} SL={_rev_sl:.4f}")
-                                except Exception as _re:
-                                    log.warning(f"  🔄 {coin}: reverse failed: {_re}")
+                                _macro_block = False
+                                _macro_reason = ""
+                                if _rev_side == "SELL":
+                                    _btc_up = (_btc_ext.pct_1h if _btc_ext else 0) > 1.5
+                                    _eth_up = (_eth_ext.pct_1h if _eth_ext else 0) > 1.5
+                                    if _btc_up or _eth_up:
+                                        _macro_block = True
+                                        _macro_reason = f"BTC/ETH pumping — can't short into bull ({('BTC' if _btc_up else 'ETH')}+1h)"
+                                    elif _fg > 70:
+                                        _macro_block = True
+                                        _macro_reason = f"Fear={_fg} greed — can't short"
+                                else:
+                                    _btc_dn = (_btc_ext.pct_low_1h if _btc_ext else 0) > 1.5
+                                    _eth_dn = (_eth_ext.pct_low_1h if _eth_ext else 0) > 1.5
+                                    if _btc_dn or _eth_dn:
+                                        _macro_block = True
+                                        _macro_reason = f"BTC/ETH dumping — can't long into bear ({('BTC' if _btc_dn else 'ETH')}-1h)"
+                                    elif _fg < 25:
+                                        _macro_block = True
+                                        _macro_reason = f"Fear={_fg} extreme — can't long into panic"
+                                if _macro_block:
+                                    log.warning(f"  🛑 {coin}: REVERSE BLOCKED — {_macro_reason}")
+                                else:
+                                    _REVERSE_COUNT[_rev_count_key] = _rev_count + 1
+                                    # Open 50% size in opposite direction, targeting loss recovery
+                                    _rev_buy = _rev_side == "BUY"
+                                    _rev_size_pct = 0.50  # 50% of original position
+                                    _rev_notional = _orig_szi * mid * leverage * _rev_size_pct
+                                    _rev_tp_pct = _loss_pct * 1.1  # Recover loss + 10% buffer
+                                    _rev_sl_pct = 0.3  # Tight SL — don't compound losses
+                                    _rev_tp = mid * (1 + _rev_tp_pct / 100) if _rev_buy else mid * (1 - _rev_tp_pct / 100)
+                                    _rev_sl = mid * (1 - _rev_sl_pct / 100) if _rev_buy else mid * (1 + _rev_sl_pct / 100)
+                                    log.info(f"  🔄 {coin}: REVERSE {_rev_side} — {_rev_size_pct*100:.0f}% size "
+                                           f"${_rev_notional:.1f} @ {leverage}x, TP to recover {_loss_pct:+.2f}% loss")
+                                    try:
+                                        _rev_result = hl.market_open(coin, _rev_buy, _rev_notional, slippage=0.005, order_type="Ioc")
+                                        if _rev_result and not (isinstance(_rev_result, dict) and _rev_result.get("status") == "err"):
+                                            _place_retry_tpsl(coin, _rev_buy, _rev_notional, _rev_sl, [{"price": _rev_tp, "fraction": 1.0}])
+                                            log.info(f"  ✅ {coin}: REVERSE opened — TP={_rev_tp:.4f} SL={_rev_sl:.4f}")
+                                    except Exception as _re:
+                                        log.warning(f"  🔄 {coin}: reverse failed: {_re}")
                             continue
                         except Exception as de:
                             log.warning(f"  💀 {coin}: close failed: {de}")
