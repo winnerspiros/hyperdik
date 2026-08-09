@@ -5805,8 +5805,21 @@ def run(dry_run: bool = False):
 
                     evo_requests = evolve_parameters(evo_state.segments, evo_state)
                     if evo_requests:
-                            log.info(f"  Evolution requested: {len(evo_requests)} param changes to review")
-                            log.info(f"  Prompt ready for AI review ({len(evo_requests[0]['prompt'])} chars)")
+                        log.info(f"  Evolution requested: {len(evo_requests)} param changes to review")
+                        log.info(f"  Prompt ready for AI review ({len(evo_requests[0]['prompt'])} chars)")
+                        # Actually call AI with web search (Aug 9: was a stub)
+                        try:
+                            results = run_evolution_analysis(evo_requests)
+                            if results:
+                                for r in results:
+                                    a = r.get("analysis", "")[:150]
+                                    s = r.get("suggestions", [])
+                                    if a:
+                                        log.info(f"  Evo AI: {a}")
+                                    for sg in s[:3]:
+                                        log.info(f"     {sg.get('param','?')}: {sg.get('current','?')}->{sg.get('suggested','?')}")
+                        except Exception as e:
+                            log.info(f"  Evo AI call failed: {type(e).__name__}")
 
                     evo_state.save()
 
