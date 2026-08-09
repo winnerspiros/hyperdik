@@ -17,8 +17,6 @@
 [![AI](https://img.shields.io/badge/AI-Qwen_235B_%2B_Llama_4-purple)](https://openrouter.ai)
 [![Status](https://img.shields.io/badge/Status-Live-brightgreen)]()
 
-> *"stupid name till i think of something better"*
-
 ---
 
 ## 🧠 What It Does
