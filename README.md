@@ -1,21 +1,60 @@
-# Hyperliquid AI Trading Bot
+# 🤖 Hyperliquid AI Trading Bot
 
-AI-driven perpetual futures trading on [Hyperliquid](https://hyperliquid.xyz) — 177 coins, 5-second cycles, 47 modules.
+```
+╔══════════════════════════════════════════════════════════════╗
+║  ██╗  ██╗██╗   ██╗██████╗ ███████╗██████╗ ██╗     ██╗██████╗  ║
+║  ██║  ██║╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗██║     ██║██╔══██╗ ║
+║  ███████║ ╚████╔╝ ██████╔╝█████╗  ██████╔╝██║     ██║██║  ██║ ║
+║  ██╔══██║  ╚██╔╝  ██╔═══╝ ██╔══╝  ██╔══██╗██║     ██║██║  ██║ ║
+║  ██║  ██║   ██║   ██║     ███████╗██║  ██║███████╗██║██████╔╝ ║
+║  ╚═╝  ╚═╝   ╚═╝   ╚═╝     ╚══════╝╚═╝  ╚═╝╚══════╝╚═╝╚═════╝  ║
+╚══════════════════════════════════════════════════════════════╝
+       AI-Driven Perpetual Futures · 177 Coins · 5s Cycles
+```
 
-**Models**: Qwen 235B MoE (decisions) + Llama 4 Maverick (picks) + Llama 4 Scout (fallback) — all via OpenRouter.
+[![Python](https://img.shields.io/badge/Python-3.12+-blue)](https://python.org)
+[![Hyperliquid](https://img.shields.io/badge/Exchange-Hyperliquid-green)](https://hyperliquid.xyz)
+[![AI](https://img.shields.io/badge/AI-Qwen_235B_%2B_Llama_4-purple)](https://openrouter.ai)
+[![Status](https://img.shields.io/badge/Status-Live-brightgreen)]()
 
 ---
 
-## Quick Start
+## 🧠 What It Does
+
+A fully autonomous trading bot that scans 177 perpetual futures markets every 5 seconds, picks the best trades using three AI models, and executes with microsecond-precision entry timing and a multi-layer exit system.
+
+```
+  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+  │ 📡 DATA  │───▶│ 🧠 AI    │───▶│ 📊 SIGNAL│───▶│ ⚡ TRADE │
+  │ 177 mids │    │ Qwen 235B│    │ 5 layers │    │ micro-peak│
+  │ WS ticks │    │ Maverick │    │ 7 gates  │    │ 6x-12x   │
+  │ OI·CVD   │    │ Scout    │    │ ensemble │    │ TP/SL     │
+  └──────────┘    └──────────┘    └──────────┘    └─────┬────┘
+                                                        │
+                      ┌─────────────────────────────────┘
+                      ▼
+               ┌──────────┐    ┌──────────┐
+               │ 🛡️ EXIT  │───▶│ 📈 LEARN │
+               │ breakeven │    │ outcomes │
+               │ profit-lock│   │ weights  │
+               │ trend-kill│    │ memory   │
+               └──────────┘    └──────────┘
+```
+
+---
+
+## 🚀 Quick Start
 
 ```bash
+# Clone
 git clone https://github.com/winnerspiros/hyperliquid-trading-bot.git
 cd hyperliquid-trading-bot
 
+# Setup
 python3 -m venv .venv && source .venv/bin/activate
 pip install hyperliquid-python-sdk eth-account xgboost numpy scikit-learn pandas
 
-# Hyperliquid wallet (required)
+# Wallet (required)
 mkdir -p ~/.hyperliquid
 cat > ~/.hyperliquid/config.json << 'EOF'
 {
@@ -25,164 +64,139 @@ cat > ~/.hyperliquid/config.json << 'EOF'
 }
 EOF
 
-# OpenRouter key (optional — enables AI coin selection)
+# AI (optional — enables coin selection)
 export OPENROUTER_API_KEY=your_key_here
 
-# Run
+# Go
 python3 -B hyperliquid_daemon.py
 ```
 
 ---
 
-## How It Works
+## 🤖 AI Models
 
-```
-  Account  →  Mids  →  OI  →  Market Intel  →  Sector Scan
-     │
-     ▼
-  Coin Rotation (40 of 177)  →  AI Picks Top 2-3
-     │
-     ▼
-  Enrich  →  Composite  →  Unified  →  ML  →  Gates
-     │
-     ▼
-  AI Sizing  →  Micro-Peak Entry  →  Execute
-     │
-     ▼
-  Monitor  →  Exit Eval  →  TP/SL  →  Breakeven Lock
-```
+| Model | Role | Cost |
+|---|---|---|
+| **Qwen 235B MoE** | Decisions, sizing, exits | $0.64/M tok |
+| **Llama 4 Maverick** | Coin picks, market read | Free |
+| **Llama 4 Scout** | Auto-fallback | Free |
 
-**Entry** — AI scans rotating 40-coin window each cycle, picks 2-3 candidates with direction, confidence, target, and stop. Five signal layers vote (composite, enriched, unified ML, funding, whale). Trades pass quality gates (VWAP extremes, ML contradiction, composite floor, EV gate). Before market entry, samples WebSocket mids at 150ms for up to 4s to catch a better price.
-
-**Exit** — Breakeven lock: once net PnL covers fees, exchange SL moves to entry price. Tiered profit locks at 0.25%, 0.50%, 1.50%, and 3.00% peaks. Flat positions get an AI re-check at 5 minutes before killing. Positions trending strongly against are cut immediately. Liquidation survival triggers at <1% distance.
+All via [OpenRouter](https://openrouter.ai) — one API key, three models.
 
 ---
 
-## Modules
+## ⚙️ How Trades Happen
 
-### AI
-| Module | Role |
-|---|---|
-| `ai_decider.py` | Coin selection, exit evaluation, sizing, debate |
-| `ai_validator.py` | Second-opinion on every AI decision |
-| `market_intel.py` | Fear & Greed index, trending coins, BTC dominance, news |
+### 📥 Entry
 
-### Prediction
-| Module | Role |
+1. **AI Scan** — 40 coins per cycle (rotating window), picks top 2-3 with direction, confidence, target, stop
+2. **5 Signal Layers** vote: composite · enriched · unified ML · funding · whale
+3. **7 Quality Gates**: VWAP extremes · ML contradiction · composite floor · EV gate · regime guard · survival · chase block
+4. **Micro-Peak Timing** — samples WebSocket mids at 150ms for 4s, catches the best tick before entering
+
+### 📤 Exit
+
+| Trigger | Action |
 |---|---|
-| `continuous_predictor.py` | 15-layer ensemble, 6 time horizons |
-| `unified_predictor.py` | ML + market structure + liquidity flow |
-| `perfect_predictor.py` | 3-signal approach — funding, order book, multi-TF |
+| 🔒 Breakeven lock | Net ≥ fees → SL to entry, can't lose |
+| 💰 Profit lock | 0.25% · 0.50% · 1.50% · 3.00% peaks → partial close |
+| 🧠 AI re-check | Flat 5min → ask AI before kill (extends to 10min) |
+| 📉 Trend-kill | 4h strongly against → immediate |
+| 🩸 Bleed | Peak dropping + momentum turning → cut |
+| 🚨 Liquidation | <1% distance → force escape |
+
+---
+
+## 📦 Modules
+
+### 🧠 AI & Decision
+| Module | Purpose |
+|---|---|
+| `ai_decider.py` | Coin selection, exits, sizing, AI debate |
+| `ai_validator.py` | Second opinion on every prediction |
+| `market_intel.py` | Fear & Greed · trending coins · BTC dom · news |
+
+### 🔮 Prediction
+| Module | Purpose |
+|---|---|
+| `continuous_predictor.py` | **Primary** — 15 layers, 6 horizons |
+| `unified_predictor.py` | ML + structure + flow + macro |
+| `perfect_predictor.py` | 3-signal: funding · OB · multi-TF |
 | `ml_predictor.py` | XGBoost + LSTM models |
-| `cryptogat_predictor.py` | Graph Attention Network — cross-coin signals |
-| `kronos_predictor.py` | Transformer trajectory prediction |
+| `cryptogat_predictor.py` | Graph Attention Network |
+| `kronos_predictor.py` | Transformer trajectory |
 
-### Signals
-| Module | Role |
-|---|---|
-| `hyperliquid_strategy.py` | 5-pillar composite signal + ensemble |
-| `unified_direction.py` | Directional consensus from all layers |
-| `vwap_signal.py` | VWAP deviation, sigma bands, mean reversion |
-| `oi_delta.py` | Open Interest delta + price/OI divergence |
-| `cvd_engine.py` | Cumulative Volume Delta from real trades |
-| `cvd_divergence.py` | CVD/price divergence detection |
-| `taker_ratio.py` | Taker buy/sell ratio |
-| `volume_delta.py` | Bar-level buy vs sell volume |
-| `imbalance_trend.py` | Order book imbalance trending |
-| `market_regime.py` | Regime — trending, ranging, volatile, extreme |
-| `market_structure.py` | Swing points, BOS/CHOCH, structure breaks |
-| `hurst_detector.py` | Hurst exponent — mean reversion vs trending |
-| `chart_patterns.py` | Classical chart pattern recognition |
-| `funding_acceleration.py` | Funding rate change velocity |
-| `hyperliquid_funding_sniper.py` | Full funding rate context + prediction |
+### 📊 Signals
+`hyperliquid_strategy.py` · `unified_direction.py` · `vwap_signal.py` · `oi_delta.py` · `cvd_engine.py` · `cvd_divergence.py` · `taker_ratio.py` · `volume_delta.py` · `imbalance_trend.py` · `market_regime.py` · `market_structure.py` · `hurst_detector.py` · `chart_patterns.py` · `funding_acceleration.py` · `hyperliquid_funding_sniper.py`
 
-### Data
-| Module | Role |
-|---|---|
-| `context_enricher.py` | Assembles rich AI context from all sources |
-| `market_analyzer.py` | Market-wide heat, breadth, regime |
-| `price_extremes.py` | Multi-TF range position, dynamic TP targets |
-| `correlation_tracker.py` | Rolling correlations between positions |
-| `cross_exchange.py` | Binance/HL price divergence |
-| `sector_rotation.py` | Sector momentum tracking |
-| `economic_calendar.py` | Upcoming events — FOMC, CPI, etc. |
+### 📡 Data
+`context_enricher.py` · `market_analyzer.py` · `price_extremes.py` · `correlation_tracker.py` · `cross_exchange.py` · `sector_rotation.py` · `economic_calendar.py`
 
-### Risk
-| Module | Role |
-|---|---|
-| `hyperliquid_risk.py` | WEL/TWEL limits, HSL, position caps |
-| `hrp_sizing.py` | Hierarchical Risk Parity sizing |
-| `ev_gate.py` | Expected Value gate — blocks negative-EV trades |
+### 🛡️ Risk
+`hyperliquid_risk.py` · `hrp_sizing.py` · `ev_gate.py`
 
-### Execution
-| Module | Role |
-|---|---|
-| `hyperliquid_client.py` | SDK wrapper, adaptive rate limiter, all API calls |
-| `hyperliquid_execution.py` | Order placement, fills, TP/SL management |
-| `action_executor.py` | Pipeline-based action execution |
-| `hyperliquid_ws.py` | WebSocket — real-time trades, books, mids |
+### ⚡ Execution
+`hyperliquid_client.py` · `hyperliquid_execution.py` · `action_executor.py` · `hyperliquid_ws.py`
 
-### Extensions
-| Module | Role |
-|---|---|
-| `hyperliquid_delta_neutral.py` | Delta-neutral position balancing |
-| `hyperliquid_evolution.py` | Strategy parameter optimization |
-| `hyperliquid_learner.py` | Self-learning from trade outcomes |
-| `hyperliquid_whale.py` | Whale wallet activity tracking |
+### 🔧 Extensions
+`hyperliquid_delta_neutral.py` · `hyperliquid_evolution.py` · `hyperliquid_learner.py` · `hyperliquid_whale.py`
 
-### Liquidation
-| Module | Role |
-|---|---|
-| `liquidation_zones.py` | Order book depth clusters, heatmap zones |
-| `liquidation_monitor.py` | Real-time WS fill monitoring + cascade detection |
+### 💀 Liquidation
+`liquidation_zones.py` · `liquidation_monitor.py`
 
-### Peak Detection
-| Module | Role |
-|---|---|
-| `peak_exhaustion_detector.py` | Candle-level RSI divergence + tick-level order book thinning |
-| `pump_detector.py` | Pump & dump detection for AI risk context |
+### ⛰️ Peak Detection
+`peak_exhaustion_detector.py` · `pump_detector.py`
 
-### Main
-| Module | Role |
-|---|---|
-| `hyperliquid_daemon.py` | Main loop — entry, exit, position monitor, signal scan |
+### 🏠 Main
+`hyperliquid_daemon.py` — the brain stem (5,900 lines)
+
+> 📖 Full details in [`STRUCTURE.md`](STRUCTURE.md)
 
 ---
 
-## Tools (`tools/`)
+## 🧰 Tools (`tools/`)
 
-Standalone utilities — not imported by the daemon:
+Standalone utilities — run separately, not imported by the daemon:
 
-| Script | Purpose |
+| Tool | What |
 |---|---|
-| `auto_retrain_ml.py` | Auto-retrain 177 XGBoost models every 6h |
-| `train_ml_models.py` | Manual ML model training |
+| `auto_retrain_ml.py` | Retrain 177 XGBoost models |
 | `hyperliquid_backtest.py` | Full pipeline backtesting |
-| `market_predictor.py` | LLM strategic market forecaster |
-| `sim_fast.py` | Fast parameter simulation |
-| `optimize_grid.py` | Grid search over 200+ parameter combos |
-| `performance_metrics.py` | Trade analytics — Sharpe, drawdown, win rate |
-| `prediction_memory.py` | Track prediction accuracy over time |
-| `_analyze_trades.py` | Parse daemon logs for trade review |
-| `onchain_metrics.py` | Mayer Multiple, on-chain summaries |
-| `kraken_client.py` | Kraken Futures API (cross-exchange) |
+| `market_predictor.py` | LLM strategic forecaster |
+| `sim_fast.py` | Parameter simulation |
+| `optimize_grid.py` | Grid search 200+ combos |
+| `performance_metrics.py` | Sharpe · drawdown · win rate |
+| `prediction_memory.py` | Accuracy tracking |
+| `_analyze_trades.py` | Log-based trade review |
+| `train_ml_models.py` | Manual model training |
+| `onchain_metrics.py` | Mayer Multiple · on-chain |
+| `kraken_client.py` | Kraken Futures API |
 
 ---
 
-## Key Parameters
+## 🎯 Parameters
 
-**Entry**: 6x default leverage (10-12x on 4/4 confluence), 20% equity per position (35% on confluence), 0.5% slippage market IOC, 4s micro-peak window at 150ms samples.
-
-**Exit**: Breakeven lock at net ≥ 0.42%, profit lock tiers at 0.25/0.50/1.50/3.00%, flat-position AI re-check at 300s (extends to 600s if AI confirms), trend-kill at 4h <1.5% from extreme, bleed detection at >0.3% drop with momentum turning.
-
-**Risk**: TWEL 100%, WEL 40% per direction, HSL dynamic drawdown, max 3 positions.
+| What | Value |
+|---|---|
+| Leverage | 6× default, 10-12× on confluence |
+| Position size | 20% equity, 35% on 4/4 agreement |
+| Entry | Market IOC 0.5% slippage · micro-peak 4s @ 150ms |
+| Max positions | 3 |
+| Coins scanned | 40/cycle from 177 |
+| Cycle time | 5 seconds |
 
 ---
 
-## Approach
+## 💡 Approach
 
-- Trust AI decisions over mechanical gates — send max data, let the model decide
-- Better model quality fixes bad decisions better than stricter thresholds
-- BTC/ETH for macro context only — trade the alt coins
-- Don't chase pumps, catch trends early, stay active
-- Every basis point on entry matters — micro-peak timing for better prices
+> 🧠 **AI is the brain** — send maximum data, trust its decisions over mechanical gates
+>
+> 🎯 **Better model > tighter gates** — a smarter AI fixes bad decisions, not stricter thresholds
+>
+> 📈 **Catch trends early** — don't chase pumps, ride the move from the start
+>
+> 🪙 **Trade the alts** — BTC/ETH for macro context only
+>
+> ⚡ **Every basis point counts** — micro-peak entry for better prices
+>
+> 🔄 **Stay active** — inaction is also a loss
