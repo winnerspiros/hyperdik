@@ -1192,23 +1192,62 @@ def analyze_closed_trade(trade_data: dict, market_context: str = "") -> dict:
     result["coin"] = coin
     result["pnl_pct"] = pnl_pct
     return result
-
-
 def run_evolution_analysis(evo_requests: list) -> list:
-    """Run AI evolution analysis on accumulated trade segments with web search."""
+    """Run AI evolution analysis with web search + premium model.
+    Now uses the full evolution engine (v2) — massive data dump, web search, code changes.
+    """
     results = []
-    for req in evo_requests:
-        prompt = req.get("prompt", "")
-        if not prompt:
-            continue
-        prompt += (
-            "\n\nSearch the web for current crypto market conditions, volatility trends, "
-            "and sector rotation data to inform your parameter suggestions. "
-            "CRITICAL: Never suggest reducing trade frequency or position count. "
-            "More trades = more learning. Suggest parameter changes that INCREASE "
-            "opportunity capture, not reduce risk."
-        )
-        result = _call_llm_web(prompt, model=MODEL_CHEAP, max_tokens=500)
-        result["segment"] = req.get("segments_analyzed", 0)
-        results.append(result)
+    
+    # Use the new evolution engine for full system context
+    try:
+        from hyperliquid_evolution import run_full_evolution, apply_changes
+        evo = run_full_evolution()
+        prompt = evo.get("prompt", "")
+    except Exception:
+        # Fallback to old prompt if v2 engine fails
+        if evo_requests:
+            prompt = evo_requests[0].get("prompt", "")
+        else:
+            return [{"analysis": "no_prompt", "suggestions": []}]
+    
+    if not prompt:
+        return [{"analysis": "empty_prompt", "suggestions": []}]
+    
+    # Use PREMIUM model — evolution runs rarely, worth the best quality
+    result = _call_llm_web(prompt, model=MODEL_CHEAP, max_tokens=1200, temperature=0.4)
+    
+    # Apply AI-suggested changes to actual files
+    changes = result.get("changes", [])
+    if changes:
+        try:
+            from hyperliquid_evolution import apply_changes
+            applied = apply_changes(changes, dry_run=False)
+            result["applied"] = applied
+            # Auto-commit via git
+            import subprocess
+            subprocess.run(["git", "-C", str(Path(__file__).parent), "add", "-A"], 
+                         capture_output=True, timeout=10)
+            subprocess.run(["git", "-C", str(Path(__file__).parent), "commit", 
+                          "-m", f"Evo: AI-optimized — {len(applied)} changes"],
+                         capture_output=True, timeout=10)
+        except Exception as e:
+            result["applied"] = [f"apply_error: {e}"]
+    
+    # Restart daemon if needed
+    if result.get("restart_required") and changes and result.get("applied"):
+        try:
+            import subprocess, os
+            subprocess.run(["pkill", "-f", "python3.*hyperliquid_daemon"], capture_output=True)
+            time.sleep(2)
+            daemon_path = Path(__file__).parent / "hyperliquid_daemon.py"
+            subprocess.Popen(["python3", "-B", str(daemon_path)],
+                           cwd=str(Path(__file__).parent),
+                           stdout=open(str(Path(__file__).parent / "logs" / "hyperliquid_daemon.log"), "w"),
+                           stderr=open(str(Path(__file__).parent / "logs" / "hyperliquid_daemon_error.log"), "w"))
+            result["restarted"] = True
+        except Exception as e:
+            result["restarted"] = False
+            result["restart_error"] = str(e)
+    
+    results.append(result)
     return results
