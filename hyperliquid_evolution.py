@@ -1,69 +1,435 @@
 #!/usr/bin/env python3
 """
-HYPERDIK Evolution Engine v2 — Autonomous trading system optimizer.
+Hyperliquid Evolution Engine — LLM-based parameter optimization via
+segmented backtest reflection (Moss-style evolution loop).
 
-Capabilities:
-  - Rewrite AI prompts sent to Qwen/Llama
-  - Modify daemon code (with file writes)
-  - Adjust ALL strategy parameters (no caps when justified)
-  - Restart daemon after changes
-  - Web search for market context + strategy research
+FLOW:
+  1. Collect trade performance data in weekly segments
+  2. Compute per-segment metrics (WR, PF, avg win/loss, drawdown)
+  3. LLM reads evolution_log, applies 7 Reflection Principles
+  4. LLM produces micro-adjustments (±10% per param, max ±30% drift)
+  5. Rerun with new params; repeat weekly
 
-Safety:
-  - All changes logged to evolution_state.json
-  - Git auto-commit after every evolution run
-  - Old files backed up before modification
-  - Daemon restart only if code changes were applied
+PERSONALITY PARAMS (locked): weights, leverage, bias, rolling
+TACTICAL PARAMS (adjustable): stop/TP multiples, threshold pcts, EMA spans
+
+Built from:
+  - moss-trade-bot-skills — 7 Reflection Principles, personality/tactical split
+  - master-confluence — strategy decay, shadow signaling
 """
 
-import json, os, time, hashlib, subprocess
+from __future__ import annotations
+
+import json
+import os
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from dataclasses import dataclass, field
 from typing import Any
 
-ROOT = Path(__file__).parent
-STATE_PATH = ROOT / "data" / "evolution_state.json"
-TRADE_LOG = ROOT / "data" / "trade_memory.json"
-WEIGHTS_PATH = ROOT / "data" / "continuous_weights.json"
-LEARNED_PATH = ROOT / "data" / "learned_weights.json"
+
+# ============================================================
+# Parameter Schemas
+# ============================================================
+
+@dataclass
+class PersonalityParams:
+    """Locked personality params — define the strategy's core identity."""
+    trend_weight: float = 0.30
+    momentum_weight: float = 0.25
+    mean_reversion_weight: float = 0.15
+    volume_weight: float = 0.15
+    volatility_weight: float = 0.15
+    long_bias: float = 0.5
+    base_leverage: int = 3
+    max_positions: int = 5
+    rolling_enabled: bool = False
+    rolling_trigger_pct: float = 0.30
+    rolling_reinvest_pct: float = 0.80
+    rolling_max_times: int = 3
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in self.__dict__.items()}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PersonalityParams":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
 
-# ═══════════════════════════════════════════════════════════
-# DATA DUMP — feeds the AI EVERYTHING
-# ═══════════════════════════════════════════════════════════
+@dataclass
+class TacticalParams:
+    """Adjustable tactical params — optimized by evolution loop.
+    Bounded: ±30% drift from initial values."""
+    # Stops & Targets
+    stop_atr_mult: float = 1.8
+    tp1_r_mult: float = 0.30
+    tp2_r_mult: float = 0.50
+    tp3_r_mult: float = 1.20
+    trail_atr_mult: float = 2.0
+
+    # Entry thresholds
+    rsi_buy_max: float = 45.0
+    rsi_sell_min: float = 55.0
+    bb_pct_buy: float = 0.35
+    bb_pct_sell: float = 0.65
+    adx_trend_min: float = 25.0
+    adx_sideways_max: float = 30.0
+
+    # Risk
+    max_risk_pct: float = 0.02
+    cooldown_seconds: float = 1800.0
+    unstuck_age_seconds: float = 7200.0
+    unstuck_close_pct: float = 0.50
+
+    # Volatility
+    vol_scalar_min: float = 0.5
+    vol_scalar_max: float = 1.5
+    target_atr_pct: float = 0.01
+
+    def to_dict(self) -> dict:
+        return {k: v for k, v in self.__dict__.items()}
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "TacticalParams":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+# ============================================================
+# Evolution State
+# ============================================================
+
+@dataclass
+class SegmentMetrics:
+    """Performance metrics for a single time segment."""
+    segment_id: str
+    start_time: str
+    end_time: str
+    trades: int
+    wins: int
+    losses: int
+    win_rate: float
+    profit_factor: float
+    total_pnl: float
+    avg_win: float
+    avg_loss: float
+    max_drawdown_pct: float
+    sharpe: float
+    long_trades: int
+    short_trades: int
+    exit_reasons: dict[str, int] = field(default_factory=dict)
+    market_context: str = ""
+
+
+@dataclass
+class EvolutionState:
+    """Persistent evolution state."""
+    version: int = 0
+    personality: PersonalityParams = field(default_factory=PersonalityParams)
+    tactical: TacticalParams = field(default_factory=TacticalParams)
+    initial_tactical: dict = field(default_factory=dict)
+    segments: list[SegmentMetrics] = field(default_factory=list)
+    last_evolution: str = ""
+    adjustments: list[dict] = field(default_factory=list)
+    rounds_since_change: int = 0
+
+    def save(self, path: str = "data/evolution_state.json") -> None:
+        """Persist evolution state."""
+        data = {
+            "version": self.version,
+            "personality": self.personality.to_dict(),
+            "tactical": self.tactical.to_dict(),
+            "initial_tactical": self.initial_tactical,
+            "segments": [s.__dict__ for s in self.segments[-20:]],  # Keep last 20
+            "last_evolution": self.last_evolution,
+            "adjustments": self.adjustments[-50:],  # Keep last 50
+            "rounds_since_change": self.rounds_since_change,
+        }
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+
+    @classmethod
+    def load(cls, path: str = "data/evolution_state.json") -> "EvolutionState":
+        """Load evolution state from disk."""
+        if not os.path.exists(path):
+            state = cls()
+            state.initial_tactical = state.tactical.to_dict()
+            return state
+
+        with open(path) as f:
+            data = json.load(f)
+
+        state = cls()
+        state.version = data.get("version", 0) + 1
+        state.personality = PersonalityParams.from_dict(data.get("personality", {}))
+        state.tactical = TacticalParams.from_dict(data.get("tactical", {}))
+        state.initial_tactical = data.get("initial_tactical", state.tactical.to_dict())
+        state.adjustments = data.get("adjustments", [])
+        state.last_evolution = data.get("last_evolution", "")
+        state.rounds_since_change = data.get("rounds_since_change", 0)
+        return state
+
+
+# ============================================================
+# 7 Reflection Principles Prompt
+# ============================================================
+
+REFLECTION_PROMPT = """You are a trading strategy optimizer. Review the evolution log
+below and suggest micro-adjustments to tactical parameters.
+
+APPLY THESE 7 PRINCIPLES:
+
+P1: BIG PICTURE FIRST
+  - If cumulative return is positive, don't overreact to individual bad segments.
+  - Focus on trends across 3+ segments, not single-segment swings.
+
+P2: ANALYZE WINNING TRADES
+  - Why did winning segments work? What was the market context?
+  - Don't change what's working.
+
+P3: ANALYZE LOSING TRADES
+  - Were stops too tight? Wrong direction? Bad entries?
+  - Identify the ROOT CAUSE, not just "it lost money".
+
+P4: IDENTIFY EXACT PARAMETER
+  - NEVER suggest vague changes like "tighten stops".
+  - Always specify: "stop_atr_mult: 1.8 → 1.9" or "tp1_r_mult: 0.30 → 0.25"
+  - Each suggestion must map to one specific parameter name.
+
+P5: MAX ±10% PER PARAMETER PER ROUND
+  - Each adjustment is at most 10% of the current value.
+  - Small, safe steps — evolution, not revolution.
+
+P6: INERTIA — don't change if <2 segments have passed
+  - If a parameter was changed recently, let it run for at least 2 segments
+    before changing again.
+
+P7: ADAPTATION MANDATE
+  - Must suggest at least one adjustment every 3 rounds.
+  - Even if things are going well, find ONE small improvement.
+
+CONSTRAINTS:
+  - Personality params (weights, leverage, bias) are LOCKED. Do NOT suggest changes.
+  - Tactical params can drift at most ±30% from initial values.
+  - Initial tactical values: {initial_tactical}
+
+CURRENT TACTICAL PARAMS:
+{current_tactical}
+
+RECENT ADJUSTMENTS:
+{recent_adjustments}
+
+EVOLUTION LOG:
+{evolution_log}
+
+OUTPUT: JSON array of adjustments, each with:
+  {{"parameter": "name", "current": value, "suggested": value, "reason": "P#: ..."}}
+
+Only output the JSON array, nothing else."""
+
+
+def build_evolution_log(segments: list[SegmentMetrics]) -> str:
+    """Build structured evolution log for LLM consumption."""
+    lines = []
+    cumulative_pnl = 0.0
+    cumulative_trades = 0
+
+    for seg in segments:
+        cumulative_pnl += seg.total_pnl
+        cumulative_trades += seg.trades
+
+        lines.append(f"\n### Segment {seg.segment_id} ({seg.start_time} → {seg.end_time})")
+        lines.append(f"  Market: {seg.market_context}")
+        lines.append(f"  Trades: {seg.trades} (L:{seg.long_trades} S:{seg.short_trades})")
+        lines.append(f"  Win Rate: {seg.win_rate:.1%} | PF: {seg.profit_factor:.2f}")
+        lines.append(f"  PnL: ${seg.total_pnl:+.2f} | Cum: ${cumulative_pnl:+.2f}")
+        lines.append(f"  Avg Win: ${seg.avg_win:+.2f} | Avg Loss: ${seg.avg_loss:+.2f}")
+        lines.append(f"  Max DD: {seg.max_drawdown_pct:.1f}% | Sharpe: {seg.sharpe:.2f}")
+        lines.append(f"  Exits: {seg.exit_reasons} | Cum Trades: {cumulative_trades}")
+
+    return "\n".join(lines)
+
+
+def evolve_parameters(segments: list[SegmentMetrics], state: EvolutionState) -> list[dict]:
+    """Run LLM-based parameter evolution.
+
+    Returns list of adjustments made.
+    """
+    # Check if we should evolve
+    if len(segments) < 2:
+        return []
+
+    if state.rounds_since_change < 2 and state.adjustments:
+        # Inertia: wait for at least 2 more segments
+        return []
+
+    # Build evolution log
+    evo_log = build_evolution_log(segments)
+
+    # Build prompt
+    prompt = REFLECTION_PROMPT.format(
+        initial_tactical=json.dumps(state.initial_tactical, indent=2),
+        current_tactical=json.dumps(state.tactical.to_dict(), indent=2),
+        recent_adjustments=json.dumps(state.adjustments[-10:], indent=2),
+        evolution_log=evo_log,
+    )
+
+    # NOTE: In production, this sends to the LLM. Here we return the prompt
+    # for the daemon to handle via its own AI infrastructure.
+    return [{
+        "type": "evolution_request",
+        "prompt": prompt,
+        "segments_analyzed": len(segments),
+        "current_params": state.tactical.to_dict(),
+        "initial_params": state.initial_tactical,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }]
+
+
+def apply_adjustments(adjustments: list[dict], state: EvolutionState) -> list[str]:
+    """Apply LLM-suggested adjustments to tactical params with drift guard."""
+    tactical_dict = state.tactical.to_dict()
+    applied = []
+    initial = state.initial_tactical
+
+    for adj in adjustments:
+        param = adj.get("parameter", "")
+        suggested = adj.get("suggested")
+
+        if param not in tactical_dict:
+            applied.append(f"SKIP:{param}:unknown")
+            continue
+
+        current = tactical_dict[param]
+        initial_val = initial.get(param, current)
+
+        # ±10% max change per round
+        change_pct = abs(suggested - current) / abs(current) if current != 0 else 1.0
+        if change_pct > 0.10:
+            # Clamp to ±10%
+            direction = 1 if suggested > current else -1
+            suggested = current * (1 + direction * 0.10)
+            applied.append(f"CLAMP:{param}:{current:.4f}→{suggested:.4f}(±10% cap)")
+        else:
+            applied.append(f"OK:{param}:{current:.4f}→{suggested:.4f}")
+
+        # ±30% total drift guard
+        drift = abs(suggested - initial_val) / abs(initial_val) if initial_val != 0 else 0
+        if drift > 0.30:
+            direction = 1 if suggested > initial_val else -1
+            suggested = initial_val * (1 + direction * 0.30)
+            applied[-1] = f"DRIFT_GUARD:{param}:{current:.4f}→{suggested:.4f}(±30% cap)"
+
+        tactical_dict[param] = suggested
+
+    state.tactical = TacticalParams.from_dict(tactical_dict)
+    state.adjustments.append({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "changes": applied,
+    })
+
+    if applied:
+        state.rounds_since_change = 0
+    else:
+        state.rounds_since_change += 1
+
+    state.version += 1
+    return applied
+
+
+# ============================================================
+# Segment Builder — create from trade history
+# ============================================================
+
+def build_segment(
+    segment_id: str,
+    trades: list[dict],
+    start_time: str,
+    end_time: str,
+    market_context: str = "",
+) -> SegmentMetrics:
+    """Build segment metrics from a list of trades."""
+    if not trades:
+        return SegmentMetrics(
+            segment_id=segment_id, start_time=start_time, end_time=end_time,
+            trades=0, wins=0, losses=0, win_rate=0, profit_factor=0,
+            total_pnl=0, avg_win=0, avg_loss=0, max_drawdown_pct=0,
+            sharpe=0, long_trades=0, short_trades=0, market_context=market_context,
+        )
+
+    wins = [t for t in trades if t.get("pnl", 0) > 0]
+    losses = [t for t in trades if t.get("pnl", 0) < 0]
+    total_pnl = sum(t.get("pnl", 0) for t in trades)
+    win_rate = len(wins) / len(trades) if trades else 0
+    avg_win = sum(w["pnl"] for w in wins) / len(wins) if wins else 0
+    avg_loss = abs(sum(l["pnl"] for l in losses) / len(losses)) if losses else 0
+
+    profit_factor = (sum(w["pnl"] for w in wins) / abs(sum(l["pnl"] for l in losses))
+                     if losses and sum(l["pnl"] for l in losses) != 0 else 0)
+
+    # Max drawdown
+    cumulative = 0.0
+    peak = 0.0
+    max_dd = 0.0
+    for t in trades:
+        cumulative += t.get("pnl", 0)
+        peak = max(peak, cumulative)
+        max_dd = max(max_dd, peak - cumulative)
+
+    # Sharpe (simplified)
+    pnls = [t.get("pnl", 0) for t in trades]
+    import statistics
+    avg_pnl = statistics.mean(pnls) if pnls else 0
+    std_pnl = statistics.stdev(pnls) if len(pnls) > 1 else 1
+    sharpe = (avg_pnl / std_pnl) if std_pnl > 0 else 0
+
+    # Exit reasons
+    from collections import Counter
+    exit_reasons = dict(Counter(t.get("exit_reason", "unknown") for t in trades))
+
+    long_trades = sum(1 for t in trades if t.get("side") == "BUY")
+    short_trades = sum(1 for t in trades if t.get("side") == "SELL")
+
+    return SegmentMetrics(
+        segment_id=segment_id,
+        start_time=start_time,
+        end_time=end_time,
+        trades=len(trades),
+        wins=len(wins),
+        losses=len(losses),
+        win_rate=win_rate,
+        profit_factor=profit_factor,
+        total_pnl=total_pnl,
+        avg_win=avg_win,
+        avg_loss=avg_loss,
+        max_drawdown_pct=max_dd,
+        sharpe=sharpe,
+        long_trades=long_trades,
+        short_trades=short_trades,
+        exit_reasons=exit_reasons,
+        market_context=market_context,
+    )
+
+
+# ============================================================
+# EVOLUTION V2 (Aug 9) — Full context, autonomous optimization
+# ============================================================
 
 def build_full_context() -> dict:
     """Assemble complete trading system state for the evolution AI."""
-    ctx = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "files": {},
-        "performance": {},
-    }
-
-    # ── Read all data files ──
-    for label, path in [
-        ("trade_memory", TRADE_LOG),
-        ("continuous_weights", WEIGHTS_PATH),
-        ("learned_weights", LEARNED_PATH),
-        ("evolution_state", STATE_PATH),
-    ]:
+    import json
+    from pathlib import Path
+    ctx = {"timestamp": datetime.now(timezone.utc).isoformat(), "files": {}, "performance": {}}
+    for label, fname in [("trade_memory","trade_memory.json"),("continuous_weights","continuous_weights.json"),
+                          ("learned_weights","learned_weights.json"),("evolution_state","evolution_state.json")]:
+        path = Path(__file__).parent / "data" / fname
         if path.exists():
-            try:
-                ctx["files"][label] = json.loads(path.read_text())
-            except Exception:
-                ctx["files"][label] = f"<unreadable: {path}>"
-
-    # ── Read daemon log (last 200 lines) ──
-    log_path = ROOT / "logs" / "hyperliquid_daemon.log"
+            try: ctx["files"][label] = json.loads(path.read_text())
+            except Exception: ctx["files"][label] = "<unreadable>"
+    log_path = Path(__file__).parent / "logs" / "hyperliquid_daemon.log"
     if log_path.exists():
-        try:
-            lines = log_path.read_text().split("\n")[-200:]
-            ctx["files"]["daemon_log_tail"] = "\n".join(lines)
-        except Exception:
-            ctx["files"]["daemon_log_tail"] = "<unreadable>"
-
-    # ── Performance summary from trade memory ──
+        ctx["files"]["daemon_log_tail"] = "\n".join(log_path.read_text().split("\n")[-200:])
     trades = ctx["files"].get("trade_memory", [])
     if isinstance(trades, list) and trades:
         wins = [t for t in trades if t.get("pnl_pct", 0) > 0]
@@ -71,206 +437,99 @@ def build_full_context() -> dict:
         coins = {}
         for t in trades:
             c = t.get("coin", "?")
-            coins.setdefault(c, {"trades": 0, "pnl": 0, "wins": 0})
+            coins.setdefault(c, {"trades":0,"pnl":0,"wins":0})
             coins[c]["trades"] += 1
             coins[c]["pnl"] += t.get("pnl_pct", 0)
-            if t.get("pnl_pct", 0) > 0:
-                coins[c]["wins"] += 1
-
+            if t.get("pnl_pct",0) > 0: coins[c]["wins"] += 1
         ctx["performance"] = {
-            "total_trades": len(trades),
-            "wins": len(wins),
-            "losses": len(losses),
-            "win_rate": round(len(wins) / len(trades) * 100, 1) if trades else 0,
-            "total_pnl_pct": round(sum(t.get("pnl_pct", 0) for t in trades), 2),
-            "avg_win_pct": round(sum(t["pnl_pct"] for t in wins) / len(wins), 2) if wins else 0,
-            "avg_loss_pct": round(sum(t["pnl_pct"] for t in losses) / len(losses), 2) if losses else 0,
-            "best_coin": max(coins.items(), key=lambda x: x[1]["pnl"]) if coins else None,
-            "worst_coin": min(coins.items(), key=lambda x: x[1]["pnl"]) if coins else None,
-            "per_coin": {c: v for c, v in sorted(coins.items(), key=lambda x: x[1]["pnl"])},
+            "total_trades":len(trades),"wins":len(wins),"losses":len(losses),
+            "win_rate":round(len(wins)/len(trades)*100,1) if trades else 0,
+            "total_pnl_pct":round(sum(t.get("pnl_pct",0) for t in trades),2),
+            "best_coin":max(coins.items(),key=lambda x:x[1]["pnl"]) if coins else None,
+            "worst_coin":min(coins.items(),key=lambda x:x[1]["pnl"]) if coins else None,
+            "per_coin":{c:v for c,v in sorted(coins.items(),key=lambda x:x[1]["pnl"])},
         }
-
-    # ── Read current AI prompts from ai_decider.py ──
-    ai_decider = ROOT / "ai_decider.py"
-    if ai_decider.exists():
-        try:
-            code = ai_decider.read_text()
-            # Extract prompt-building functions
-            prompts = {}
-            for marker in ["TRADABLE", "COINS:", "ANALYZE", "EXIT EVAL", "DEBATE"]:
-                idx = code.find(marker)
-                if idx > 0:
-                    snippet = code[max(0, idx-50):idx+300]
-                    prompts[f"prompt_section_{marker}"] = snippet
-            ctx["files"]["ai_prompts"] = prompts
-        except Exception:
-            ctx["files"]["ai_prompts"] = "<unreadable>"
-
-    # ── Read daemon key sections ──
-    daemon = ROOT / "hyperliquid_daemon.py"
+    ai = Path(__file__).parent / "ai_decider.py"
+    if ai.exists():
+        code = ai.read_text()
+        prompts = {}
+        for m in ["TRADABLE","COINS:","EXIT EVAL","DEBATE","ANALYZE"]:
+            i = code.find(m)
+            if i>0: prompts[f"s_{m}"] = code[max(0,i-50):i+300]
+        ctx["files"]["ai_prompts"] = prompts
+    daemon = Path(__file__).parent / "hyperliquid_daemon.py"
     if daemon.exists():
-        try:
-            code = daemon.read_text()
-            # Extract key parameters
-            params = {}
-            for line in code.split("\n"):
-                for key in ["BASE_LEVERAGE", "CYCLE_SECONDS", "MAX_POSITIONS",
-                           "MIN_CONVICTION", "VWAP", "COMPOSITE", "STOP", "SLIPPAGE"]:
-                    if key in line and "=" in line and not line.strip().startswith("#"):
-                        params[key] = line.strip()[:120]
-            ctx["files"]["daemon_params"] = params
-        except Exception:
-            ctx["files"]["daemon_params"] = "<unreadable>"
-
+        params = {}
+        for line in daemon.read_text().split("\n"):
+            for k in ["BASE_LEVERAGE","CYCLE_SECONDS","MAX_POSITIONS","MIN_CONVICTION","STOP","SLIPPAGE","VWAP","COMPOSITE"]:
+                if k in line and "=" in line and not line.strip().startswith("#"):
+                    params[k] = line.strip()[:120]
+        ctx["files"]["daemon_params"] = params
     return ctx
 
 
-# ═══════════════════════════════════════════════════════════
-# PROMPT BUILDER — massive context, web search instructions
-# ═══════════════════════════════════════════════════════════
-
 def build_evolution_prompt(ctx: dict) -> str:
-    """Build the complete evolution prompt with full system state."""
-    
-    perf = ctx.get("performance", {})
-    files = ctx.get("files", {})
-
+    perf = ctx.get("performance",{}); files = ctx.get("files",{})
+    best = perf.get("best_coin"); worst = perf.get("worst_coin")
+    best_name = best[0] if isinstance(best,tuple) and best else "?"
+    worst_name = worst[0] if isinstance(worst,tuple) and worst else "?"
     prompt = f"""YOU ARE AN AUTONOMOUS TRADING SYSTEM OPTIMIZER. YOU HAVE FULL AUTHORITY.
 
-⏰ {ctx['timestamp']}
-📊 {perf.get('total_trades', 0)} trades | {perf.get('win_rate', 0)}% WR | {perf.get('total_pnl_pct', 0):+.1f}% total PnL
-✅ {perf.get('wins', 0)} wins (avg {perf.get('avg_win_pct', 0):+.2f}%) | ❌ {perf.get('losses', 0)} losses (avg {perf.get('avg_loss_pct', 0):+.2f}%)
-🏆 Best: {perf.get('best_coin')} | 💀 Worst: {perf.get('worst_coin')}
+{ctx["timestamp"]}
+{perf.get("total_trades",0)} trades | {perf.get("win_rate",0)}% WR | {perf.get("total_pnl_pct",0):+.1f}% PnL
 
 === COMPLETE TRADE HISTORY ===
-{json.dumps(files.get('trade_memory', []), indent=2)[:20000]}
+{json.dumps(files.get("trade_memory",[]),indent=2)[:20000]}
 
 === PER-COIN PERFORMANCE ===
-{json.dumps(perf.get('per_coin', {}), indent=2)[:15000]}
+{json.dumps(perf.get("per_coin",{}),indent=2)[:15000]}
 
 === CURRENT PARAMETERS ===
-{json.dumps(files.get('daemon_params', {}), indent=2)[:10000]}
+{json.dumps(files.get("daemon_params",{}),indent=2)[:10000]}
 
-=== AI PROMPT SNIPPETS (what we tell the trading AI) ===
-{json.dumps(files.get('ai_prompts', {}), indent=2)[:15000]}
+=== AI PROMPTS ===
+{json.dumps(files.get("ai_prompts",{}),indent=2)[:15000]}
 
-=== RECENT DAEMON LOGS ===
-{files.get('daemon_log_tail', 'N/A')[:15000]}
-
-=== LEARNED WEIGHTS ===
-{json.dumps(files.get('learned_weights', {}), indent=2)[:12000]}
-
-=== CONTINUOUS WEIGHTS ===
-{json.dumps(files.get('continuous_weights', {}), indent=2)[:10000]}
+=== RECENT LOGS ===
+{files.get("daemon_log_tail","N/A")[:15000]}
 
 === WEB SEARCH TASKS ===
-1. Search for: "{perf.get('best_coin',['UNKNOWN'])[0] if perf.get('best_coin') else 'BTC'} crypto news price action today"
-2. Search for: "{perf.get('worst_coin',['UNKNOWN'])[0] if perf.get('worst_coin') else 'ETH'} why underperforming"
-3. Search for: "crypto market regime August 2026 fear greed"
-4. Search for: "best crypto trading strategies 2026 hyperliquid perpetuals"
-5. Search for: "how to improve {perf.get('win_rate', 0)}% win rate crypto trading bot"
+1. "{best_name} crypto news price action today"
+2. "{worst_name} why underperforming crypto"
+3. "crypto market sentiment August 2026 fear greed"
+4. "best crypto trading strategies 2026 hyperliquid perpetuals"
+5. "how to improve {perf.get("win_rate",0)}% win rate crypto trading bot"
 
-=== YOUR TASK ===
-You have FULL authority to optimize this trading system. Analyze the data, search the web, then return changes.
-
-You CAN:
-- Rewrite AI prompts in ai_decider.py (better instructions to Qwen/Llama)
-- Modify trading parameters in hyperliquid_daemon.py
-- Change signal weights, thresholds, conviction requirements
-- Adjust position sizing, leverage, entry/exit logic
-- Request daemon restart
-
-Your GOAL: MAXIMIZE profit. More trades, better entries, fewer missed opportunities.
-NEVER suggest being more conservative. Inaction = loss.
-If win rate is low but individual wins are big, that's FINE — optimize for total PnL.
+You CAN: rewrite AI prompts, modify daemon params, change signal weights,
+adjust position sizing/leverage, request daemon restart.
+GOAL: MAXIMIZE profit. NEVER be more conservative. Inaction = loss.
 
 RETURN JSON ONLY:
-{{
-  "analysis": "1-paragraph summary of what's happening",
-  "market_context": "what you found from web search",
-  "changes": [
-    {{
-      "file": "ai_decider.py or hyperliquid_daemon.py",
-      "type": "prompt_rewrite|param_change|code_change|add_logic|remove|
-      "old": "exact string to find in file (for prompt_rewrite/param_change)",
-      "new": "replacement string (for prompt_rewrite/param_change)",
-      "reason": "why this change, data-backed",
-      "expected_impact": "what should improve",
-      "confidence": 0-100
-    }}
-  ],
-  "restart_required": true/false,
-  "missed_opportunities": ["patterns you noticed"],
-  "risk_warning": "any concerns (be honest)"
-}}"""
-
+{{"analysis":"...","market_context":"...","changes":[{{"file":"ai_decider.py or hyperliquid_daemon.py","type":"prompt_rewrite|param_change|code_change","old":"string","new":"string","reason":"...","expected_impact":"...","confidence":0-100}}],"restart_required":true/false,"missed_opportunities":["..."],"risk_warning":"..."}}"""
     return prompt
 
 
-# ═══════════════════════════════════════════════════════════
-# EXECUTION — apply AI-suggested changes
-# ═══════════════════════════════════════════════════════════
-
 def apply_changes(changes: list, dry_run: bool = False) -> list:
-    """Apply AI-suggested file changes. Backs up files first. Returns change log."""
     applied = []
-    
     for ch in changes:
-        file = ch.get("file", "")
-        old_str = ch.get("old", "")
-        new_str = ch.get("new", "")
-        reason = ch.get("reason", "")[:100]
-        
-        if not file or not old_str or not new_str:
-            applied.append(f"SKIP: missing fields in {ch}")
-            continue
-        
-        path = ROOT / file
-        if not path.exists():
-            applied.append(f"SKIP: {file} not found")
-            continue
-        
-        if dry_run:
-            applied.append(f"DRY_RUN: would change {file}: {reason}")
-            continue
-        
+        f = ch.get("file",""); o = ch.get("old",""); n = ch.get("new","")
+        r = ch.get("reason","")[:100]
+        if not f or not o or not n: applied.append("SKIP:missing"); continue
+        path = Path(__file__).parent / f
+        if not path.exists(): applied.append(f"SKIP:not found"); continue
+        if dry_run: applied.append(f"DRY:{f}:{r}"); continue
         try:
-            content = path.read_text()
-            if old_str not in content:
-                applied.append(f"SKIP: old string not found in {file}")
-                continue
-            
-            # Backup
-            backup = ROOT / f"{file}.bak.{int(time.time())}"
-            backup.write_text(content)
-            
-            # Apply
-            content = content.replace(old_str, new_str, 1)
-            path.write_text(content)
-            applied.append(f"APPLIED: {file} — {reason}")
-        except Exception as e:
-            applied.append(f"ERROR: {file} — {type(e).__name__}: {e}")
-    
+            c = path.read_text()
+            if o not in c: applied.append(f"SKIP:no match"); continue
+            (Path(__file__).parent / f"{f}.bak.{int(time.time())}").write_text(c)
+            path.write_text(c.replace(o, n, 1))
+            applied.append(f"OK:{f}:{r}")
+        except Exception as e: applied.append(f"ERR:{f}:{e}")
     return applied
 
 
 def run_full_evolution() -> dict:
-    """Main evolution entry point — builds context, calls AI, applies changes."""
-    
-    # 1. Build massive context dump
     ctx = build_full_context()
-    
-    # 2. Build evolution prompt
     prompt = build_evolution_prompt(ctx)
-    
-    # 3. Call AI (handled by run_evolution_analysis in ai_decider.py)
-    #    The daemon calls this through the web-search-enabled path
-    
-    result = {
-        "context_size": len(prompt),
-        "prompt": prompt,
-        "timestamp": ctx["timestamp"],
-        "performance_snapshot": ctx.get("performance", {}),
-    }
-    
-    return result
+    return {"context_size":len(prompt),"prompt":prompt,"timestamp":ctx["timestamp"],
+            "performance_snapshot":ctx.get("performance",{})}
