@@ -46,4 +46,4 @@ exit:
 # ── Monitoring ──
 monitoring:
   log_level: "INFO"                 # DEBUG, INFO, WARNING, ERROR
-  cycle_seconds: 5                  # Main loop interval
+  cycle_seconds: 3                    # Main loop interval (default: 3s)
