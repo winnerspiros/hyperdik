@@ -78,10 +78,10 @@ python3 -B hyperliquid_daemon.py
 | Model | Role | Cost |
 |---|---|---|
 | **Qwen 235B MoE** | Decisions, sizing, exits | $0.64/M tok |
-| **Llama 4 Maverick** | Coin picks, market read | Free |
-| **Llama 4 Scout** | Auto-fallback | Free |
+| **Llama 4 Maverick** | Coin picks, market read | $1.00/M tok |
+| **Llama 4 Scout** | Fallback (rate-limit recovery) | $0.40/M tok |
 
-All via [OpenRouter](https://openrouter.ai) — one API key, three models.
+All via [OpenRouter](https://openrouter.ai) — one API key, three models. Scout only activates when Qwen gets rate-limited.
 
 ---
 
