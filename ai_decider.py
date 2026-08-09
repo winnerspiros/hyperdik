@@ -1095,3 +1095,120 @@ def ai_debate_entry(
         "bear_score": int(result.get("bear", 50)),
         "reason": result.get("reason", ""),
     }
+
+# ═══════════════════════════════════════════════════════════════
+# WEB-SEARCH-ENABLED POST-TRADE and EVOLUTION ANALYSIS (Aug 9)
+# These are NOT time-critical — 3-10s latency is acceptable.
+# ═══════════════════════════════════════════════════════════════
+
+def _call_llm_web(prompt: str, model: str = MODEL_CHEAP,
+                  max_tokens: int = 500, temperature: float = 0.3) -> dict:
+    """Call LLM with OpenRouter web search plugin enabled.
+    Adds 3-10s latency — only use for post-trade/evolution analysis, NOT live trading.
+    """
+    if not OPENROUTER_KEY:
+        return {"analysis": "no_api_key", "suggestions": []}
+
+    system = (
+        "Crypto trading analyst. Output ONLY valid JSON. No markdown, no text outside JSON. "
+        "You analyze trades to find missed opportunities and better parameters. "
+        "Focus on: entry timing, position sizing, missed signals, trend catching. "
+        "NEVER suggest being more conservative. Inaction = loss. More trades = more chances. "
+        "Always suggest at least one way to trade MORE, not less. "
+        "Keys: analysis, suggestions (list of {param, current, suggested, reason}), "
+        "missed_opportunities (list of strings), confidence (0-100)."
+    )
+
+    payload = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": prompt}
+        ],
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "plugins": [{"id": "web", "max_results": 3}],
+        "provider": {"order": ["Groq", "DeepInfra", "Together"], "allow_fallbacks": True},
+    }).encode()
+
+    import urllib.request
+    req = urllib.request.Request(API_URL, data=payload, headers={
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {OPENROUTER_KEY}",
+        "X-Title": "hyperdik-analysis",
+    })
+
+    try:
+        with urllib.request.urlopen(req, timeout=25) as r:
+            resp = json.loads(r.read())
+            choices = resp.get("choices", [])
+            if not choices:
+                return {"analysis": "empty_response", "suggestions": []}
+            content = (choices[0].get("message") or {}).get("content", "") or ""
+            content = content.strip()
+            if content.startswith("```"):
+                nl = content.find("\n")
+                content = content[nl+1:] if nl > 0 else content[3:]
+                if content.endswith("```"):
+                    content = content[:-3]
+            return json.loads(content.strip())
+    except Exception as e:
+        return {"analysis": f"api_error:{type(e).__name__}", "suggestions": []}
+
+
+def analyze_closed_trade(trade_data: dict, market_context: str = "") -> dict:
+    """Analyze a completed trade with web search for market context."""
+    if not trade_data:
+        return {"analysis": "no_data", "suggestions": []}
+
+    coin = trade_data.get("coin", "?")
+    side = trade_data.get("side", "?")
+    pnl_pct = trade_data.get("pnl_pct", 0)
+    entry_px = trade_data.get("entry_price", 0)
+    exit_px = trade_data.get("exit_price", 0)
+    hold_secs = trade_data.get("hold_secs", 0)
+    regime = trade_data.get("regime", "?")
+    conviction = trade_data.get("conviction", 0)
+    composite = trade_data.get("composite_score", 0)
+    leverage = trade_data.get("leverage", 1)
+
+    prompt = (
+        f"ANALYZE THIS COMPLETED {side} TRADE ON {coin}:\n"
+        f"Entry: ${entry_px} -> Exit: ${exit_px} | PnL: {pnl_pct:+.2f}% | Held: {hold_secs:.0f}s\n"
+        f"Leverage: {leverage}x | Conviction: {conviction}/100 | Composite: {composite:+.3f}\n"
+        f"Regime at entry: {regime}\n"
+    )
+    if market_context:
+        prompt += f"\nMARKET STATE AT EXIT:\n{market_context}\n"
+    prompt += (
+        "\nSearch the web for recent news about this coin. "
+        "What went right or wrong? Could we have entered earlier? "
+        "Was the size appropriate? Any parameter tweaks to catch more like this? "
+        "IMPORTANT: Never suggest trading less or being more conservative. "
+        "Focus on: better entry timing, sizing adjustments, trend detection, missed signals."
+    )
+
+    result = _call_llm_web(prompt, model=MODEL_CHEAP, max_tokens=400)
+    result["coin"] = coin
+    result["pnl_pct"] = pnl_pct
+    return result
+
+
+def run_evolution_analysis(evo_requests: list) -> list:
+    """Run AI evolution analysis on accumulated trade segments with web search."""
+    results = []
+    for req in evo_requests:
+        prompt = req.get("prompt", "")
+        if not prompt:
+            continue
+        prompt += (
+            "\n\nSearch the web for current crypto market conditions, volatility trends, "
+            "and sector rotation data to inform your parameter suggestions. "
+            "CRITICAL: Never suggest reducing trade frequency or position count. "
+            "More trades = more learning. Suggest parameter changes that INCREASE "
+            "opportunity capture, not reduce risk."
+        )
+        result = _call_llm_web(prompt, model=MODEL_CHEAP, max_tokens=500)
+        result["segment"] = req.get("segments_analyzed", 0)
+        results.append(result)
+    return results

@@ -130,6 +130,7 @@ from ai_decider import (
     decide_borderline, decide_sizing, decide_regime_override,
     validate_trade, predict_short_term, analyze_fill, get_stats as ai_stats,
     ai_select_coins, ai_assess_market, ai_evaluate_exit, ai_debate_entry,
+    analyze_closed_trade, run_evolution_analysis,
 )
 
 # Peak/bottom exhaustion detector — candle-level + tick-level merged (Aug 9)
@@ -1518,6 +1519,20 @@ def _record_close_trade(coin: str, mid: float, entry: float, szi: float, side: s
                 pass
         log.info(f"  📚 Learned from {coin} {side}: {'bullish' if was_bullish_correct else 'bearish'} correct")
 
+        # ── Post-trade AI analysis (web search, background thread — not blocking) ──
+        try:
+            import threading
+            trade_snapshot = {
+                "coin": coin, "side": side, "entry_price": entry,
+                "exit_price": mid, "pnl_pct": round(net_pnl_pct, 3),
+                "hold_secs": 0, "regime": regime, "conviction": conviction,
+                "composite_score": 0, "leverage": leverage, "reason": reason,
+            }
+            t = threading.Thread(target=_run_trade_analysis, args=(trade_snapshot,), daemon=True)
+            t.start()
+        except Exception:
+            pass  # Analysis is optional — never block the main loop
+
         # ── AI feedback: store summary for future context ──
         trade_entry = {
             "coin": coin, "side": side, "pnl_pct": round(pnl_pct, 2),
@@ -1531,6 +1546,30 @@ def _record_close_trade(coin: str, mid: float, entry: float, szi: float, side: s
             recent_trades.pop(0)
     except Exception:
         pass  # Learning is optional
+
+# ── Background trade analysis (runs in thread, web search, NOT blocking) ──
+def _run_trade_analysis(trade_data: dict):
+    """Run AI post-trade analysis in background thread. Logs result, never throws."""
+    try:
+        # Build market context snapshot for the analysis
+        ctx_lines = []
+        if _recent_trades:
+            ctx_lines.append(f"Recent ({len(_recent_trades)}): " + 
+                ", ".join(f"{t['coin']}:{t['pnl_pct']:+.1f}%" for t in _recent_trades[-5:]))
+        ctx = "\n".join(ctx_lines) if ctx_lines else ""
+        
+        result = analyze_closed_trade(trade_data, market_context=ctx)
+        analysis = result.get("analysis", "")[:200]
+        suggestions = result.get("suggestions", [])
+        missed = result.get("missed_opportunities", [])
+        
+        log.info(f"  🧠 AI trade analysis: {analysis}")
+        for s in suggestions[:3]:
+            log.info(f"     💡 {s.get('param','?')}: {s.get('current','?')}→{s.get('suggested','?')} — {s.get('reason','')[:80]}")
+        for m in missed[:2]:
+            log.info(f"     ⚠️ Missed: {m[:120]}")
+    except Exception as e:
+        log.info(f"  🧠 AI trade analysis failed: {type(e).__name__}")
 
 _recent_trades: list[dict] = []  # Last 10 trades for AI context
 
