@@ -1,0 +1,411 @@
+{
+  "audit_info": {
+    "date": "2026-08-09",
+    "repo": "/home/ubuntu/hyperliquid-trader",
+    "total_dead_files_root": 61,
+    "total_deprecated_files": 3,
+    "active_files_from_daemon": 58,
+    "methodology": "Transitive import graph from hyperliquid_daemon.py + ai_daemon.py + daemon.py + launch_parallel.py"
+  },
+  "salvageable": {
+    "sentiment_scraper.py": {
+      "verdict": "SALVAGE — High value",
+      "lines": 339,
+      "salvageable_code": [
+        "score_sentiment() — Lightweight VADER-like sentiment scorer with crypto-specific lexicon (50+ terms: bullish, moon, dump, scam, etc.). No external deps. Fully self-contained.",
+        "_SENTIMENT_LEXICON — 50+ crypto/financial sentiment terms with calibrated scores. Valuable standalone dictionary.",
+        "get_reddit_sentiment() — Reddit sentiment via pushshift.io (no API key). Returns scored items + avg_sentiment.",
+        "get_crypto_news_sentiment() — RSS feed sentiment aggregation (Google News + CoinTelegraph). Parses XML without external libs.",
+        "get_coin_sentiment_summary() — Aggregates Reddit + Google Trends for a coin. Unified sentiment dict.",
+        "get_google_trends() — Google Trends interest via RSS (no API key).",
+        "parse_rss() — Generic RSS/Atom parser using ElementTree. No external deps."
+      ],
+      "integration_value": "HIGH — The score_sentiment() function with its crypto lexicon is a drop-in enrichment for any AI market intelligence pipeline. The daemon's ai_decider could use this as supplementary context."
+    },
+    "data_enricher.py": {
+      "verdict": "SALVAGE — Very high value",
+      "lines": 395,
+      "salvageable_code": [
+        "build_rich_context() — Master function that assembles a formatted AI-ready context block from 7 data sources: Fear & Greed, CoinGecko global/top coins/trending, positions with prices, news, whales, funding, economic calendar. This is essentially a market intelligence aggregator.",
+        "COINGECKO_ID_MAP — 40+ symbol→CoinGecko ID mappings. Useful reference data.",
+        "get_coin_prices() — Batch price lookup via CoinGecko with caching. Works for any symbol list.",
+        "get_fear_greed() — Crypto Fear & Greed with 60s TTL cache.",
+        "get_global_data() — Total market cap, BTC/ETH dominance, active cryptocurrencies.",
+        "get_trending() — CoinGecko top-5 trending coins.",
+        "_fmt_big() — Smart number formatter (1.5B, 2.3M).",
+        "Caching system (_cache_get/_cache_set) — JSON-file cache with TTL. Simple and reusable."
+      ],
+      "integration_value": "HIGH — market_intelligence.py already depends on this. The build_rich_context() function is a ready-made market intelligence feed for any AI agent. CoinGecko ID map is reference data."
+    },
+    "market_intelligence.py": {
+      "verdict": "SALVAGE — Architectural value",
+      "lines": 198,
+      "salvageable_code": [
+        "get_snapshot() — Single canonical market snapshot (fear_greed, global, trending, regime, funding, onchain, defi, mempool, tickers). TTL-gated (10min). Solves the '5 agents fetching separately' problem.",
+        "format_for_ai() — Compact human-readable snapshot for AI prompt injection.",
+        "SNAPSHOT_PATH / SNAPSHOT_TTL constants — Clean architectural pattern."
+      ],
+      "integration_value": "MEDIUM — The snapshot pattern is architecturally sound (fetch once, read many). However the daemon's v3 architecture already has its own data pipeline. The concept is worth adopting but the specific implementation would need adaptation."
+    },
+    "onchain_metrics.py": {
+      "verdict": "SALVAGE — Lightweight & useful",
+      "lines": 78,
+      "salvageable_code": [
+        "get_mayer_multiple() — BTC Mayer Multiple (price/200d MA). Identifies overbought (>2.4) vs oversold (<0.8) conditions. Uses CoinMetrics community API (free, no key).",
+        "get_combined_onchain_summary() — Formatted string with Mayer Multiple, MVRV, supply, 30d ROI, active addresses.",
+        "_fetch_timeseries() — Generic CoinMetrics timeseries fetcher — reusable for any metric."
+      ],
+      "integration_value": "MEDIUM — On-chain cycle indicators (Mayer Multiple, MVRV) are macro signals the daemon currently lacks. Could be folded into regime detection or used as a BTC bias filter."
+    },
+    "prediction_memory.py": {
+      "verdict": "SALVAGE — Simple prediction tracking",
+      "lines": 107,
+      "salvageable_code": [
+        "save_prediction() — Persist AI prediction with direction, target, stop, confidence, hold time.",
+        "resolve_prediction() — Mark prediction as resolved with actual PnL outcome (correct/wrong/flat).",
+        "get_prediction_stats() — Accuracy and avg PnL across all resolved predictions.",
+        "File-based cache system with lazy loading."
+      ],
+      "integration_value": "MEDIUM — The daemon's hyperliquid_learner.py already has trade recording, but this adds prediction-outcome tracking (was the AI direction call right?). Complementary, not redundant."
+    },
+    "llm_optimizer.py": {
+      "verdict": "SALVAGE — Token optimization patterns",
+      "lines": 266,
+      "salvageable_code": [
+        "class LLMCache — SHA256-hashed LRU cache for LLM responses with TTL. Tracks hits/misses/cost.",
+        "evolution_prompt_v2() — Ultra-compact evolution prompt template (~800 tokens). Uses numbered principles.",
+        "execution_prompt_v2() — Compact execution prompt (~200 tokens).",
+        "validate_trade_prompt() — Minimal trade validation prompt (~100 tokens).",
+        "call_llm() — LLM caller with cache lookup, cost tracking, and fallback chain pattern.",
+        "batch_validate() — Multi-trade validation in one LLM call."
+      ],
+      "integration_value": "HIGH — The LLMCache class is directly usable by the daemon's ai_decider to avoid redundant API calls. The prompt templates show token-efficient patterns worth adopting. The cost tracking is useful for monitoring."
+    },
+    "self_improving_ai.py": {
+      "verdict": "SALVAGE — Performance feedback loop",
+      "lines": 193,
+      "salvageable_code": [
+        "class SelfImprovingAI — Analyzes past decisions from SQLite, finds patterns (coin win rates, best/worst hours), generates prompt additions.",
+        "analyze_patterns() — Per-coin win rate analysis, hourly performance, overall win rate trends.",
+        "get_prompt_additions() — Generates AI prompt additions like '⚠️ SOL: 25% win rate, AVOID' or '✅ BTC: 80% win rate, PREFER'.",
+        "get_self_improvement_context() — Global convenience function."
+      ],
+      "integration_value": "MEDIUM — The daemon's hyperliquid_learner.py tracks trades, but SelfImprovingAI adds pattern analysis (coin-specific win rates, time-of-day). These could feed into the evolution loop."
+    },
+    "kraken_client.py": {
+      "verdict": "SALVAGE — Production-grade exchange integration",
+      "lines": 302,
+      "salvageable_code": [
+        "Full Kraken Futures REST client with HMAC-SHA512 signing.",
+        "_sign() — Correct Kraken signing: HMAC-SHA512(nonce+postData+endpoint) with base64-decoded private key.",
+        "_request() — Authenticated request method with error handling.",
+        "Position management, order placement, balance fetching, market data.",
+        "Credential loading from env vars or ~/.kraken/creds.json."
+      ],
+      "integration_value": "HIGH — If the bot ever expands beyond Hyperliquid, this is a battle-tested Kraken Futures client. The signing implementation is correct (common pitfall: Kraken's unusual nonce+postData+endpoint signing order). Save as a reference/client library."
+    },
+    "okx_client.py": {
+      "verdict": "SALVAGE — Production-grade exchange integration",
+      "lines": 335,
+      "salvageable_code": [
+        "Full OKX V5 REST client with HMAC-SHA256 signing.",
+        "_sign() — Correct OKX V5 signing: timestamp+method+path+body.",
+        "_public_request() — Unauthenticated public endpoints (tickers, orderbook).",
+        "_request() — Authenticated request method.",
+        "Funding rate fetching, position management, order placement.",
+        "Credential loading from env vars or ~/.okx/creds.json."
+      ],
+      "integration_value": "HIGH — OKX is the #2 derivatives exchange after Binance. This is a clean, well-written client. The funding rate endpoints are already referenced by cross_exchange.py for price divergence detection. Keep as a reference/client library."
+    },
+    "ai_brain.py": {
+      "verdict": "SALVAGE — LLM reasoning patterns worth studying",
+      "lines": 414,
+      "salvageable_code": [
+        "class AITradingBrain — Full LLM-based trading brain with OpenRouter integration. Two-stage: cheap model → premium for trades.",
+        "analyze_market_decision() — Multi-signal AI trading decision (holdings, tickers, PnL, support, news, fear/greed, dips, weekend detection). Compact prompt format.",
+        "_parse_decision() — Robust JSON parser with fallback to essay prose parsing. Handles single-quoted JSON (model quirks).",
+        "_call_llm() — OpenRouter API caller with provider preferences, fallbacks, prompt caching.",
+        "analyze_position_reduction() — AI portfolio reduction logic for overleveraged states.",
+        "_predict_price_direction() — AI dip analyst: evaluate if a -12% crash is a buying opportunity."
+      ],
+      "integration_value": "MEDIUM — The daemon already has ai_decider.py (v3 replacement). AITradingBrain is the v2 predecessor. Worth studying the _parse_decision() robust parser and the compact prompt format, but not a drop-in replacement."
+    },
+    "market_predictor.py": {
+      "verdict": "SALVAGE — Strategic prediction engine",
+      "lines": 731,
+      "salvageable_code": [
+        "class PredictorBrain — Forward-looking AI predictor with multi-timeframe analysis.",
+        "_collect_multi_tf_prices() — Multi-timeframe OHLC collector (1h/4h/1d) across 8 coins.",
+        "_collect_technical_signals() — RSI, MACD, volume, ADX, trend strength per symbol.",
+        "_collect_chart_patterns() — Chart pattern detection via chart_patterns.py.",
+        "build_prediction_prompt() — Full strategic prediction prompt assembler (reviewer data + multi-TF + technical + patterns + funding + correlations + liquidations).",
+        "write_advisory() — Advisory action file system for day_trader consumption.",
+        "_add_calendar_entry() — Strategic calendar entry management."
+      ],
+      "integration_value": "MEDIUM — The multi-TF data collection and technical signal extraction are well-implemented. Could supplement the daemon's existing signal pipeline. The calendar advisory system is a nice separation of strategic vs tactical concerns."
+    },
+    "sentiment.py": {
+      "verdict": "SALVAGE (if combined with sentiment_scraper)",
+      "lines": 220,
+      "salvageable_code": [
+        "class SentimentAnalyzer — News + Fear & Greed + Reddit composite sentiment.",
+        "COIN_KEYWORDS — 9-coin keyword mapping for sentiment detection.",
+        "get_crypto_news_sentiment() — CryptoCompare news API + Fear & Greed fallback.",
+        "get_market_fear_greed() — Alternative.me Fear & Greed API.",
+        "get_market_overview() — Complete market sentiment snapshot.",
+        "get_reddit_sentiment_simple() — Pushshift Reddit search.",
+        "get_composite_sentiment() — Weighted composite (news 0.4, F&G 0.4, Reddit 0.2)."
+      ],
+      "integration_value": "LOW — sentiment_scraper.py supersedes this with a better implementation (VADER-like lexicon, no external API dependency for scoring). Keep sentiment_scraper, consider sentiment.py redundant."
+    },
+    "news_collector.py": {
+      "verdict": "MARGINAL — Trivial wrapper",
+      "lines": 85,
+      "salvageable_code": [
+        "get_crypto_news() — CryptoPanic + RSS feed fallback. Has static fallback headlines.",
+        "get_social_sentiment() — Reddit hot posts + Google Trends hype detection."
+      ],
+      "integration_value": "LOW — Very thin wrapper. data_enricher.py already integrates news_collector via lazy import. The functions are ~20 lines each. Could inline into data_enricher or replace with sentiment_scraper's news functions."
+    },
+    "strategies.py": {
+      "verdict": "SALVAGE — Ensemble strategy framework",
+      "lines": 294,
+      "salvageable_code": [
+        "class TechnicalStrategy — Multi-TF (15m/1h/4h) weighted technical analysis: RSI, MACD, EMA alignment, Bollinger Bands, volume confirmation, momentum.",
+        "class SentimentStrategy — Sentiment composite signal converter.",
+        "class MeanReversionStrategy — RSI-based mean reversion (oversold bounce, overbought reversal) with BB confirmation.",
+        "class TrendFollowingStrategy — Multi-TF trend alignment (3 TFs), MACD confirmation.",
+        "class StrategyOrchestrator — Weighted ensemble: technical 0.40, trend 0.25, mean_reversion 0.20, sentiment 0.15. Weighted voting with confidence scaling."
+      ],
+      "integration_value": "MEDIUM — The ensemble framework mirrors the daemon's 5-pillar composite approach but at a simpler level. The StrategyOrchestrator pattern (weighted votes → consensus) is a clean design. Could serve as a lightweight alternative or testing harness."
+    },
+    "backtest_engine.py": {
+      "verdict": "SALVAGE — Clean backtest framework",
+      "lines": 257,
+      "salvageable_code": [
+        "class BacktestEngine — Pure Python backtest engine (no pandas hard dep). Runs strategy over OHLCV, computes equity curve, Sharpe, max DD, win rate, total return.",
+        "load_ohlcv_csv() — CSV OHLCV loader.",
+        "mean_reversion() — Built-in mean reversion strategy for baseline comparison."
+      ],
+      "integration_value": "MEDIUM — Clean, well-structured backtest engine. No heavy dependencies. Could be used to validate strategy changes before deployment. The daemon lacks a backtest module."
+    },
+    "hyperliquid_backtest.py": {
+      "verdict": "SALVAGE if backtesting needed",
+      "lines": 424,
+      "salvageable_code": [
+        "class BacktestEngine — Runs the full 5-pillar composite + ensemble through real HL candle data.",
+        "fetch_hl_candles() — Hyperliquid candle fetcher.",
+        "step() / check_exits() / run() — Full simulation loop with trailing stops, take profit, entry/exit logic.",
+        "_compute_metrics() — Sharpe, max DD, win rate, avg return per trade."
+      ],
+      "integration_value": "MEDIUM — Direct backtest of the daemon's strategy on HL data. Useful for parameter optimization and pre-deployment validation."
+    },
+    "simulate_full.py": {
+      "verdict": "SALVAGE — Full pipeline simulation",
+      "lines": 509,
+      "salvageable_code": [
+        "fetch_1h_history() — HL candle fetcher for simulation.",
+        "compute_atr() / compute_rsi() / compute_adx() — Indicator functions.",
+        "Full signal → sizing → trade → PnL pipeline simulation.",
+        "Parameter optimization grid search."
+      ],
+      "integration_value": "MEDIUM — End-to-end simulation of the entire trading pipeline. Useful for parameter optimization."
+    },
+    "hyperliquid_simulator.py": {
+      "verdict": "SALVAGE — Parameter optimizer",
+      "lines": 378,
+      "salvageable_code": [
+        "fetch_ohlcv() — Kraken daily OHLCV fetcher.",
+        "ema() / rsi() / pivot_points() / atr() — Indicator implementations.",
+        "run_simulation() — Leveraged perps long+short simulator.",
+        "optimize() — Grid search parameter optimizer."
+      ],
+      "integration_value": "LOW-MEDIUM — Uses Kraken data for simulation. Less directly useful than hyperliquid_backtest.py for in-ecosystem testing."
+    },
+    "scalper.py": {
+      "verdict": "DELETE — Empty file",
+      "lines": 0,
+      "salvageable_code": [],
+      "integration_value": "NONE"
+    },
+    "check_trending.py": {
+      "verdict": "DELETE — Empty file",
+      "lines": 0,
+      "salvageable_code": [],
+      "integration_value": "NONE"
+    },
+    "trader.py": {
+      "verdict": "MARGINAL — Legacy entry point",
+      "lines": 316,
+      "salvageable_code": [
+        "class TradingAgent — Full Revolut X trading agent with scan → analyze → decide → execute cycle.",
+        "scan_opportunities() — Scans all tickers for opportunities.",
+        "make_trade() — Trade execution with size calculation."
+      ],
+      "integration_value": "LOW — Legacy Revolut X agent. The current daemon (hyperliquid_daemon.py) is the v3 replacement. Worth keeping for reference on the scan→analyze→decide→execute loop pattern."
+    },
+    "daemon.py": {
+      "verdict": "MARGINAL — Legacy daemon",
+      "lines": 490,
+      "salvageable_code": [
+        "class RevolvingTrader — 24/7 daemon with crash recovery, strategy weight adaptation, Telegram alerts.",
+        "run_forever() — Continuous loop with error handling and recovery."
+      ],
+      "integration_value": "LOW — Legacy v2 daemon. The run_forever() pattern and crash recovery are worth studying but not directly reusable."
+    },
+    "ai_daemon.py": {
+      "verdict": "MARGINAL — Legacy AI daemon",
+      "lines": 272,
+      "salvageable_code": [
+        "class AITrader — AI-powered daemon with LLM reasoning loop.",
+        "run_forever() — Continuous AI-driven trading loop."
+      ],
+      "integration_value": "LOW — Predecessor to current daemon. The AI reasoning loop pattern is interesting but already evolved in hyperliquid_daemon.py."
+    },
+    "launch_parallel.py": {
+      "verdict": "DELETE — Hardcoded paths, defunct",
+      "lines": 17,
+      "salvageable_code": [],
+      "integration_value": "NONE — Hardcodes '/home/ubuntu/revolut-x-trader' path. Defunct."
+    },
+    "trader_db.py": {
+      "verdict": "SALVAGE — DB patterns",
+      "lines": 177,
+      "salvageable_code": [
+        "get_db() / init() — SQLite DB initialization.",
+        "log_trade() / log_decision() / save_snapshot() — Trade/decision logging.",
+        "get_strategy_performance() — Strategy-level performance aggregation."
+      ],
+      "integration_value": "LOW — DB schema patterns for trade tracking. The daemon already has its own DB setup."
+    },
+    "bankrbot_strategies.py": {
+      "verdict": "MARGINAL — Strategy variants",
+      "lines": 191,
+      "salvageable_code": [
+        "class PumpRiskFilter — Detects pump coins, assesses risk.",
+        "class PersistentTrendStrategy — Multi-TF trend strategy.",
+        "class VolumeProfileStrategy — Volume-profile-based strategy."
+      ],
+      "integration_value": "LOW — Specialized strategy variants. The daemon's strategy engine already covers these domains."
+    },
+    "pattern_detector.py": {
+      "verdict": "SALVAGE — Technical signal library",
+      "lines": 186,
+      "salvageable_code": [
+        "detect_patterns() — Multi-signal detector: RSI, EMA, ATR, support/resistance, trend, volatility, volume anomalies, MACD crossover.",
+        "Individual detector functions: _rsi(), _ema(), _atr(), _detect_support_resistance(), _trend_direction(), _volatility_regime(), _volume_anomaly(), _macd_crossover(), _rsi_signal()."
+      ],
+      "integration_value": "MEDIUM — Clean, standalone technical pattern detection. Could supplement the daemon's 5-pillar signals."
+    },
+    "chart_patterns.py": {
+      "verdict": "SALVAGE — Chart pattern detection",
+      "lines": 220,
+      "salvageable_code": [
+        "detect_double_top() / detect_double_bottom() — Classic reversal patterns.",
+        "detect_head_and_shoulders() — H&S pattern detection.",
+        "detect_flag() / detect_triangle() — Continuation patterns.",
+        "detect_all_patterns() — Run all detectors, return named patterns.",
+        "format_patterns_for_ai() — AI-ready text format."
+      ],
+      "integration_value": "MEDIUM — Chart pattern detection is not in the daemon's current signal pipeline. Valuable supplement for AI decision context."
+    },
+    "strategist.py": {
+      "verdict": "MARGINAL — Strategic planning agent",
+      "lines": 250,
+      "salvageable_code": [
+        "class StrategistBrain — AI strategic planner using LLM.",
+        "run_strategist() — Full strategic planning cycle.",
+        "_load_calendar() / _load_entry_prices() — Calendar/position tracking."
+      ],
+      "integration_value": "LOW — Strategic planning layer. The daemon's weekly evolution loop handles similar concerns."
+    },
+    "strategy_analyzer.py": {
+      "verdict": "MARGINAL — Strategy analysis utilities",
+      "lines": 175,
+      "salvageable_code": [
+        "analyze_martingale() — Martingale strategy analysis.",
+        "analyze_grid_setup() — Grid trading analysis.",
+        "analyze_position_exits() — Exit strategy analysis.",
+        "recommend_coin_ranking() — Coin ranking for strategy.",
+        "get_full_strategy_context() — Full strategy context for AI."
+      ],
+      "integration_value": "LOW — Strategy analysis utilities. Niche use cases."
+    },
+    "strategy_optimizer.py": {
+      "verdict": "SALVAGE — Parameter optimization",
+      "lines": 350,
+      "salvageable_code": [
+        "class GeneticOptimizer — Genetic algorithm for strategy parameter optimization.",
+        "class BayesianOptimizer — Bayesian optimization using RBF kernel + expected improvement.",
+        "_crossover() / _mutate() — GA operators."
+      ],
+      "integration_value": "MEDIUM — BayesianOptimizer could be used to optimize the daemon's strategy parameters. The daemon's evolution loop currently uses LLM-based optimization — Bayesian optimization would be more rigorous."
+    },
+    "pump_chaser.py / pump_detector.py": {
+      "verdict": "MARGINAL — Pump detection",
+      "salvageable_code": [
+        "class PumpChaser — Real-time pump detection + auto-buy with stop-loss.",
+        "detect_pump() — Price/volume-based pump detection.",
+        "detect_wash_trading() — Wash trading pattern detection."
+      ],
+      "integration_value": "LOW — Pump chasing is inherently risky. The daemon takes the opposite approach (conservative, regime-aware)."
+    }
+  },
+  "true_dead_weight": {
+    "scalper.py": {"verdict": "DELETE", "reason": "Empty file — 0 lines"},
+    "check_trending.py": {"verdict": "DELETE", "reason": "Empty file — 0 lines"},
+    "launch_parallel.py": {"verdict": "DELETE", "reason": "Defunct — hardcoded paths to revolut-x-trader, not hyperliquid-trader"},
+    "deprecated/bank_manager.py": {"verdict": "DELETE", "reason": "Already in deprecated/ — legacy bank manager agent"},
+    "deprecated/buyer_agent.py": {"verdict": "DELETE", "reason": "Already in deprecated/ — legacy buyer agent"},
+    "deprecated/seller_agent.py": {"verdict": "DELETE", "reason": "Already in deprecated/ — legacy seller agent"},
+    "market_intel.py": {"verdict": "DELETE", "reason": "Not imported by anyone, unreferenced. market_intelligence.py supersedes this."}
+  },
+  "low_value_archive_candidates": {
+    "trader.py": "Legacy Revolut X trader. Daemon v3 replaces this. Archive for historical reference.",
+    "daemon.py": "Legacy v2 daemon. Archived ancestor. Keep for crash recovery pattern reference.",
+    "ai_daemon.py": "Legacy AI daemon. Replaced by hyperliquid_daemon.py v3.",
+    "news_collector.py": "85 lines. Trivial wrapper. Inline into data_enricher or replace with sentiment_scraper.",
+    "sentiment.py": "Superseded by sentiment_scraper.py (better VADER-like implementation).",
+    "pump_chaser.py": "High-risk pump chasing. Conflicts with daemon's conservative approach.",
+    "pump_detector.py": "Pump detection utilities. Marginally useful.",
+    "strategist.py": "Strategic planning agent. Daemon v3 handles this.",
+    "strategy_analyzer.py": "Niche strategy analysis utilities.",
+    "bankrbot_strategies.py": "Strategy variants. Daemon's strategy engine covers these."
+  },
+  "recommended_action": {
+    "keep_and_integrate": [
+      "data_enricher.py — Market intelligence aggregator (CoinGecko + F&G + multi-source)",
+      "sentiment_scraper.py — VADER-like crypto sentiment with no external deps",
+      "llm_optimizer.py — LLM cache + token-efficient prompt patterns",
+      "kraken_client.py — Production Kraken Futures client (reference library)",
+      "okx_client.py — Production OKX client (reference library)",
+      "onchain_metrics.py — BTC on-chain cycle indicators (Mayer Multiple, MVRV)",
+      "prediction_memory.py — AI prediction outcome tracking"
+    ],
+    "keep_as_reference": [
+      "market_intelligence.py — Snapshot architecture pattern",
+      "market_predictor.py — Multi-TF prediction pipeline",
+      "ai_brain.py — LLM trading brain with robust JSON parser",
+      "strategies.py — Ensemble strategy framework",
+      "backtest_engine.py — Clean backtest framework",
+      "hyperliquid_backtest.py — Daemon strategy backtest",
+      "simulate_full.py — Full pipeline simulation",
+      "self_improving_ai.py — Performance feedback loop",
+      "strategy_optimizer.py — Bayesian + GA optimizers",
+      "pattern_detector.py — Technical signal library",
+      "chart_patterns.py — Chart pattern detection"
+    ],
+    "delete": [
+      "scalper.py (empty)",
+      "check_trending.py (empty)",
+      "launch_parallel.py (defunct, hardcoded paths)",
+      "deprecated/ (all 3 files)",
+      "market_intel.py (unreferenced)"
+    ],
+    "archive_after_study": [
+      "trader.py, daemon.py, ai_daemon.py (legacy daemons)",
+      "sentiment.py (superseded by sentiment_scraper.py)",
+      "news_collector.py (trivial wrapper)"
+    ]
+  }
+}

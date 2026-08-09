@@ -365,6 +365,161 @@ def get_all_activity_summary() -> str:
 
 # ── Self-test ──────────────────────────────────────────────────────────────
 
+
+# ── Cascade Detection (merged from liquidation_cascade.py, Aug 9) ──
+class CascadeSignal:
+    """Signal from liquidation cascade analysis."""
+    symbol: str
+    cascade_detected: bool
+    cascade_side: str  # 'longs_liquidated' or 'shorts_liquidated'
+    severity: float  # 0-1, how severe the cascade
+    bounce_probability: float  # 0-1, probability of reversal
+    lai: float  # Liquidation Asymmetry Index (-1 to 1)
+    suggested_action: str  # 'BUY' | 'SELL' | 'HOLD'
+    confidence: float
+    reason: str
+
+def detect_cascade_from_candles(
+    candles: list[dict],
+    symbol: str = "",
+    lookback_bars: int = 12,
+) -> CascadeSignal:
+    """
+    Detect liquidation cascade patterns from candle data (proxy method).
+    
+    Signs of a liquidation cascade in candles:
+    1. Large candle(s) with high volume → forced selling/buying
+    2. Long wicks on reversal → liquidation exhaustion
+    3. Volume spike > 3x average → cascade volume
+    
+    Strategy: Look for exhaustion patterns after cascade candles.
+    """
+    if len(candles) < lookback_bars:
+        return CascadeSignal(
+            symbol=symbol, cascade_detected=False,
+            cascade_side="", severity=0, bounce_probability=0,
+            lai=0, suggested_action="HOLD", confidence=0,
+            reason="insufficient_candles",
+        )
+    
+    recent = candles[-lookback_bars:]
+    
+    # Compute average volume
+    volumes = [float(c.get("v", c.get("volume", 0))) for c in recent[:-2]]
+    avg_vol = sum(volumes) / len(volumes) if volumes else 1
+    
+    # Check last 2 candles
+    last = recent[-1]
+    prev = recent[-2]
+    prev_vol = float(prev.get("v", prev.get("volume", 0)))
+    last_vol = float(last.get("v", last.get("volume", 0)))
+    
+    prev_o = float(prev.get("o", prev.get("open", 0)))
+    prev_c = float(prev.get("c", prev.get("close", 0)))
+    last_o = float(last.get("o", last.get("open", 0)))
+    last_c = float(last.get("c", last.get("close", 0)))
+    prev_h = float(prev.get("h", prev.get("high", 0)))
+    prev_l = float(prev.get("l", prev.get("low", 0)))
+    last_h = float(last.get("h", last.get("high", 0)))
+    last_l = float(last.get("l", last.get("low", 0)))
+    
+    if avg_vol <= 0:
+        return CascadeSignal(
+            symbol=symbol, cascade_detected=False,
+            cascade_side="", severity=0, bounce_probability=0,
+            lai=0, suggested_action="HOLD", confidence=0,
+            reason="zero_volume",
+        )
+    
+    # Detect cascade candle: high volume + large range
+    cascade_vol_threshold = 2.5  # 2.5x average volume
+    cascade_range_threshold = 2.0  # 2x ATR
+    
+    prev_range_pct = abs(prev_c - prev_o) / prev_o * 100 if prev_o > 0 else 0
+    last_range_pct = abs(last_c - last_o) / last_o * 100 if last_o > 0 else 0
+    
+    prev_is_cascade = (prev_vol > avg_vol * cascade_vol_threshold and 
+                       prev_range_pct > 1.5)
+    last_is_cascade = (last_vol > avg_vol * cascade_vol_threshold and 
+                       last_range_pct > 1.5)
+    
+    if not prev_is_cascade and not last_is_cascade:
+        return CascadeSignal(
+            symbol=symbol, cascade_detected=False,
+            cascade_side="", severity=0, bounce_probability=0,
+            lai=0, suggested_action="HOLD", confidence=0,
+            reason="no_cascade_pattern",
+        )
+    
+    # Determine cascade direction
+    cascade_bearish = False
+    cascade_bullish = False
+    
+    if prev_is_cascade:
+        if prev_c < prev_o * 0.98:  # Big red candle
+            cascade_bearish = True
+        elif prev_c > prev_o * 1.02:  # Big green candle
+            cascade_bullish = True
+    
+    # Check for exhaustion/reversal signal
+    # Bearish cascade exhaustion: hammer/doji after big red
+    # Bullish cascade exhaustion: shooting star after big green
+    
+    severity = max(prev_vol, last_vol) / (avg_vol * cascade_vol_threshold)
+    severity = min(1.0, severity)
+    
+    bounce_prob = 0.0
+    action = "HOLD"
+    conf = 0.0
+    reason = ""
+    
+    if cascade_bearish:
+        # Long liquidation cascade - look for exhaustion (hammer/bullish reversal)
+        lower_wick = (last_l - min(last_o, last_c)) / abs(last_o - last_c) if abs(last_o - last_c) > 0 else 0
+        is_hammer = (lower_wick > 0.6 and last_c > last_o * 0.998)
+        is_bullish_engulf = (last_c > last_o and last_o <= prev_c and last_c >= prev_o)
+        
+        if is_hammer or is_bullish_engulf:
+            bounce_prob = min(0.80, 0.35 + severity * 0.4)
+            action = "BUY"
+            conf = min(80, 35 + severity * 40)
+            reason = f"liq_cascade_exhaustion:hammer" if is_hammer else f"liq_cascade_exhaustion:engulf"
+        else:
+            # Cascade ongoing, wait
+            bounce_prob = 0.2
+            action = "HOLD"
+            conf = 25
+            reason = "liq_cascade_ongoing:waiting_for_exhaustion"
+    
+    elif cascade_bullish:
+        # Short liquidation cascade - look for exhaustion (shooting star/bearish reversal)
+        upper_wick = (last_h - max(last_o, last_c)) / abs(last_o - last_c) if abs(last_o - last_c) > 0 else 0
+        is_shooting_star = (upper_wick > 0.6 and last_c < last_o * 1.002)
+        is_bearish_engulf = (last_c < last_o and last_o >= prev_c and last_c <= prev_o)
+        
+        if is_shooting_star or is_bearish_engulf:
+            bounce_prob = min(0.80, 0.35 + severity * 0.4)
+            action = "SELL"
+            conf = min(80, 35 + severity * 40)
+            reason = f"liq_cascade_exhaustion:star" if is_shooting_star else f"liq_cascade_exhaustion:engulf"
+        else:
+            bounce_prob = 0.2
+            action = "HOLD"
+            conf = 25
+            reason = "liq_cascade_ongoing:waiting_for_exhaustion"
+    
+    return CascadeSignal(
+        symbol=symbol,
+        cascade_detected=True,
+        cascade_side="longs" if cascade_bearish else "shorts",
+        severity=round(severity, 3),
+        bounce_probability=round(bounce_prob, 3),
+        lai=1.0 if cascade_bearish else -1.0,
+        suggested_action=action,
+        confidence=round(conf, 1),
+        reason=reason,
+    )
+
 if __name__ == "__main__":
     import sys
 

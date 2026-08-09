@@ -132,20 +132,17 @@ from ai_decider import (
     ai_select_coins, ai_assess_market, ai_evaluate_exit, ai_debate_entry,
 )
 
-# Peak/bottom exhaustion detector — predicts local tops/bottoms
+# Peak/bottom exhaustion detector — candle-level + tick-level merged (Aug 9)
 from peak_exhaustion_detector import (
-    detect_peak_exhaustion, predict_price_target, format_exhaustion_for_ai, ExhaustionSignal,
+    detect_peak_exhaustion, detect_tick_peak,
+    predict_price_target, format_exhaustion_for_ai, format_tick_peak,
+    ExhaustionSignal, TickPeakSignal,
 )
 # Unified prediction engine — combines ML, exhaustion, structure, flow, macro
 from price_extremes import get_extremes, get_dynamic_tp_targets, format_extremes_for_ai
 from unified_predictor import (
     predict_unified, format_prediction_for_ai, PredictionResult,
 )
-# Tick-level peak/bottom detector — millisecond precision, runs every 10s
-from tick_peak_detector import (
-    detect_tick_peak, format_tick_peak, TickPeakSignal,
-)
-# AI Validation — DeepSeek V4 Pro second-opinion on every prediction
 from ai_validator import (
     validate_prediction, format_validation, AIValidationResult,
 )
@@ -598,7 +595,49 @@ _CHASE_THRESHOLDS = [
 ]
 
 
-def _check_recent_move(coin: str, side: str) -> dict:
+def _micro_peak_entry_wait(coin: str, is_buy: bool, px: float, max_wait: float = 4.0) -> float:
+    """Wait for a favorable micro-move before entering. Uses live WebSocket mids (no API).
+    
+    SHORT: wait for price to tick UP (better entry = higher price).
+    LONG:  wait for price to tick DOWN (better entry = lower price).
+    
+    Returns the best price seen during the window, or px if no WS data.
+    Max wait is short (4s) — this is micro-timing, not a limit order.
+    """
+    try:
+        from hyperliquid_ws import get_field
+    except ImportError:
+        return px
+    _start = time.time()
+    _best = px
+    _sample_interval = 0.15  # 150ms samples — fast enough for micro-peaks
+    _seen_favorable = False
+    _first_sample = px
+    while time.time() - _start < max_wait:
+        time.sleep(_sample_interval)
+        ws_mids = get_field("mids")
+        if not ws_mids:
+            continue
+        _ws_px = float(ws_mids.get(coin, 0) or ws_mids.get(coin.upper(), 0))
+        if _ws_px <= 0:
+            continue
+        if is_buy:
+            # LONG: better price is LOWER
+            if _ws_px < _best:
+                _best = _ws_px
+                _seen_favorable = True
+        else:
+            # SHORT: better price is HIGHER
+            if _ws_px > _best:
+                _best = _ws_px
+                _seen_favorable = True
+        # Exit early if we got a favorable micro-move (>0.05% improvement)
+        _improvement = abs(_best - px) / px * 100
+        if _seen_favorable and _improvement > 0.05:
+            break
+    if _seen_favorable:
+        return _best
+    return px
     """Check if price already moved significantly in the trade direction.
     
     Returns dict with:
@@ -1119,7 +1158,10 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
             log.info(f"  🎯 {coin}: AI zone=${entry_zone:.4f} close ({abs(px-entry_zone)/px*100:.1f}%) — limit, 45s timeout")
             result = hl.order(coin, is_buy, sz, _zone_limit, order_type="gtc")
             if isinstance(result, dict) and result.get("status") == "err":
-                log.warning(f"  DIRECT OPEN {coin}: zone limit failed — {result.get('error', 'unknown')}, falling back")
+                log.warning(f"  DIRECT OPEN {coin}: zone limit failed — {result.get('error', 'unknown')}, falling back with micro-peak timing")
+                _mp_px = _micro_peak_entry_wait(coin, is_buy, px)
+                if _mp_px != px:
+                    log.info(f"  ⚡ {coin}: micro-peak fallback → ${px:.4f}→${_mp_px:.4f}")
                 result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
             else:
                 _z_oid = _extract_oid(result)
@@ -1133,12 +1175,23 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
                     log.info(f"  📝 {coin}: zone limit oid={_z_oid} queued (45s)")
                     return True
                 else:
-                    log.warning(f"  DIRECT OPEN {coin}: no oid from zone limit — falling back")
+                    log.warning(f"  DIRECT OPEN {coin}: no oid from zone limit — falling back with micro-peak timing")
+                    _mp_px = _micro_peak_entry_wait(coin, is_buy, px)
+                    if _mp_px != px:
+                        log.info(f"  ⚡ {coin}: micro-peak fallback → ${px:.4f}→${_mp_px:.4f}")
                     result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
         
         elif entry_zone > 0:
-            # AI zone too far — just enter at market
-            log.info(f"  🎯 {coin}: AI zone=${entry_zone:.4f} too far ({abs(px-entry_zone)/px*100:.1f}%) — market entry")
+            # AI zone too far — cap at 10% distance
+            _zone_distance = abs(px-entry_zone)/px*100
+            if _zone_distance > 10.0:
+                log.info(f"  🚫 {coin}: ZONE TOO FAR — AI zone=${entry_zone:.4f} is {_zone_distance:.1f}% away (>{10.0}% cap), skip")
+                return False
+            # AI zone too far — enter at market with micro-peak timing
+            log.info(f"  🎯 {coin}: AI zone=${entry_zone:.4f} too far ({_zone_distance:.1f}%) — market entry")
+            _mp_px = _micro_peak_entry_wait(coin, is_buy, px)
+            if _mp_px != px:
+                log.info(f"  ⚡ {coin}: micro-peak → ${px:.4f}→${_mp_px:.4f} ({(abs(_mp_px-px)/px*100):.2f}% better)")
             result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
         
         # Step 3: Pump/dump-aware entry — don't chase, wait for pullback
@@ -1896,13 +1949,25 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                     
                     # ── PROFIT LOCK: tiered — all thresholds now survive 0.42% fees at 6x ──
                     # Aug 7: 0.03% was below fee — trades looked green but lost money.
-                    # Floor raised to 0.08% net minimum. Every close now actually profits.
+                    # Aug 9: Floor raised to 0.15% net — must clear 0.42% max fee with room.
+                    # Let winners run: tight profit locks cut good trades. Only lock when
+                    # profit is solid. Peak lock tiers handle scaling exits on big runners.
+                    # EXTREME REVERSAL: only force-exit if peak was big (>3%) and now losing.
+                    if _peak_pnl >= 3.0 and net_pnl_pct < -0.15:
+                        log.warning(f"  🚨 {coin}: EXTREME REVERSAL — peak was {_peak_pnl:+.2f}%, now losing {net_pnl_pct:+.2f}%, closing 50%")
+                        try:
+                            _close_sz = abs(szi) * 0.5
+                            hl.market_close(coin, sz=_close_sz)
+                            log.info(f"  📤 {coin}: partial close {_close_sz:.1f}u — 50% remaining to run")
+                        except Exception as e:
+                            log.warning(f"  ⚠️ {coin}: partial close failed: {e}")
+                    
                     if _hold_age_mon < 60:
-                        _lock_target = 0.08  # First 60s: must clear fees with room
+                        _lock_target = 0.15  # First 60s: must clear max fee (0.42%@6x) + room
                     elif _hold_age_mon < 180:
-                        _lock_target = 0.12  # 1-3 min: let micro-move develop
+                        _lock_target = 0.25  # 1-3 min: let winner develop, lock bigger profit
                     else:
-                        _lock_target = 0.08  # 3+ min: still must beat fees
+                        _lock_target = 0.15  # 3+ min: still profitable, let it ride unless reversing
                     
                     if _net_pnl_mon >= _lock_target:
                         log.warning(f"  💰 {coin}: PROFIT LOCK — net={_net_pnl_mon:+.2f}% ≥ {_lock_target:.2f}% (age={_hold_age_mon:.0f}s), closing NOW")
@@ -1998,7 +2063,57 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                             # Bleeding: peak was better, now dropping, mom going the wrong way
                             exit_reason = f"BLEED: down {drop_from_peak_pct:.2f}% from peak, mom turning against, net={_net_pnl_mon:+.2f}%"
                         elif not _ever_green and _hold_age_mon > 300:
-                            exit_reason = f"NEVER-GREEN: underwater {_net_pnl_mon:+.2f}% for {_hold_age_mon:.0f}s, never hit breakeven"
+                            # ── AI RE-CHECK: ask AI before killing flat positions ──
+                            # Aug 9: DON'T blindly kill at 300s. If 4h trend is NOT strongly
+                            # against and AI still believes in the trade, extend to 600s.
+                            # Only kill immediately if trend is screaming against or AI says exit.
+                            _recheck_key = f"_ai_exit_recheck:{cu}"
+                            _already_rechecked = getattr(_monitor_positions, _recheck_key, False) if hasattr(_monitor_positions, _recheck_key) else False
+                            _trend_strongly_against = False
+                            if side == "SHORT":
+                                _trend_strongly_against = (_pct_low_4h < 1.5)  # Strong uptrend: <1.5% below 4h high
+                            else:
+                                _trend_strongly_against = (_pct_4h < 1.5)  # Strong downtrend: <1.5% above 4h low
+                            if _trend_strongly_against:
+                                exit_reason = f"NEVER-GREEN: underwater {_net_pnl_mon:+.2f}% for {_hold_age_mon:.0f}s, trend strongly against (4h={_pct_4h if side!='SHORT' else _pct_low_4h:.1f}% from extreme)"
+                            elif _already_rechecked and _hold_age_mon > 600:
+                                exit_reason = f"NEVER-GREEN: underwater {_net_pnl_mon:+.2f}% for {_hold_age_mon:.0f}s, AI said hold but 600s timeout exceeded"
+                            elif not _already_rechecked:
+                                setattr(_monitor_positions, _recheck_key, True)
+                                try:
+                                    _ext_str = ""
+                                    if ext:
+                                        _ext_str = f"1h:{ext.pct_1h:+.1f}%/-{ext.pct_low_1h:.1f}%@{ext.range_pos_1h:.0f}% 4h:{ext.pct_4h:+.1f}%/-{ext.pct_low_4h:.1f}%"
+                                    _regime_str = "neutral"
+                                    if _regime_downtrend:
+                                        _regime_str = "trending_down"
+                                    elif _regime_uptrend:
+                                        _regime_str = "trending_up"
+                                    _ai_result = ai_evaluate_exit(
+                                        coin=coin,
+                                        direction=side,
+                                        entry_price=entry,
+                                        current_price=mid,
+                                        pnl_pct=_net_pnl_mon,
+                                        hold_seconds=_hold_age_mon,
+                                        mom_5m=mom5,
+                                        mom_15m=0,
+                                        regime=_regime_str,
+                                        target_pct=2.0,
+                                        stop_pct=0.55,
+                                        price_extremes=_ext_str,
+                                        peak_pnl=_peak_pnl if _peak_pnl > -999 else 0,
+                                    )
+                                    _ai_action = _ai_result.get("action", "exit")
+                                    _ai_conf = _ai_result.get("confidence", 0)
+                                    _ai_reason = _ai_result.get("reason", "")
+                                    if _ai_action == "hold" and _ai_conf >= 70:
+                                        log.info(f"  🧠 {coin}: AI RE-CHECK → HOLD (conf={_ai_conf}%): {_ai_reason} — extending NEVER-GREEN to 600s")
+                                    else:
+                                        exit_reason = f"NEVER-GREEN: underwater {_net_pnl_mon:+.2f}% for {_hold_age_mon:.0f}s — AI says {_ai_action}@{_ai_conf}%: {_ai_reason}"
+                                except Exception as _ai_err:
+                                    log.warning(f"  ⚠️ {coin}: AI re-check crashed ({type(_ai_err).__name__}: {_ai_err}) — falling back to NEVER-GREEN kill")
+                                    exit_reason = f"NEVER-GREEN: underwater {_net_pnl_mon:+.2f}% for {_hold_age_mon:.0f}s, never hit breakeven (AI re-check failed)"
 
                     if exit_reason:
                         log.warning(f"  💀 {coin}: {exit_reason}")
@@ -3443,18 +3558,96 @@ def run(dry_run: bool = False):
                                 pass
                             import sector_rotation as _sr
                             _sec_score = _sr.sector_tracker.get_sector_score(c)
+                            # ── VWAP sigma: critical for AI direction (mean reversion awareness) ──
+                            _vwap_sigma = 0.0
+                            try:
+                                _vwap_vols = [float(x.get("v", x.get("volume", 0))) for x in c15[-20:]]
+                                _vwap_highs = [float(x.get("h", x.get("high", 0))) for x in c15[-20:]]
+                                _vwap_lows = [float(x.get("l", x.get("low", 0))) for x in c15[-20:]]
+                                _vwap_closes = [float(x.get("c", x.get("close", 0))) for x in c15[-20:]]
+                                _vwap_typ = [(h+l+c)/3 for h,l,c in zip(_vwap_highs, _vwap_lows, _vwap_closes)]
+                                _vwap_tv = sum(t*v for t,v in zip(_vwap_typ, _vwap_vols))
+                                _vwap_tv_total = sum(_vwap_vols)
+                                if _vwap_tv_total > 0:
+                                    _vwap_mean = _vwap_tv / _vwap_tv_total
+                                    _vwap_var = sum(((t-_vwap_mean)**2)*v for t,v in zip(_vwap_typ, _vwap_vols)) / _vwap_tv_total
+                                    _vwap_std = _vwap_var ** 0.5
+                                    if _vwap_std > 0:
+                                        _vwap_sigma = (mid - _vwap_mean) / _vwap_std
+                            except Exception:
+                                pass
+                            # ── CVD: cumulative volume delta for buy/sell pressure ──
+                            _cvd = {}
+                            try:
+                                from volume_delta import compute_cvd
+                                _cvd_result = compute_cvd(c15)
+                                _cvd = {"trend": "rising" if _cvd_result.cvd_slope > 0 else "falling",
+                                        "conf": min(100, abs(_cvd_result.cvd_slope) * 1000),
+                                        "divergence": _cvd_result.divergence}
+                            except Exception:
+                                pass
+                            # ── OI delta: open interest change ──
+                            _oi_delta = 0.0
+                            try:
+                                from oi_delta import get_oi_delta
+                                _oi_delta = get_oi_delta(c)
+                            except Exception:
+                                pass
+                            # ── 1h proximity (distance from 1h high/low) ──
+                            _1h_prox = {}
+                            try:
+                                c1h = _fetch_candles_cached(c, "1h", 30)
+                                if c1h and len(c1h) >= 5:
+                                    _1h_highs = [float(x.get("h", x.get("high", 0))) for x in c1h[-6:]]
+                                    _1h_lows = [float(x.get("l", x.get("low", 0))) for x in c1h[-6:]]
+                                    _hh = max(_1h_highs) if _1h_highs else mid
+                                    _ll = min(_1h_lows) if _1h_lows else mid
+                                    if _hh > 0 and _ll > 0:
+                                        _1h_prox = {"to_high": (1 - mid/_hh)*100 if mid < _hh else 0,
+                                                    "to_low": (mid/_ll - 1)*100 if mid > _ll else 0}
+                            except Exception:
+                                pass
+                            # ── 4h range position: where is price in the 4h range? ──
+                            # Aug 9: AI needs 4h context to avoid shorting into +74% pumps
+                            _4h_prox = {}
+                            try:
+                                _ext = get_extremes(c, mids)
+                                if _ext and _ext.high_4h > 0 and _ext.low_4h > 0:
+                                    _4h_prox = {"pct_high": _ext.pct_low_4h,  # % below 4h high
+                                               "pct_low": _ext.pct_4h,        # % above 4h low
+                                               "range_pos": _ext.range_pos_4h if hasattr(_ext, 'range_pos_4h') else 50}
+                            except Exception:
+                                pass
                             ai_candidates.append({
                                 "coin": c, "price": mid, "composite": comp,
                                 "regime": reg.value, "volatility": vol,
                                 "btc_corr": DEFAULT_BTC_CORRELATIONS.get(c.upper(), 0.5),
+                                "mom_1m": _calc_momentum(c, "1m"),
                                 "mom_5m": _calc_momentum(c, "5m"),
                                 "mom_15m": _calc_momentum(c, "15m"),
+                                "mom_1h": _calc_momentum(c, "1h"),
+                                "vwap_dist": round(_vwap_sigma * 100, 1),
+                                "_cvd": _cvd,
+                                "oi_delta": round(_oi_delta, 2),
+                                "_range_pct": round(vol * 3, 1),
+                                "_1h_prox": _1h_prox,
+                                "_4h_prox": _4h_prox,
+                                "signal_hint": f"{reg.value}:comp={comp:+.2f}",
                                 "sector": _sr.COIN_SECTOR.get(c.upper(), ""),
                                 "sector_score": _sec_score,
                             })
                         if ai_candidates:
+                            # ── Market intelligence: external data for AI context ──
+                            try:
+                                from market_intel import get_market_brief
+                                _mkt_brief = get_market_brief()
+                            except Exception:
+                                _mkt_brief = ""
                             log.info(f"  AI scanning {len(ai_candidates)} candidates...")
-                            ai_picks, ai_skips, ai_market_notes = ai_select_coins(ai_candidates, total_eq, recent_trades=_recent_trades)
+                            ai_picks, ai_skips, ai_market_notes = ai_select_coins(
+                                ai_candidates, total_eq,
+                                market_context=_mkt_brief,
+                                recent_trades=_recent_trades)
                             if ai_skips:
                                 for s in ai_skips:
                                     _forager_skip_cooldown[str(s).upper()] = time.time() + 300
@@ -4086,7 +4279,8 @@ def run(dry_run: bool = False):
 
                     # ── AI Override: trust AI trade plan when confidence ≥ 80% ──
                     # Must be AFTER all gates — clears block_reason regardless of which gate set it
-                    # BUT: don't override when composite is weak (< 0.15) — the signal is noise
+                    # BUT: don't override when composite is weak (< 0.08) — the signal is noise
+                    # Aug 9: raised min composite from 0.03→0.08, scaled threshold by validator flags
                     ai_plan = _ai_trade_plan.get(coin.upper(), {})
                     ai_conf_val = ai_plan.get("confidence", 0)
                     ai_dir_raw = ai_plan.get("direction", "").lower()
@@ -4095,7 +4289,7 @@ def run(dry_run: bool = False):
                     _bull_market = (ai_market.get("bias", "") == "bullish" if "ai_market" in dir() else False)
                     # Bull market accelerator: if AI says bullish, trust AI longs with lower bar
                     _bull_aligned = _bull_market and ai_dir_raw == "long"
-                    _min_composite = 0.03 if _bull_aligned else (0.03 if ai_dir_raw == "short" else 0.10)
+                    _min_composite = 0.05 if _bull_aligned else (0.08 if ai_dir_raw == "short" else 0.12)
                     if ai_conf_val >= 80 and block_reason:
                         # ── UN-OVERRIDABLE GATES: VWAP extremes, data consensus — no AI bypass ──
                         _cannot_override = ("VWAP:+" in block_reason and "overbought" in block_reason) or \
@@ -4628,9 +4822,22 @@ def run(dry_run: bool = False):
                                 action = "SELL"
                                 _vwap_overrides = True
                             if not _vwap_overrides:
-                                log.warning(f"  🛑 {coin}: DIRECTION CONFLICT — trading {sig_side_str} but enriched says {enriched_final} "
-                                           f"(AI conf={ai_conf_sanity}% < 95% needed for contrarian)")
-                                continue
+                                # ── Regime-aware: in trending_down, AI picking SHORT follows the trend ──
+                                # Enriched's BUY in downtrend is mean-reversion (contrarian).
+                                # The AI IS the trend-follower here — lower threshold.
+                                _regime_supports_ai = (
+                                    (regime_is_downtrend and sig_side_str == "SELL") or
+                                    (regime_is_uptrend and sig_side_str == "BUY")
+                                )
+                                _contrarian_threshold = 80 if _regime_supports_ai else 95
+                                if ai_conf_sanity >= _contrarian_threshold:
+                                    log.warning(f"  ⚠️  {coin}: CONTRARIAN TRADE — AI {ai_conf_sanity}% overrides enriched {enriched_final} "
+                                               f"(regime supports AI, threshold={_contrarian_threshold}%) → going {sig_side_str}")
+                                    # Continue to sizing — don't block
+                                else:
+                                    log.warning(f"  🛑 {coin}: DIRECTION CONFLICT — trading {sig_side_str} but enriched says {enriched_final} "
+                                               f"(AI conf={ai_conf_sanity}% < {_contrarian_threshold}% needed for contrarian)")
+                                    continue
                         else:
                             log.warning(f"  ⚠️  {coin}: CONTRARIAN TRADE — AI {ai_conf_sanity}% overrides enriched {enriched_final} → going {sig_side_str}")
 
@@ -4954,8 +5161,32 @@ def run(dry_run: bool = False):
                     _trade_is_sell = _trade_side == "SELL" if '_trade_side' in dir() else False
                     if _trade_is_sell and ai_override_applied and not _bull_market:
                         _comp_floor = -0.15  # SELL override in non-bull: trending_down macro, negative OK
+                    # ── VWAP mean-reversion: overbought coins can be shorted with positive composite ──
+                    # When VWAP>+1.5σ, the mean-reversion edge justifies shorting a trending-up coin.
+                    # Relax floor from 0.15→0.40 for +1.5σ, 0.15→0.60 for +2.5σ+.
+                    _vwap_sigma_for_floor = 0.0
+                    try:
+                        import re
+                        _vwap_match_f = re.search(r'VWAP:([+-]\d+\.?\d*)σ', enrich_ctx) if enrich_ctx else None
+                        if _vwap_match_f:
+                            _vwap_sigma_for_floor = float(_vwap_match_f.group(1))
+                    except Exception:
+                        pass
+                    if _trade_is_sell and _vwap_sigma_for_floor > 1.5 and sig.side == "SELL":
+                        # VWAP overbought: mean reversion SELL is valid even with bullish composite
+                        _vwap_relaxed_floor = 0.15 + (_vwap_sigma_for_floor - 1.5) * 0.25  # 1.5σ→0.15, 2.5σ→0.40, 3.5σ→0.65
+                        _vwap_relaxed_floor = min(_vwap_relaxed_floor, 0.70)  # Cap at 0.70
+                        if sig.composite_score <= _vwap_relaxed_floor:
+                            log.info(f"  📈 {coin}: VWAP FLOOR RELAX — VWAP={_vwap_sigma_for_floor:+.1f}σ overbought, "
+                                    f"allowing SELL composite≤{_vwap_relaxed_floor:.2f} (actual={sig.composite_score:+.2f})")
+                            _bad_entry = False  # explicitly allow
+                            # Skip the normal floor check below — use the relaxed ceiling instead
+                            _vwap_relaxed_active = True
                     if not _bad_entry:
-                        if _trade_is_sell and _comp_floor < 0:
+                        _vwap_skip_floor = locals().get('_vwap_relaxed_active', False)
+                        if _vwap_skip_floor:
+                            pass  # VWAP relax already validated composite ceiling
+                        elif _trade_is_sell and _comp_floor < 0:
                             # For shorts: block when composite is TOO BULLISH (above abs floor)
                             # -0.25 is MORE bearish than -0.15 → PASSES. +0.05 is bullish → BLOCKS.
                             if sig.composite_score > abs(_comp_floor):
@@ -5204,6 +5435,14 @@ def run(dry_run: bool = False):
                             log.info(f"  ⚡ {coin}: DEBATE SKIPPED — enriched+AI agree at {ai_conf_val}% (comp={sig.composite_score:+.2f})")
                             _confluence_bonus = 1.0; _confluence_lev = chosen_leverage
                             _confluence_label = ""; _fast_exit = False
+                        # Regime-confirmed: AI direction matches macro trend even if enriched disagrees
+                        elif ai_conf_val >= 80 and (
+                            (regime_is_downtrend and _trade_side == "SELL") or
+                            (regime_is_uptrend and _trade_side == "BUY")
+                        ):
+                            log.info(f"  ⚡ {coin}: DEBATE SKIPPED — regime confirms {_trade_side} (AI={ai_conf_val}%, enriched={sig.side}, comp={sig.composite_score:+.2f})")
+                            _confluence_bonus = 1.0; _confluence_lev = chosen_leverage
+                            _confluence_label = "regime-confirmed"; _fast_exit = False
                         else:
                             _is_sell = _trade_side == "SELL"
                             if debate_verdict == "HOLD" and not _is_ft_debate:
@@ -5267,10 +5506,11 @@ def run(dry_run: bool = False):
                             # Execute directly on Hyperliquid (inline, no pipeline delay)
                             is_buy = (_trade_side == "BUY")
                         
-                            # Micro-cap gate: skip coins < $0.05 (thin book → ghost/dust fills)
+                            # Micro-cap gate: skip coins < $0.02 (thin book → ghost/dust fills)
+                            # Aug 9: raised from $0.01 → $0.02 — 227 ghost fills in 24h
                             _entry_price = float(mids.get(coin, 0))
-                            if _entry_price > 0 and _entry_price < 0.01:
-                                log.info(f"  🚫 {coin}: MICRO-CAP — ${_entry_price:.4f} < $0.01 (too illiquid, will ghost fill)")
+                            if _entry_price > 0 and _entry_price < 0.02:
+                                log.info(f"  🚫 {coin}: MICRO-CAP — ${_entry_price:.4f} < $0.02 (too illiquid, will ghost fill)")
                                 continue
                             # Spread check: skip if bid-ask > 2% (thin book, will ghost/dust)
                             if _entry_price > 0:
@@ -5295,6 +5535,32 @@ def run(dry_run: bool = False):
                             
                             # ── REGIME GUARD: only block, don't buy pumps, don't sell dumps ──
                             # Aug 7: everything else enters. Breakeven-lock + profit-lock protect exits.
+                            # Aug 9: BTC/ETH MACRO FILTER — if market leaders are pumping, don't short.
+                            # If BTC+ETH both up >0.5% in last hour, SHORTs are fighting the tide.
+                            try:
+                                btc_now = float(mids.get("BTC", 0))
+                                eth_now = float(mids.get("ETH", 0))
+                                _btc_key = "_btc_1h_ago"; _eth_key = "_eth_1h_ago"
+                                btc_1h_ago = getattr(_monitor_positions, _btc_key, 0) if hasattr(_monitor_positions, _btc_key) else 0
+                                eth_1h_ago = getattr(_monitor_positions, _eth_key, 0) if hasattr(_monitor_positions, _eth_key) else 0
+                                # Store baseline every 60 min
+                                if time.time() - getattr(_monitor_positions, "_btc_last_store", 0) > 3600:
+                                    setattr(_monitor_positions, _btc_key, btc_now)
+                                    setattr(_monitor_positions, _eth_key, eth_now)
+                                    setattr(_monitor_positions, "_btc_last_store", time.time())
+                                if btc_1h_ago > 0 and eth_1h_ago > 0:
+                                    btc_chg = (btc_now - btc_1h_ago) / btc_1h_ago * 100
+                                    eth_chg = (eth_now - eth_1h_ago) / eth_1h_ago * 100
+                                    macro_pumping = btc_chg > 0.5 and eth_chg > 0.3
+                                    macro_dumping = btc_chg < -0.5 and eth_chg < -0.3
+                                    if _trade_side == "SELL" and macro_pumping:
+                                        log.warning(f"  🛑 {coin}: MACRO BLOCK — BTC {btc_chg:+.1f}% ETH {eth_chg:+.1f}% pumping, can't SHORT against tide")
+                                        continue
+                                    if _trade_side == "BUY" and macro_dumping:
+                                        log.warning(f"  🛑 {coin}: MACRO BLOCK — BTC {btc_chg:+.1f}% ETH {eth_chg:+.1f}% dumping, can't LONG against tide")
+                                        continue
+                            except Exception:
+                                pass  # Can't check macro — proceed
                             _sig_regime = getattr(sig, 'regime', None)
                             _regime_val = str(_sig_regime.value) if _sig_regime and hasattr(_sig_regime, 'value') else ""
                             if _trade_side == "BUY" and "extreme_up" in _regime_val:

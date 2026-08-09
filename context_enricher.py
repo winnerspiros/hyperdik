@@ -227,7 +227,7 @@ def _enrich_cascade(candles_15m: list, symbol: str) -> str:
     if len(candles_15m) < 12:
         return ""
     try:
-        from liquidation_cascade import detect_cascade_from_candles
+        from liquidation_monitor import detect_cascade_from_candles
         cascade = detect_cascade_from_candles(candles_15m, symbol)
         if cascade.cascade_detected and cascade.bounce_probability > 0.3:
             return f"LiqCascade:{cascade.cascade_side}(bounce={cascade.bounce_probability:.0%})"

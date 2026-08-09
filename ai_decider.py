@@ -42,15 +42,19 @@ if not OPENROUTER_KEY:
 # Flash Lite was unreliable for directional calls. Flash has better reasoning.
 # DeepSeek V4 Pro is BANNED from all bot components — chat session only.
 # Jul 30: upgraded from flash-lite → flash after INJ, SYRUP, ORDI losses from bad AI picks.
-MODEL_CHEAP = "qwen/qwen3-30b-a3b-instruct-2507"  # Qwen 30B for cheap calls — $0.00002/call
-MODEL_SMART = "qwen/qwen3-30b-a3b-instruct-2507"
-MODEL_PREMIUM = "qwen/qwen3-30b-a3b-instruct-2507"
-MODEL_PICKS = "meta-llama/llama-4-maverick"  # FREE on OpenRouter, correct JSON, not OpenAI/Google/DeepSeek
+# Aug 9 v2: Switched to Qwen 235B — best decision quality in benchmark (tight sizing,
+# VWAP-aware reasoning, specific picks). $0.64/M, 2.0s avg. Scout is fallback.
+MODEL_CHEAP = "qwen/qwen3-235b-a22b-2507"    # Qwen 235B MoE $0.64/M — best decisions
+MODEL_SMART = "qwen/qwen3-235b-a22b-2507"
+MODEL_PREMIUM = "qwen/qwen3-235b-a22b-2507"
+MODEL_PICKS = "meta-llama/llama-4-maverick"   # Llama 4 Maverick $1.00/M — proven picks
+MODEL_DEEP = MODEL_CHEAP
+MODEL_FALLBACK = "meta-llama/llama-4-scout"    # $0.40/M — fast fallback if Qwen rate-limited
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
-# ── Rate limiting (prevent 429 errors) ──
-_MAX_CALLS_PER_MINUTE = 25  # SURVIVAL: was 15 — flash-lite can handle more throughput
-_MIN_CALL_SPACING = 0.5    # SURVIVAL: was 0.8 — faster cycles, cheaper model
+# ── Rate limiting (Qwen 235B is ~2s avg — slower than Scout) ──
+_MAX_CALLS_PER_MINUTE = 20
+_MIN_CALL_SPACING = 0.5
 _call_timestamps: list[float] = []
 _last_call_time: float = 0.0
 
@@ -79,8 +83,12 @@ _cache_misses = 0
 _cache_total_cost = 0.0
 
 # Cost model
+# Cost model (per 1K tokens input, output) — updated for Qwen 235B
 COST_PER_1K = {
-    "qwen/qwen3-30b-a3b-instruct-2507": (0.000048, 0.00019),  # $0.048/$0.19 per 1M — practically free
+    "qwen/qwen3-235b-a22b-2507": (0.00032, 0.00032),    # $0.32/$0.32 per 1M = $0.64/M total
+    "meta-llama/llama-4-scout": (0.00020, 0.00020),      # $0.40/M — fallback
+    "meta-llama/llama-4-maverick": (0.00050, 0.00050),   # $1.00/M — picks
+    "qwen/qwen3-30b-a3b-instruct-2507": (0.000048, 0.00019),  # legacy
 }
 
 
@@ -153,13 +161,10 @@ def _call_llm(prompt: str, model: str = MODEL_CHEAP,
     if not OPENROUTER_KEY:
         return {"decision": "HOLD", "reason": "no_api_key"}
 
-    # ── Build system prompt based on task ──
+    # ── Build system prompt (minimized for token efficiency) ──
     system = (
-        "You are a crypto trading AI assistant. "
-        "Respond ONLY with valid JSON. No markdown, no explanations outside JSON. "
-        "For coin selection: use keys picks,skip,market_note,strategy,skip_reason. "
-        "For trade decisions: use keys decision,reason. Never mix them. "
-        "Be concise. Every token costs money."
+        "Crypto trading AI. Output ONLY valid JSON. No markdown, no text outside JSON. "
+        "Picks keys: picks,skip,market_note. Trade keys: decision,reason. Be terse."
     )
 
     payload = json.dumps({
@@ -170,14 +175,16 @@ def _call_llm(prompt: str, model: str = MODEL_CHEAP,
         ],
         "temperature": temperature,
         "max_tokens": max_tokens,
-        # Note: response_format json_object removed — Haiku 4.5 on OpenRouter
-        # returns malformed JSON with this flag. We parse + strip markdown manually.
+        "data_collection": "allow",
+        "provider": {"order": ["Groq", "DeepInfra", "Together"], "allow_fallbacks": True},
+        "transforms": ["prompt-caching-v1"],   # OpenRouter caching: 90% off repeated system prompts
     }).encode()
 
     import urllib.request
     req = urllib.request.Request(API_URL, data=payload, headers={
         "Content-Type": "application/json",
         "Authorization": f"Bearer {OPENROUTER_KEY}",
+        "X-Title": "hyperliquid-trader",       # OpenRouter analytics tag
             })
 
     try:
@@ -250,12 +257,18 @@ def _call_llm_safe(prompt, model=MODEL_CHEAP, max_tokens=200, temperature=0.3, c
         log.warning(f"  ⚠️ _call_llm CRASH: {type(e).__name__}: {e}")
         return {"decision": "HOLD", "reason": f"crash:{str(e)[:40]}", "picks": [], "skip": []}
 
-# Patch: make _call_llm self-safe by wrapping
+# Patch: make _call_llm self-safe with fallback
 _call_llm_original = _call_llm
 def _call_llm(prompt, model=MODEL_CHEAP, max_tokens=200, temperature=0.3, cache_prefix=""):
     try:
         return _call_llm_original(prompt, model, max_tokens, temperature, cache_prefix)
     except:
+        # If primary model fails, try fallback (Scout) once
+        if model != MODEL_FALLBACK:
+            try:
+                return _call_llm_original(prompt, MODEL_FALLBACK, max_tokens, temperature, cache_prefix)
+            except:
+                pass
         return {"decision": "HOLD", "reason": "crash", "picks": [], "skip": []}
 
 
@@ -797,6 +810,13 @@ def _scan_batch(batch: list[dict], equity: float, market_context: str,
             prox_str = f" 1h_h:{hi:.1f}% 1h_l:{lo:.1f}%"
         if _rp > 0:
             prox_str += f" rng:{_rp:.1f}%"
+        # ── 4h range context (Aug 9): where is price in 4h range? ──
+        _4h = c.get('_4h_prox', {}) or {}
+        if _4h.get('pct_high', 99) < 99 or _4h.get('pct_low', 99) < 99:
+            hi4 = _4h.get('pct_high', 99)
+            lo4 = _4h.get('pct_low', 99)
+            rp4 = _4h.get('range_pos', 50)
+            prox_str += f" 4h:{lo4:+.1f}%/-{hi4:.1f}%@{rp4:.0f}%"
         lines.append(
             f"{c['coin']}: ${c.get('price',0):.2f} comp={c.get('composite',0):+.2f} "
             f"reg={c.get('regime','?')} vol={c.get('volatility',0):.1f}% "
@@ -821,6 +841,9 @@ def _scan_batch(batch: list[dict], equity: float, market_context: str,
         + f"⚠️ VWAP RULES: NEVER buy when VWAP>+1.5% (overbought). NEVER short when VWAP<-1.5% (oversold). "
         + f"Buy dips (VWAP<-1.5%), short pumps (VWAP>+1.5%). "
         + f"Skip: flat mom5(<0.3%), dead enriched, no CVD, m1h>5% exhausted, comp>0.3 extreme. "
+        + f"4h CONTEXT: 4h:+X%/-Y%@Z% means Z% in 4h range (0%=bottom,100%=top). "
+        + f"Near 4h high (<5% below)=resistance, short ONLY with mom5 turning down+exhaustion signs. "
+        + f"Far above 4h low (>30%)=strong uptrend, fading needs reversal evidence. Flat 4h=mean reversion ok. "
         + f"VWAP SCAN: {vwap_ob_count} overbought:{vwap_os_count} oversold | " 
         + (f"⛔ ONLY PICK SHORTS — all coins overbought, do NOT pick any BUY/LONG" if vwap_ob_count > len(batch) * 0.7 else
            f"⛔ ONLY PICK LONGS — all oversold" if vwap_os_count > len(batch) * 0.7 else
@@ -988,15 +1011,20 @@ def ai_evaluate_exit(
     target_pct: float,
     stop_pct: float,
     price_extremes: str = "",
+    peak_pnl: float = 0.0,
+    btc_ctx: str = "",
 ) -> dict:
     """AI evaluates whether to hold or exit an open position.
 
     Returns {"action": "hold"|"exit", "confidence": 0-100, "reason": str}
+    Aug 9: added peak_pnl and btc_ctx — exit model now sees macro + peak reversal context.
     """
     ext_line = f"\n{price_extremes}\n" if price_extremes else ""
+    peak_line = f" peak_was={peak_pnl:+.1f}%" if peak_pnl != 0 else ""
+    btc_line = f"\nBTC/ETH: {btc_ctx}" if btc_ctx else ""
     prompt = (
-        f"EVAL:{coin} {direction} @${current_price:.4f} pnl={pnl_pct:+.1f}% {hold_seconds/60:.0f}min "
-        f"mom5={mom_5m:+.1f}% mom15={mom_15m:+.1f}% reg={regime} tgt={target_pct:.1f}%{ext_line}"
+        f"EVAL:{coin} {direction} @${current_price:.4f} pnl={pnl_pct:+.1f}%{peak_line} {hold_seconds/60:.0f}min "
+        f"mom5={mom_5m:+.1f}% mom15={mom_15m:+.1f}% reg={regime} tgt={target_pct:.1f}%{ext_line}{btc_line}\n"
         f"Think like a trader: if up but fading → lock profit. If losing + momentum against → cut. "
         f"If flat too long → dead, exit. If solidly up + small dip in uptrend → hold. "
         f"If trend broke (mom5 flipped) → exit regardless. Use common sense not thresholds.\n"

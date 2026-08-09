@@ -206,6 +206,7 @@ def calculate_position_size(
     max_risk_pct: float = 0.02,
     vol_scale: bool = True,
     max_position_pct: float = 0.20,
+    _MIN_POS_USD: float = 7.0,  # mirrors ExposureLimits.min_position_usd
 ) -> float:
     """Calculate position size with volatility-targeted scaling.
 
@@ -254,11 +255,20 @@ def calculate_position_size(
     # risk_usd / stop_distance ignores total position value.
     # E.g., $75 account with 2% risk ($1.50) and 3% stop on $13 coin
     # → size = $1.50 / ($13*0.03) = 3.85 → notional = $50 (66% of equity!)
+    # Aug 8: micro-account floor — cap must never produce notional < min_position_usd
+    # Otherwise the downstream check_position_allowed rejects the trade we just sized.
     max_notional = equity * max_position_pct
+    # For micro accounts (<$100): ensure cap is at least 5% above minimum to avoid boundary collision
+    _min_notional_floor = _MIN_POS_USD * 1.05 if equity < 100 else 0
+    max_notional = max(max_notional, _min_notional_floor)
     max_size_position = max_notional / entry_price
     size = min(size, max_size_position)
 
     notional = size * entry_price
+    # Final guard: if cap squeezed us below minimum, bump to minimum
+    if notional < _MIN_POS_USD:
+        notional = _MIN_POS_USD
+        size = notional / entry_price
 
     # Min notional check (Hyperliquid requires $10 minimum)
     # Micro accounts ($50-100): relax to $5 — position sizing already conservative

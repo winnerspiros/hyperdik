@@ -1245,7 +1245,7 @@ def enrich_master_signal(
     
     # ── 3. Liquidation Cascade ──
     try:
-        from liquidation_cascade import detect_cascade_from_candles
+        from liquidation_monitor import detect_cascade_from_candles
         cascade = detect_cascade_from_candles(candles, coin)
         enriched.cascade_detected = cascade.cascade_detected
         enriched.cascade_side = cascade.cascade_side
