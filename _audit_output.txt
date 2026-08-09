@@ -1,0 +1,375 @@
+/home/ubuntu/hyperliquid-trader/_audit.py:93: DeprecationWarning: ast.Str is deprecated and will be removed in Python 3.14; use ast.Constant instead
+  isinstance(node.body[0].value, (ast.Constant, ast.Str))):
+File                                    Lines  Pub Priv Cls  Cmt% Issues Category
+------------------------------------------------------------------------------------------------------------------------
+action_executor.py                        963    3   17   1   7.5      1 MINOR
+ai_decider.py                            1098   12    9   0   9.6      7 NEEDS_WORK
+ai_validator.py                           344    2    2   1   4.7      2 MINOR
+chart_patterns.py                         386    7    2   0   5.2      0 CLEAN
+context_enricher.py                       386    1   14   0   5.7      3 NEEDS_WORK
+continuous_predictor.py                  1151    8   18   2  10.0      4 NEEDS_WORK
+correlation_tracker.py                    175    3    2   0   2.3      4 NEEDS_WORK
+cross_exchange.py                         393    8    5   0   4.3      7 NEEDS_WORK
+cryptogat_predictor.py                    316    3    4   1  10.1      7 NEEDS_WORK
+cvd_divergence.py                         324    7    0   0   4.9      6 NEEDS_WORK
+cvd_engine.py                             306    7    1   0   6.2      2 MINOR
+economic_calendar.py                      110    1    0   0  15.5      2 MINOR
+ev_gate.py                                281    5    0   1   5.0      4 NEEDS_WORK
+funding_acceleration.py                   158    3    0   0  10.1      2 MINOR
+hrp_sizing.py                             185    3    3   1   9.2      3 NEEDS_WORK
+hurst_detector.py                         209    6    0   0   7.2      3 NEEDS_WORK
+hyperliquid_client.py                     525   29    3   0   7.8      2 MINOR
+hyperliquid_delta_neutral.py              291   12    0   2   9.3      3 NEEDS_WORK
+hyperliquid_evolution.py                  413   10    0   4   7.0      3 NEEDS_WORK
+hyperliquid_execution.py                  404   11    0   4  11.4      5 NEEDS_WORK
+hyperliquid_funding_sniper.py             456    8    8   2   8.6      6 NEEDS_WORK
+hyperliquid_learner.py                    286    4    0   1   5.9      2 MINOR
+hyperliquid_risk.py                       630   21    0   7  11.1      8 NEEDS_WORK
+hyperliquid_strategy.py                  1579   31   11   7   9.7      9 NEEDS_WORK
+hyperliquid_whale.py                      255    8    5   3   5.1      3 NEEDS_WORK
+hyperliquid_ws.py                         365    5    8   0   7.4      2 MINOR
+imbalance_trend.py                        196    2    4   0   5.6      3 NEEDS_WORK
+kronos_predictor.py                       241    2    3   1   3.7      0 CLEAN
+liquidation_monitor.py                    553    7    4   1   6.3      7 NEEDS_WORK
+liquidation_zones.py                      753    9    5   3   8.0      8 NEEDS_WORK
+market_analyzer.py                        341    4    3   1  10.6      1 MINOR
+market_intel.py                           136   10    2   0   2.2      1 MINOR
+market_regime.py                          169    2    0   1   3.6      2 MINOR
+market_structure.py                       212    3    0   0   5.2      6 NEEDS_WORK
+ml_predictor.py                           512    9    5   2   7.0      2 MINOR
+oi_delta.py                               542    6    6   2   5.4      2 MINOR
+peak_exhaustion_detector.py               889    5   13   2   9.2      7 NEEDS_WORK
+perfect_predictor.py                      422    3    3   2   5.5      2 MINOR
+price_extremes.py                         206    3    0   1   8.3      2 MINOR
+pump_detector.py                          167    4    0   0   4.8      2 MINOR
+sector_rotation.py                        165    5    1   1   6.1      1 MINOR
+taker_ratio.py                            196    2    2   0   5.6      4 NEEDS_WORK
+unified_direction.py                      517    5    3   1  13.9      4 NEEDS_WORK
+unified_predictor.py                      486    6    1   1   9.3      7 NEEDS_WORK
+volume_delta.py                           197    3    0   0   4.6      1 MINOR
+vwap_signal.py                            227    3    0   2   4.0      1 MINOR
+hyperliquid_daemon.py                    5907    7   26   0  13.6     68 NEEDS_WORK
+
+
+=== DETAILED ISSUES ===
+
+--- action_executor.py (MINOR) ---
+  L186: Unused import 'urllib.request'
+
+--- ai_decider.py (NEEDS_WORK) ---
+  L22: Unused import 'Any'
+  L183: Unused import 'urllib.request'
+  L329: Verbose docstring (270 chars) on decide_borderline
+  L511: Verbose docstring (228 chars) on validate_trade
+  L677: Verbose docstring (244 chars) on predict_short_term
+  L1001: Verbose docstring (212 chars) on ai_evaluate_exit
+  L1042: Verbose docstring (236 chars) on ai_debate_entry
+
+--- ai_validator.py (MINOR) ---
+  L9: Unused import 'urllib.request'
+  L11: Unused import 'Optional'
+
+--- context_enricher.py (NEEDS_WORK) ---
+  L23: Unused import 'annotations'
+  L26: Unused import 'Any'
+  L239: Verbose docstring (264 chars) on _enrich_liquidation_activity
+
+--- continuous_predictor.py (NEEDS_WORK) ---
+  L90: Verbose docstring (308 chars) on _layer_higher_tf_alignment
+  L163: Verbose docstring (263 chars) on _layer_bollinger
+  L431: Verbose docstring (264 chars) on _layer_volume_profile
+  L793: Verbose docstring (211 chars) on predict_continuous
+
+--- correlation_tracker.py (NEEDS_WORK) ---
+  L8: Unused import 'timezone'
+  L9: Unused import 'Optional'
+  L32: Verbose docstring (274 chars) on compute_rolling_correlations
+  L77: Verbose docstring (284 chars) on get_correlation_summary
+
+--- cross_exchange.py (NEEDS_WORK) ---
+  L29: Unused import 'annotations'
+  L34: Unused import 'urllib.request'
+  L35: Unused import 'Optional'
+  L185: Verbose docstring (491 chars) on get_cross_divergence
+  L247: Verbose docstring (555 chars) on get_binance_volume_ratio
+  L298: Verbose docstring (370 chars) on get_cross_exchange_context
+  L363: Verbose docstring (253 chars) on get_cross_divergence_all
+
+--- cryptogat_predictor.py (NEEDS_WORK) ---
+  L19: Unused import 'Optional'
+  L20: Unused import 'defaultdict'
+  L26: Unused import 'torch'
+  L27: Unused import 'nn'
+  L28: Unused import 'F'
+  L57: Verbose docstring (201 chars) on build_graph
+  L189: Verbose docstring (276 chars) on predict
+
+--- cvd_divergence.py (NEEDS_WORK) ---
+  L15: Unused import 'np'
+  L16: Unused import 'Optional'
+  L19: Verbose docstring (316 chars) on compute_cvd
+  L64: Verbose docstring (301 chars) on detect_cvd_divergence
+  L191: Verbose docstring (378 chars) on detect_absorption
+  L251: Verbose docstring (306 chars) on detect_stacked_imbalance
+
+--- cvd_engine.py (MINOR) ---
+  L16: Unused import 'Optional'
+  L43: Verbose docstring (357 chars) on get_trade_cvd
+
+--- economic_calendar.py (MINOR) ---
+  L5: Unused import 'timedelta'
+  L6: Unused import 'urllib.request'
+
+--- ev_gate.py (NEEDS_WORK) ---
+  L47: Verbose docstring (822 chars) on check_ev_gate
+  L137: Verbose docstring (370 chars) on size_from_invalidation
+  L180: Verbose docstring (297 chars) on portfolio_heat
+  L212: Verbose docstring (296 chars) on brier_score
+
+--- funding_acceleration.py (MINOR) ---
+  L15: Unused import 'Optional'
+  L33: Verbose docstring (291 chars) on get_funding_acceleration
+
+--- hrp_sizing.py (NEEDS_WORK) ---
+  L12: Unused import 'defaultdict'
+  L13: Unused import 'fcluster'
+  L20: Verbose docstring (246 chars) on get_hrp_weights
+
+--- hurst_detector.py (NEEDS_WORK) ---
+  L15: Unused import 'Optional'
+  L17: Verbose docstring (396 chars) on hurst_exponent
+  L156: Verbose docstring (223 chars) on get_regime_for_weights
+
+--- hyperliquid_client.py (MINOR) ---
+  L18: Unused import 'constants'
+  L26: Long comment block (11 lines)
+
+--- hyperliquid_delta_neutral.py (NEEDS_WORK) ---
+  L18: Unused import 'annotations'
+  L24: Unused import 'Path'
+  L25: Unused import 'Any'
+
+--- hyperliquid_evolution.py (NEEDS_WORK) ---
+  L21: Unused import 'annotations'
+  L28: Unused import 'Path'
+  L29: Unused import 'Any'
+
+--- hyperliquid_execution.py (NEEDS_WORK) ---
+  L12: Unused import 'annotations'
+  L17: Unused import 'Decimal'
+  L17: Unused import 'ROUND_DOWN'
+  L18: Unused import 'Any'
+  L276: Verbose docstring (270 chars) on chandelier_atr_mult
+
+--- hyperliquid_funding_sniper.py (NEEDS_WORK) ---
+  L29: Unused import 'annotations'
+  L35: Unused import 'field'
+  L36: Unused import 'Path'
+  L37: Unused import 'Any'
+  L160: Verbose docstring (252 chars) on _funding_zscore
+  L344: Verbose docstring (288 chars) on evaluate_zscore
+
+--- hyperliquid_learner.py (MINOR) ---
+  L17: Unused import 'field'
+  L18: Unused import 'Optional'
+
+--- hyperliquid_risk.py (NEEDS_WORK) ---
+  L12: Unused import 'annotations'
+  L18: Unused import 'Any'
+  L20: Unused import 'get_correlation_members'
+  L20: Unused import 'kelly_fraction'
+  L20: Unused import 'MarketRegime'
+  L199: Verbose docstring (436 chars) on calculate_position_size
+  L389: Verbose docstring (241 chars) on is_funding_window
+  L452: Verbose docstring (222 chars) on compute_portfolio_heat
+
+--- hyperliquid_strategy.py (NEEDS_WORK) ---
+  L26: Unused import 'annotations'
+  L30: Unused import 'field'
+  L32: Unused import 'Any'
+  L34: Unused import 'np'
+  L509: Verbose docstring (258 chars) on _pillar_volatility
+  L875: Verbose docstring (273 chars) on generate_master_signal
+  L1171: Verbose docstring (311 chars) on enrich_master_signal
+  L1438: Verbose docstring (499 chars) on score_conviction
+  L1054: Long comment block (10 lines)
+
+--- hyperliquid_whale.py (NEEDS_WORK) ---
+  L10: Unused import 'annotations'
+  L17: Unused import 'Path'
+  L18: Unused import 'Any'
+
+--- hyperliquid_ws.py (MINOR) ---
+  L296: Unused import 'urllib.request'
+  L40: Verbose docstring (212 chars) on get_field
+
+--- imbalance_trend.py (NEEDS_WORK) ---
+  L16: Unused import 'annotations'
+  L20: Unused import 'Optional'
+  L66: Verbose docstring (357 chars) on get_imbalance_trend
+
+--- liquidation_monitor.py (NEEDS_WORK) ---
+  L17: Unused import 'annotations'
+  L52: Verbose docstring (296 chars) on _get_liquidation_fills
+  L84: Verbose docstring (339 chars) on _classify_liquidation_direction
+  L146: Verbose docstring (661 chars) on get_liquidation_activity
+  L201: Verbose docstring (400 chars) on get_liquidation_context
+  L241: Verbose docstring (545 chars) on get_self_liquidations
+  L382: Verbose docstring (332 chars) on detect_cascade_from_candles
+
+--- liquidation_zones.py (NEEDS_WORK) ---
+  L23: Unused import 'annotations'
+  L27: Unused import 'field'
+  L54: Verbose docstring (296 chars) on get_liquidation_context
+  L67: Verbose docstring (941 chars) on estimate_safe_stop
+  L155: Verbose docstring (693 chars) on detect_cascade_risk
+  L277: Verbose docstring (316 chars) on get_all_liquidation_context
+  L391: Verbose docstring (346 chars) on _cluster_levels
+  L472: Verbose docstring (473 chars) on _compute_cascade_risk
+
+--- market_analyzer.py (MINOR) ---
+  L9: Unused import 'RevolutXError'
+
+--- market_intel.py (MINOR) ---
+  L11: Unused import 'urllib.request'
+
+--- market_regime.py (MINOR) ---
+  L7: Unused import 'timedelta'
+  L19: Verbose docstring (248 chars) on classify_regime
+
+--- market_structure.py (NEEDS_WORK) ---
+  L7: Unused import 'Optional'
+  L7: Unused import 'List'
+  L7: Unused import 'Tuple'
+  L10: Verbose docstring (480 chars) on find_swing_points
+  L64: Verbose docstring (361 chars) on classify_market_structure
+  L149: Verbose docstring (367 chars) on get_market_structure_summary
+
+--- ml_predictor.py (MINOR) ---
+  L363: Verbose docstring (230 chars) on predict_next
+  L420: Verbose docstring (231 chars) on predict_all
+
+--- oi_delta.py (MINOR) ---
+  L21: Unused import 'field'
+  L159: Verbose docstring (606 chars) on get_oi_signal
+
+--- peak_exhaustion_detector.py (NEEDS_WORK) ---
+  L18: Unused import 'np'
+  L19: Unused import 'field'
+  L100: Verbose docstring (208 chars) on _detect_rsi_divergence
+  L202: Verbose docstring (285 chars) on detect_peak_exhaustion
+  L313: Verbose docstring (418 chars) on predict_price_target
+  L455: Verbose docstring (283 chars) on _compute_order_book_signal
+  L627: Verbose docstring (459 chars) on detect_tick_peak
+
+--- perfect_predictor.py (MINOR) ---
+  L26: Unused import 'Optional'
+  L213: Verbose docstring (209 chars) on predict_perfect
+
+--- price_extremes.py (MINOR) ---
+  L11: Unused import 'annotations'
+  L130: Verbose docstring (307 chars) on get_dynamic_tp_targets
+
+--- pump_detector.py (MINOR) ---
+  L7: Unused import 'List'
+  L12: Verbose docstring (340 chars) on detect_pump
+
+--- sector_rotation.py (MINOR) ---
+  L13: Unused import 'Optional'
+
+--- taker_ratio.py (NEEDS_WORK) ---
+  L20: Unused import 'annotations'
+  L23: Unused import 'deque'
+  L24: Unused import 'Optional'
+  L45: Verbose docstring (393 chars) on get_taker_ratio
+
+--- unified_direction.py (NEEDS_WORK) ---
+  L17: Unused import 'annotations'
+  L21: Unused import 'Optional'
+  L245: Verbose docstring (246 chars) on classify_regime
+  L450: Verbose docstring (265 chars) on should_exit
+
+--- unified_predictor.py (NEEDS_WORK) ---
+  L18: Unused import 'annotations'
+  L21: Unused import 'field'
+  L22: Unused import 'Optional'
+  L60: Unused import '_json'
+  L60: Unused import '_time'
+  L45: Verbose docstring (259 chars) on compute_ml_prediction
+  L284: Verbose docstring (390 chars) on _get_regime_weights
+
+--- volume_delta.py (MINOR) ---
+  L48: Verbose docstring (670 chars) on compute_cvd
+
+--- vwap_signal.py (MINOR) ---
+  L17: Unused import 'Optional'
+
+--- hyperliquid_daemon.py (NEEDS_WORK) ---
+  L28: Unused import 'gc'
+  L91: Unused import 'calculate_entry_levels'
+  L91: Unused import 'PillarWeights'
+  L91: Unused import 'SignalSide'
+  L91: Unused import '_safe_float'
+  L91: Unused import 'estimate_kelly_from_history'
+  L91: Unused import 'get_tier_sizing'
+  L91: Unused import 'ConvictionTier'
+  L91: Unused import 'MIN_CONVICTION_SCORE'
+  L99: Unused import 'is_funding_window'
+  L99: Unused import 'get_leverage_for_regime'
+  L99: Unused import 'RiskCheck'
+  L99: Unused import 'compute_portfolio_heat'
+  L99: Unused import 'compute_max_new_position'
+  L108: Unused import 'MultiTierTP'
+  L113: Unused import 'PersonalityParams'
+  L113: Unused import 'TacticalParams'
+  L113: Unused import 'apply_adjustments'
+  L113: Unused import 'SegmentMetrics'
+  L118: Unused import 'WhaleSignal'
+  L119: Unused import 'FundingSignal'
+  L121: Unused import 'ArbState'
+  L121: Unused import 'ARB_STATE_PATH'
+  L126: Unused import 'compute_rolling_correlations'
+  L126: Unused import 'get_correlation_summary'
+  L129: Unused import 'decide_borderline'
+  L129: Unused import 'decide_regime_override'
+  L129: Unused import 'analyze_fill'
+  L129: Unused import 'ai_stats'
+  L136: Unused import 'predict_price_target'
+  L136: Unused import 'format_exhaustion_for_ai'
+  L136: Unused import 'ExhaustionSignal'
+  L136: Unused import 'TickPeakSignal'
+  L142: Unused import 'format_extremes_for_ai'
+  L143: Unused import 'format_prediction_for_ai'
+  L143: Unused import 'PredictionResult'
+  L146: Unused import 'AIValidationResult'
+  L150: Unused import 'get_learned_weights'
+  L154: Unused import 'format_perfect_prediction'
+  L154: Unused import 'PerfectPrediction'
+  L158: Unused import 'format_prediction_detailed'
+  L158: Unused import 'ContinuousPrediction'
+  L158: Unused import 'HorizonPrediction'
+  L163: Unused import 'get_oi_context'
+  L167: Unused import 'get_liquidation_context'
+  L167: Unused import 'estimate_safe_stop'
+  L167: Unused import 'get_all_liquidation_context'
+  L172: Unused import 'get_binance_price'
+  L172: Unused import 'get_cross_exchange_context'
+  L172: Unused import 'get_all_binance_prices'
+  L177: Unused import '_layer_taker_ratio'
+  L177: Unused import 'get_taker_context'
+  L181: Unused import '_layer_imbalance_trend'
+  L181: Unused import 'get_imbalance_context'
+  L185: Unused import 'should_exit'
+  L185: Unused import 'DirectionPrediction'
+  L505: Unused import 'urllib.error'
+  L547: Unused import 'urllib.request'
+  L1379: Unused import 'fnmatch'
+  L1774: Dead branch: if False:
+  L1789: Dead branch: if False:
+  L292: Verbose docstring (207 chars) on _net_pnl_pct
+  L302: Verbose docstring (219 chars) on _can_close_position
+  L598: Verbose docstring (348 chars) on _micro_peak_entry_wait
+  L712: Verbose docstring (216 chars) on _build_quick_context
+  L967: Verbose docstring (281 chars) on _execute_direct_close
+  L1106: Verbose docstring (259 chars) on _execute_direct_open
+  L1564: Verbose docstring (201 chars) on _verify_open_orders
