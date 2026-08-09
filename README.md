@@ -1,23 +1,15 @@
 # 🤖 HYPERDIK — Hyperliquid AI Trading Bot
 
-```
-╔══════════════════════════════════════════════════════════════╗
-║  ██╗  ██╗██╗   ██╗██████╗ ███████╗██████╗ ██████╗ ██╗██╗  ██╗ ║
-║  ██║  ██║╚██╗ ██╔╝██╔══██╗██╔════╝██╔══██╗██╔══██╗██║██║ ██╔╝ ║
-║  ███████║ ╚████╔╝ ██████╔╝█████╗  ██████╔╝██║  ██║██║█████╔╝  ║
-║  ██╔══██║  ╚██╔╝  ██╔═══╝ ██╔══╝  ██╔══██╗██║  ██║██║██╔═██╗  ║
-║  ██║  ██║   ██║   ██║     ███████╗██║  ██║██████╔╝██║██║  ██╗ ║
-║  ╚═╝  ╚═╝   ╚═╝   ╚═╝     ╚══════╝╚═╝  ╚═╝╚═════╝ ╚═╝╚═╝  ╚═╝ ║
-╚══════════════════════════════════════════════════════════════╝
-       AI-Driven Perpetual Futures · 177 Coins · 5s Cycles
-```
+<p align="center">
+  <img src="assets/hyperdik-logo.jpg" alt="HYPERDIK" width="384">
+</p>
 
 [![Python](https://img.shields.io/badge/Python-3.12+-blue)](https://python.org)
 [![Hyperliquid](https://img.shields.io/badge/Exchange-Hyperliquid-green)](https://hyperliquid.xyz)
 [![AI](https://img.shields.io/badge/AI-Qwen_235B_%2B_Llama_4-purple)](https://openrouter.ai)
 [![Status](https://img.shields.io/badge/Status-Live-brightgreen)]()
 
----
+> *"stupid name till i think of something better"*
 
 ## 🧠 What It Does
 
