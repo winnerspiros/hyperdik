@@ -1539,7 +1539,17 @@ def _record_close_trade(coin: str, mid: float, entry: float, szi: float, side: s
             "reason": reason[:40], "was_correct": was_bullish_correct or was_bearish_correct,
         }
         _recent_trades.append(trade_entry)
-        recent_trades.append(trade_entry)  # Also feed evolution tracker
+        recent_trades.append(trade_entry)
+        
+        # ── Prompt performance tracking (for auto-optimization) ──
+        try:
+            record_prompt_outcome(
+                prompt_hash=hash_prompt("ai_select"),  # tracks prompt version
+                coin=coin, pnl_pct=round(net_pnl_pct, 3),
+                regime=regime, confidence=int(conviction), side=side,
+            )
+        except Exception:
+            pass
         if len(_recent_trades) > 10:
             _recent_trades.pop(0)
         if len(recent_trades) > 50:
@@ -5822,6 +5832,19 @@ def run(dry_run: bool = False):
                             log.info(f"  Evo AI call failed: {type(e).__name__}")
 
                     evo_state.save()
+
+            # ── Prompt optimization (every ~200 cycles) ──
+            if evolution_check_cycles % 200 == 0:
+                try:
+                    stats = get_prompt_stats(hash_prompt("ai_select"))
+                    if stats.get("trials", 0) >= 30:
+                        current = "ai_select"  # placeholder — read from ai_decider
+                        new_prompt = optimize_prompt_via_ai(current, os.environ.get("OPENROUTER_API_KEY", ""))
+                        if new_prompt and len(new_prompt) > 100:
+                            vhash = graduate_prompt(new_prompt, hash_prompt("ai_select"))
+                            log.info(f"  Prompt optimized: {vhash} stats={stats}")
+                except Exception:
+                    pass
 
             # Cycle profiling
             elapsed = time.time() - cycle_start
