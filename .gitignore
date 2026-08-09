@@ -38,19 +38,13 @@ creds.json
 .env
 .env.*
 
-# Runtime data (regenerated, large)
+# Runtime data — regenerated, not source code
+data/ai_decider_cache.json
+data/trade_memory.json
+data/eur_reservations.json
+data/learned_weights.json
+data/continuous_weights.json
 data/pending_actions/
-data/predictions/*_advisory.json
-data/ml_models/*.json
-
-# Database files (large, regenerated)
-*.db
+data/predictions/
+data/ml_models/
 *.sqlite
-*.sqlite3
-!data/universe_coins.json
-!data/learned_weights.json
-!data/auto_tune.json
-!data/continuous_weights.json
-!data/optimal_params.json
-!data/hyperliquid_optimal_params.json
-!data/strategy_calendar.json
