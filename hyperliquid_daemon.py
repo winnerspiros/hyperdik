@@ -243,7 +243,7 @@ MIN_TRADE_USD = 5.0
 MIN_NOTIONAL_USD = 20
 # Dynamic: compute in run() based on equity, floor at 1 for micro accounts
 BASE_MAX_POSITIONS = 5
-BASE_LEVERAGE = 3  # AI-driven: AI can override 1-5x based on conviction/equity/regime (was hardcoded 2)
+BASE_LEVERAGE = 6  # AI-driven: AI can override up to 12x based on conviction/equity/regime (matches config)
 
 # ============================================================
 # Logging
@@ -291,7 +291,7 @@ _last_stop_loss_at: dict[str, float] = {}  # coin → timestamp
 STOP_LOSS_COOLING_SECONDS = 60  # Ignore signals for 60s after a stop loss
 
 # ── MINIMUM HOLD TIME ──
-MIN_HOLD_SECONDS = 300  # 5min minimum hold — let trades breathe but don't trap them
+MIN_HOLD_SECONDS = 600  # 10min minimum hold — needs time to overcome 0.42% fees at 6x (was 300)
 # ── Minimal ROI curve (Freqtrade pattern): time → min profit to stay in trade ──
 # Key: seconds held, Value: minimum % profit required to remain in position
 # At 5 min: need 1.5% profit or exit. At 10 min: 1.0%. At 30 min: 0.3%. At 60 min: 0%.
@@ -306,7 +306,7 @@ _MINIMAL_ROI = {
 # ── Hyperliquid taker fees (market orders) ──
 TAKER_FEE_RATE = 0.00035   # 0.035% per side
 ROUNDTRIP_FEE_PCT = TAKER_FEE_RATE * 2 * 100  # 0.07% of notional, both sides
-ROUNDTRIP_FEE_MARGIN_PCT = ROUNDTRIP_FEE_PCT * BASE_LEVERAGE  # 0.21% of margin at 3x
+ROUNDTRIP_FEE_MARGIN_PCT = ROUNDTRIP_FEE_PCT * BASE_LEVERAGE  # 0.42% of margin at 6x
 # ── ROI timeout throttle — prevent log spam (one close attempt per coin per threshold) ──
 _ROI_TIMEOUT_ATTEMPTED: set[str] = set()  # "COIN:threshold_secs" — cleared after 60s
 # ── Max risk per trade (Jesse pattern): reject trades that risk too much equity ──
@@ -2189,9 +2189,10 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                         elif drop_from_peak_pct > 0.3 and (mom1 * (-1 if side == "SHORT" else 1)) < -0.1:
                             # Bleeding: peak was better, now dropping, mom going the wrong way
                             exit_reason = f"BLEED: down {drop_from_peak_pct:.2f}% from peak, mom turning against, net={_net_pnl_mon:+.2f}%"
-                        elif not _ever_green and _hold_age_mon > 300:
+                        elif not _ever_green and _hold_age_mon > 300 and _net_pnl_mon < -0.55:
+                            # -0.55% = fee (-0.42%) + actual adverse move (-0.13%). Below this, trade is truly losing.
                             # ── S/R-aware: near support/resistance, bounce expected → wait longer ──
-                            _sr_initial_timeout = 300
+                            _sr_initial_timeout = 600
                             if ext:
                                 if side == "SHORT" and ext.pct_1h < 3.0:
                                     _sr_initial_timeout = 600  # Short at support, squeeze expected
@@ -2342,13 +2343,14 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                     # ── UNDERWATER MANAGEMENT: add to position or cut losses ──
                     # Aug 7: if position never reached breakeven, manage it actively.
                     # Two strategies: add at better price (flat market), or cut (moving against).
-                    # Aug 8: lowered mom5 emergency threshold from 2% to 1% — 2% was too rare.
-                    _underwater = _net_pnl_mon < 0 and _hold_age_mon > 300
+                    # Aug 11: raised mom5 threshold from 1% to 2% — 1% is noise at 6x leverage.
+                    # Added net_pnl floor: don't emergency-close if loss is just fees.
+                    _underwater = _net_pnl_mon < -0.55 and _hold_age_mon > 600  # -0.55% = fee + 0.13% real loss
                     _added_key = f"_added:{cu}"
                     _already_added = getattr(_monitor_positions, _added_key, False) if hasattr(_monitor_positions, _added_key) else False
                     
                     if _underwater:
-                        _mom_against = (side == "LONG" and mom5 < -1.0) or (side == "SHORT" and mom5 > 1.0)
+                        _mom_against = (side == "LONG" and mom5 < -2.0) or (side == "SHORT" and mom5 > 2.0)
                         _mom_neutral = abs(mom5 or 0) < 0.5
                         
                         if _mom_against:
@@ -2391,13 +2393,14 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                                                             log.warning(f"  ➕ {coin}: add failed: {e}")
                     
                     # ── No other exit rules. Position runs to exchange TP or breakeven SL. ──
-                    # ── POSITIVE TIMEOUT: free capital from stagnant positions ──
-                    # Aug 7: if position is net positive (even 0.01%) after timeout, close to free capital.
-                    # Aug 8: fast-exit trades use 120s (2min), normal use 300s (5min).
+                    # ── POSITIVE TIMEOUT: free capital from stale positions ──
+                    # Aug 11: raised thresholds — 0.42% fee means "barely green" is still noise.
+                    # Only close if net > 0.30% (real profit beyond fee noise) AND aged enough.
                     _fast_key = f"_fast_exit:{cu}"
                     _is_fast = getattr(_monitor_positions, _fast_key, False) if hasattr(_monitor_positions, _fast_key) else False
-                    _pos_timeout = 120 if _is_fast else 300
-                    if _net_pnl_mon > 0 and _hold_age_mon > _pos_timeout:
+                    _pos_timeout = 600 if _is_fast else 900
+                    _min_profit = 0.30  # Must clear fee cost (0.42%) by meaningful margin
+                    if _net_pnl_mon > _min_profit and _hold_age_mon > _pos_timeout:
                         _label = "FAST-EXIT" if _is_fast else "POSITIVE TIMEOUT"
                         log.warning(f"  ⏰ {coin}: {_label} — net={_net_pnl_mon:+.2f}% after {_hold_age_mon:.0f}s, closing to free capital")
                         try:
