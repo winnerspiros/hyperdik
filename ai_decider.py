@@ -932,7 +932,7 @@ def ai_select_coins(
     batch1 = candidates[:half]
     batch2 = candidates[half:half*2]
     
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError as FutTimeout
     all_picks = []
     all_skips = []
     all_market_notes = []
@@ -941,16 +941,19 @@ def ai_select_coins(
             ex.submit(_scan_batch, batch1, equity, market_context, recent_str, 1): 1,
             ex.submit(_scan_batch, batch2, equity, market_context, recent_str, 2): 2,
         }
-        for fut in as_completed(futures):
-            try:
-                batch_picks, batch_skips, batch_note = fut.result()
-                all_picks.extend(batch_picks)
-                if batch_skips:
-                    all_skips.extend(batch_skips)
-                if batch_note:
-                    all_market_notes.append(batch_note)
-            except Exception as e:
-                log.warning(f"AI batch {futures[fut]} failed: {e}")
+        try:
+            for fut in as_completed(futures, timeout=30):
+                try:
+                    batch_picks, batch_skips, batch_note = fut.result()
+                    all_picks.extend(batch_picks)
+                    if batch_skips:
+                        all_skips.extend(batch_skips)
+                    if batch_note:
+                        all_market_notes.append(batch_note)
+                except Exception as e:
+                    log.warning(f"AI batch {futures[fut]} failed: {e}")
+        except FutTimeout:
+            log.warning(f"AI scan timeout — {len(all_picks)} picks from completed batches, {len(futures)} total")
     
     # Return top 3 by confidence
     all_picks.sort(key=lambda p: p.get("confidence", 0), reverse=True)

@@ -23,7 +23,7 @@ evolution:
   enabled: true                     # Every ~1.7h: AI reads all data, suggests code/prompt changes
   model: "openai/gpt-4.1"          # GPT-4.1 — 1M context, best code gen
   apply_changes: true               # Actually write changes to files (set false for suggest-only)
-  auto_restart: true                # Restart daemon after code changes
+  auto_restart: false                # DISABLED — evolution restart broken, spawns infinite lock-failed processes
   auto_git: true                    # Git commit after each evolution run
 
 # ── Prompt Optimizer ──
