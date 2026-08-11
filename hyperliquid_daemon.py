@@ -2098,6 +2098,15 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                     if exit_reason:
                         log.info(f"  📤 RULE EXIT: {coin} — {exit_reason}")
                         if _can_close_position(coin, f"rule_exit:{exit_reason[:30]}"):
+                            # Record trade BEFORE closing (position data still live)
+                            try:
+                                _record_close_trade(coin, mid, entry_px, abs(szi),
+                                                   "SHORT" if szi < 0 else "LONG",
+                                                   exit_reason, conviction=0,
+                                                   regime=regime.value if hasattr(regime, 'value') else "sideways",
+                                                   leverage=leverage)
+                            except Exception:
+                                pass
                             _MANUAL_CLOSES[coin] = time.time()
                             hl.market_close(coin)
                             _reset_signal_dominance(coin)
@@ -2205,6 +2214,14 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                     if exit_reason:
                         log.warning(f"  💀 {coin}: {exit_reason}")
                         try:
+                            # ── Record trade for evolution BEFORE closing ──
+                            try:
+                                _record_close_trade(coin, mid, entry, abs(szi), side,
+                                                   exit_reason, conviction=0,
+                                                   regime=regime.value if hasattr(regime, 'value') else "sideways",
+                                                   leverage=leverage)
+                            except Exception:
+                                pass
                             # ── REVERSE ON TREND-KILL: flip direction to recover loss ──
                             _orig_side = side
                             _orig_szi = abs(szi)
