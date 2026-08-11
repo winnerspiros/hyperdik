@@ -285,7 +285,7 @@ _forager_skip_cooldown: dict[str, float] = {}  # coin → timestamp, 10-min fora
 _global_pause_until: float = 0.0  # Don't open ANY position until this timestamp
 _ai_trade_plan: dict[str, dict] = {}  # coin → {direction, confidence, target_pct, stop_pct, hold_min}
 _PENDING_ZONE: dict[str, dict] = {}  # coin → {oid, is_buy, size_usd, ...} non-blocking zone orders
-_REVERSE_COUNT: dict[str, int] = {}  # coin → reverse count — cap at 1 per session (death spiral guard)
+
 # ── STOP-LOSS COOLING ──
 _last_stop_loss_at: dict[str, float] = {}  # coin → timestamp
 STOP_LOSS_COOLING_SECONDS = 60  # Ignore signals for 60s after a stop loss
