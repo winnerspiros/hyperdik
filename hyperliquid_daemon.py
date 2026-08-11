@@ -258,6 +258,10 @@ logging.basicConfig(
     ],
 )
 log = logging.getLogger("hyperliquid")
+# Prevent double-import: this script runs as __main__, but other modules
+# import "hyperliquid_daemon" → Python would reload from disk. Register __main__
+# as hyperliquid_daemon so other modules get the already-loaded module.
+sys.modules['hyperliquid_daemon'] = sys.modules['__main__']
 log.info("═══ DAEMON V3.1 LOADED — exit layers active (flashcrash, structure, ai-eval, chandelier) ═══")
 
 # ── Load full coin universe (after logger is available) ──
@@ -446,12 +450,7 @@ def _reset_session_volume_if_new_day() -> None:
         _last_session_date = today
 
 def check_session_volume(coin: str, notional_usd: float, equity: float) -> tuple[bool, str]:
-    """Check if trading more of this coin would exceed session volume cap."""
-    _reset_session_volume_if_new_day()
-    current = _session_volume.get(coin.upper(), 0)
-    cap = equity * MAX_SESSION_VOLUME_PER_COIN
-    if current + notional_usd > cap:
-        return False, f"session_vol:{current+notional_usd:.0f}>{cap:.0f}"
+    """Session volume cap DISABLED — trade based on available capital, not arbitrary caps."""
     return True, "ok"
 
 def track_session_volume(coin: str, notional_usd: float) -> None:
@@ -526,6 +525,12 @@ arb_state = load_arb_state()
 recent_trades: list[dict] = []
 cycle_count = 0
 evolution_check_cycles = 0
+
+# ── Losing streak circuit breaker (systematic trading: when edge isn't working, stop) ──
+_losing_streak: int = 0
+_last_closed_equity: float = 0.0
+_MAX_LOSING_STREAK = 3   # Reduce to 1 position after this many consecutive losers
+_HARD_PAUSE_STREAK = 5   # Pause all entries for 30 min after this many
 
 # ============================================================
 # CANDLE FETCH (from Hyperliquid API)
@@ -3120,7 +3125,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
 # ============================================================
 
 def run(dry_run: bool = False):
-    global hsl_state, exposure_state, cycle_count, evolution_check_cycles, _forager_skip_cooldown, _API_WALLET, _global_pause_until, _rotate_offset
+    global hsl_state, exposure_state, cycle_count, evolution_check_cycles, _forager_skip_cooldown, _API_WALLET, _global_pause_until, _rotate_offset, _losing_streak, _last_closed_equity
 
     cfg = json.loads(Path("/home/ubuntu/.hyperliquid/config.json").read_text())
     api_wallet = cfg["api_wallet"]
@@ -3449,6 +3454,17 @@ def run(dry_run: bool = False):
                     hsl_state.peak_equity = total_eq
                     hsl_state.drawdown_ema = 0.0
                     hsl_state.tier = HSLTier.GREEN
+                # ── Losing streak circuit breaker: track consecutive losing trades ──
+                if not active and _last_closed_equity > 0:
+                    if total_eq < _last_closed_equity:
+                        _losing_streak += 1
+                        log.warning(f"  📉 Losing streak: {_losing_streak} — equity ${_last_closed_equity:.2f}→${total_eq:.2f}")
+                    else:
+                        if _losing_streak > 0:
+                            log.info(f"  ✅ Losing streak broken at {_losing_streak} — equity recovered")
+                        _losing_streak = 0
+                if not active:
+                    _last_closed_equity = total_eq
                 hsl_state.update(total_eq)
                 # ── Dynamic limits: micro accounts get higher TWEL ──
                 if exposure_state.limits.twel_limit == 0.30:  # Only set once
@@ -3547,6 +3563,16 @@ def run(dry_run: bool = False):
                     slots_left = max(0, max_pos - len(active))
                 elif total_eq < 50:
                     max_pos = 2
+                    slots_left = max(0, max_pos - len(active))
+                # ── Losing streak circuit breaker: reduce/block entries when edge is absent ──
+                if _losing_streak >= _HARD_PAUSE_STREAK:
+                    log.warning(f"  🛑 HARD PAUSE: {_losing_streak} consecutive losing trades — pausing 30 min")
+                    _global_pause_until = max(_global_pause_until, time.time() + 1800)
+                    _losing_streak = 0  # Reset after pausing
+                    slots_left = 0
+                elif _losing_streak >= _MAX_LOSING_STREAK:
+                    log.warning(f"  ⚠️  LOSING STREAK: {_losing_streak} consecutive losers — reducing to 1 max position")
+                    max_pos = min(max_pos, 1)
                     slots_left = max(0, max_pos - len(active))
                 cap_new_per_cycle = 1 if total_eq < 200 else slots_left
                 slots_left = min(slots_left, cap_new_per_cycle)
@@ -5702,6 +5728,13 @@ def run(dry_run: bool = False):
                             _final_leverage = _confluence_lev
                             if _confluence_bonus > 1.0:
                                 log.info(f"  🔥 {coin}: {_confluence_label} → size ${_sized_notional:.0f}→${_final_notional:.0f} lev {chosen_leverage}x→{_final_leverage}x")
+                            # ── Kelly-style sizing: scale DOWN when few signals agree (systematic trading principle) ──
+                            # Count independent agreeing signals: enriched, ML, unified, AI (capped at 4)
+                            _agree_count = sum([_enriched_agrees, _ml_agrees, _unified_agrees, ai_conf_val >= 80])
+                            _kelly_frac = max(0.25, _agree_count / 4.0)  # floor 25% even on AI-solo
+                            _final_notional *= _kelly_frac
+                            if _kelly_frac < 0.75:
+                                log.info(f"  📐 {coin}: Kelly fraction {_kelly_frac:.0%} — {_agree_count}/4 signals agree → ${_final_notional:.0f}")
                             
                             # Parse entry zone: AI may return "0.059-0.061" or "0.059"
                             _zone_px = 0.0

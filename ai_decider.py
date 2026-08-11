@@ -1233,17 +1233,12 @@ def run_evolution_analysis(evo_requests: list) -> list:
         except Exception as e:
             result["applied"] = [f"apply_error: {e}"]
     
-    # Restart daemon if needed
+    # Restart daemon via systemd (don't pkill+Popen — conflicts with systemd supervision)
     if result.get("restart_required") and changes and result.get("applied"):
         try:
-            import subprocess, os
-            subprocess.run(["pkill", "-f", "python3.*hyperliquid_daemon"], capture_output=True)
-            time.sleep(2)
-            daemon_path = Path(__file__).parent / "hyperliquid_daemon.py"
-            subprocess.Popen(["python3", "-B", str(daemon_path)],
-                           cwd=str(Path(__file__).parent),
-                           stdout=open(str(Path(__file__).parent / "logs" / "hyperliquid_daemon.log"), "w"),
-                           stderr=open(str(Path(__file__).parent / "logs" / "hyperliquid_daemon_error.log"), "w"))
+            import subprocess
+            subprocess.run(["systemctl", "--user", "restart", "hyperdik.service"],
+                         capture_output=True, timeout=15)
             result["restarted"] = True
         except Exception as e:
             result["restarted"] = False
