@@ -88,13 +88,13 @@ class ExposureLimits:
         """Return appropriate limits for account size."""
         if equity < 50:
             return ExposureLimits(
-                wel_limit=0.40,          # 40% per position on micro
+                wel_limit=0.80,          # 80% per position on micro (6x lev needs room)
                 twel_limit=1.00,         # 100% — full account can be deployed
                 group_limit=0.60,
             )
         elif equity < 200:
             return ExposureLimits(
-                wel_limit=0.35,          # was 0.25 — bigger positions on micro
+                wel_limit=0.60,          # 60% per position (6x lev: 10% margin = 60% notional)
                 twel_limit=0.80,         # was 0.50 — need room for multiple positions
                 group_limit=0.50,        # was 0.35
             )
