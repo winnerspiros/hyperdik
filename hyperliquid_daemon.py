@@ -2159,6 +2159,15 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                             # Bleeding: peak was better, now dropping, mom going the wrong way
                             exit_reason = f"BLEED: down {drop_from_peak_pct:.2f}% from peak, mom turning against, net={_net_pnl_mon:+.2f}%"
                         elif not _ever_green and _hold_age_mon > 300:
+                            # ── S/R-aware: near support/resistance, bounce expected → wait longer ──
+                            _sr_initial_timeout = 300
+                            if ext:
+                                if side == "SHORT" and ext.pct_1h < 3.0:
+                                    _sr_initial_timeout = 600  # Short at support, squeeze expected
+                                elif side == "LONG" and ext.pct_low_1h < 3.0:
+                                    _sr_initial_timeout = 600  # Long at resistance, dip expected
+                            if _hold_age_mon <= _sr_initial_timeout:
+                                continue  # Still within S/R grace period
                             # ── AI RE-CHECK: ask AI before killing flat positions ──
                             # Aug 9: DON'T blindly kill at 300s. If 4h trend is NOT strongly
                             # against and AI still believes in the trade, extend to 600s.
@@ -2173,7 +2182,18 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                             if _trend_strongly_against:
                                 exit_reason = f"NEVER-GREEN: underwater {_net_pnl_mon:+.2f}% for {_hold_age_mon:.0f}s, trend strongly against (4h={_pct_4h if side!='SHORT' else _pct_low_4h:.1f}% from extreme)"
                             elif _already_rechecked and _hold_age_mon > 600:
-                                exit_reason = f"NEVER-GREEN: underwater {_net_pnl_mon:+.2f}% for {_hold_age_mon:.0f}s, AI said hold but 600s timeout exceeded"
+                                # ── S/R-aware timeout: near support/resistance, bounce is EXPECTED ──
+                                # Short near support → price bounces up first → give 2x time
+                                # Long near resistance → price dips first → give 2x time
+                                _sr_timeout = 600
+                                if ext:
+                                    if side == "SHORT" and ext.pct_1h < 3.0:
+                                        _sr_timeout = 1200  # Near support, short squeeze expected
+                                    elif side == "LONG" and ext.pct_low_1h < 3.0:
+                                        _sr_timeout = 1200  # Near resistance, dip expected
+                                if _hold_age_mon > _sr_timeout:
+                                    exit_reason = f"NEVER-GREEN: underwater {_net_pnl_mon:+.2f}% for {_hold_age_mon:.0f}s, AI said hold but {_sr_timeout}s timeout exceeded"
+                                # else: still within S/R-extended timeout, keep holding
                             elif not _already_rechecked:
                                 setattr(_monitor_positions, _recheck_key, True)
                                 try:
@@ -4407,6 +4427,30 @@ def run(dry_run: bool = False):
                     elif sig.side == "SELL" and vwap_sigma < -0.5 and sig.composite_score > -0.10:
                         if not regime_is_downtrend:
                             block_reason = f"VWAP:{vwap_sigma:+.1f}σ — selling below VWAP with weak composite ({sig.composite_score:+.2f}) in non-trending regime"
+
+                    # ── Gate 1.5: Support/Resistance — don't short at support, don't long at resistance ──
+                    # Uses the same price_extremes data already fetched for AI context.
+                    # Chart levels are real — price bounces at these points.
+                    if not block_reason:
+                        try:
+                            _sr_ext = get_extremes(coin, mids)
+                            if _sr_ext:
+                                if sig.side == "SELL":
+                                    _pct_above_1h_low = _sr_ext.pct_1h  # % above 1h low = distance from support
+                                    _pct_above_4h_low = _sr_ext.pct_4h
+                                    if _pct_above_1h_low < 2.0:
+                                        block_reason = f"S/R: {_pct_above_1h_low:.1f}% above 1h low — shorting at support"
+                                    elif _pct_above_4h_low < 3.0:
+                                        block_reason = f"S/R: {_pct_above_4h_low:.1f}% above 4h low — shorting near support"
+                                elif sig.side == "BUY":
+                                    _pct_below_1h_high = _sr_ext.pct_low_1h  # % below 1h high = distance from resistance
+                                    _pct_below_4h_high = _sr_ext.pct_low_4h
+                                    if _pct_below_1h_high < 2.0:
+                                        block_reason = f"S/R: {_pct_below_1h_high:.1f}% below 1h high — longing at resistance"
+                                    elif _pct_below_4h_high < 3.0:
+                                        block_reason = f"S/R: {_pct_below_4h_high:.1f}% below 4h high — longing near resistance"
+                        except Exception:
+                            pass  # If extremes unavailable, skip this gate
 
                     # ── Gate 2: ML model contradiction ──
                     # ML models are data-driven. When ML strongly contradicts, AI override
