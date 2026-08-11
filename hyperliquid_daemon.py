@@ -1191,6 +1191,37 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
         # Step 2: Tick-peak-aware entry — short at local peaks, buy at local bottoms
         _side_str = "BUY" if is_buy else "SELL"
         
+        # ── S/R-AWARE SMART PRICING: near support/resistance, use the bounce for better fill ──
+        # Short at support → price bounces UP → place limit ABOVE market, sell into the squeeze
+        # Long at resistance → price dips → place limit BELOW market, buy into the dip
+        # Reuses PENDING_ZONE infrastructure — non-blocking, 90s timeout.
+        if not entry_zone or entry_zone <= 0:
+            try:
+                _sr_ext = get_extremes(coin, mids)
+                if _sr_ext:
+                    _sr_price = 0.0; _sr_label = ""
+                    if not is_buy and _sr_ext.pct_1h < 3.0:
+                        _sr_price = px * 1.005; _sr_label = "S/R short bounce"
+                    elif is_buy and _sr_ext.pct_low_1h < 3.0:
+                        _sr_price = px * 0.995; _sr_label = "S/R long dip"
+                    if _sr_price > 0:
+                        _sr_limit = round_price(px_dec, _sr_price, is_buy=is_buy)
+                        log.info(f"  🎯 {coin}: {_sr_label} — limit ${_sr_limit:.4f} ({(abs(_sr_price-px)/px*100):.1f}% better), 90s timeout")
+                        result = hl.order(coin, is_buy, sz, _sr_limit, order_type="gtc")
+                        if not (isinstance(result, dict) and result.get("status") == "err"):
+                            _sr_oid = _extract_oid(result)
+                            if _sr_oid:
+                                _PENDING_ZONE[coin.upper()] = {
+                                    "oid": _sr_oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
+                                    "stop_price": stop_price, "tp_levels": tp_levels, "reason": reason,
+                                    "leverage": leverage, "placed_at": time.time(),
+                                    "timeout_s": 90, "label": "sr_smart",
+                                }
+                                log.info(f"  📝 {coin}: S/R limit oid={_sr_oid} queued")
+                                return True
+            except Exception:
+                pass
+        
         # ── AI ENTRY ZONE: if AI zone is close (<1%), use limit. Otherwise market. ──
         if entry_zone > 0 and abs(px - entry_zone) / px < 0.01:
             _zone_limit = round_price(px_dec, entry_zone, is_buy=is_buy)
