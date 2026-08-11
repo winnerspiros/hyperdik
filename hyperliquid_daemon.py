@@ -2274,7 +2274,10 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                                                    leverage=leverage)
                             except Exception:
                                 pass
-                            continue  # REVERSE disabled — compounds losses (AVAX: -1% short → reverse long → -0.5%)
+                            _MANUAL_CLOSES[coin] = time.time()
+                            hl.market_close(coin)
+                            _reset_signal_dominance(coin)
+                            continue
                         except Exception as de:
                             log.warning(f"  💀 {coin}: close failed: {de}")
                     
