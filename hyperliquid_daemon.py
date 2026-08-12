@@ -988,6 +988,19 @@ def _compute_signal(coin: str, btc_candles: list[dict] | None,
 
     # ── Layer enrichment modules (CVD, VWAP, LiqCascade, OI) ──
     try:
+        # ── 4h reality override: 15m regime lies about trend (UNI: +21% 4h, said trending_down) ──
+        _ext4h_sig = get_extremes(coin.upper(), mids or {})
+        if _ext4h_sig:
+            if _ext4h_sig.pct_low_4h < 4.0 and _ext4h_sig.pct_4h > 10.0:
+                base = MasterSignal(symbol=base.symbol, side=base.side, confidence=base.confidence,
+                                    reason=base.reason, regime=MarketRegime.TRENDING_UP,
+                                    composite_score=base.composite_score, atr=base.atr,
+                                    kelly_fraction=base.kelly_fraction)
+            elif _ext4h_sig.pct_4h < 4.0 and _ext4h_sig.pct_low_4h > 10.0:
+                base = MasterSignal(symbol=base.symbol, side=base.side, confidence=base.confidence,
+                                    reason=base.reason, regime=MarketRegime.TRENDING_DOWN,
+                                    composite_score=base.composite_score, atr=base.atr,
+                                    kelly_fraction=base.kelly_fraction)
         enriched = enrich_master_signal(
             base, candles, mids=mids or {}, hl_client=hl,
         )
