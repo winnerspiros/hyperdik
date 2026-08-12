@@ -3649,6 +3649,15 @@ def run(dry_run: bool = False):
                             df = add_basic_indicators(candles_to_frame(c15))
                             comp = compute_composite(df)
                             reg, _ = detect_regime(df, c)
+                            # ── 4h reality override: 15m candles lie about trend ──
+                            # UNI was +21% on 4h but 15m EMAs said "trending_down".
+                            # If 4h extremes clearly show trend, override the 15m regime.
+                            _ext4h = get_extremes(c.upper(), mids)
+                            if _ext4h:
+                                if _ext4h.pct_low_4h < 4.0 and _ext4h.pct_4h > 10.0:
+                                    reg = MarketRegime.TRENDING_UP  # Near 4h high, far from low → uptrend
+                                elif _ext4h.pct_4h < 4.0 and _ext4h.pct_low_4h > 10.0:
+                                    reg = MarketRegime.TRENDING_DOWN  # Near 4h low, far from high → downtrend
                             vol = 0.0
                             try:
                                 closes = [float(x.get("c", x.get("close", 0))) for x in c15[-20:]]
