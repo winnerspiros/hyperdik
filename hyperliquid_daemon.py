@@ -2065,12 +2065,9 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                         except Exception as _be_err:
                             log.warning(f"  ⚠️ {coin}: breakeven lock failed: {_be_err} — will retry next cycle")
                     
-                    # ── PROFIT LOCK: tiered — all thresholds now survive 0.42% fees at 6x ──
-                    # Aug 7: 0.03% was below fee — trades looked green but lost money.
-                    # Aug 9: Floor raised to 0.15% net — must clear 0.42% max fee with room.
-                    # Let winners run: tight profit locks cut good trades. Only lock when
-                    # profit is solid. Peak lock tiers handle scaling exits on big runners.
-                    # EXTREME REVERSAL: only force-exit if peak was big (>3%) and now losing.
+                    # ── EXTREME REVERSAL only: if we had 3%+ peak and now losing, protect ──
+                    # Aug 12: removed PROFIT LOCK + PEAK LOCK — clipping winners at 0.15% is
+                    # stupid when you have a good entry. Let trades run, exit layers handle risk.
                     if _peak_pnl >= 3.0 and net_pnl_pct < -0.15:
                         log.warning(f"  🚨 {coin}: EXTREME REVERSAL — peak was {_peak_pnl:+.2f}%, now losing {net_pnl_pct:+.2f}%, closing 50%")
                         try:
@@ -2079,51 +2076,6 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                             log.info(f"  📤 {coin}: partial close {_close_sz:.1f}u — 50% remaining to run")
                         except Exception as e:
                             log.warning(f"  ⚠️ {coin}: partial close failed: {e}")
-                    
-                    if _hold_age_mon < 60:
-                        _lock_target = 0.15  # First 60s: must clear max fee (0.42%@6x) + room
-                    elif _hold_age_mon < 180:
-                        _lock_target = 0.25  # 1-3 min: let winner develop, lock bigger profit
-                    else:
-                        _lock_target = 0.15  # 3+ min: still profitable, let it ride unless reversing
-                    
-                    if _net_pnl_mon >= _lock_target:
-                        log.warning(f"  💰 {coin}: PROFIT LOCK — net={_net_pnl_mon:+.2f}% ≥ {_lock_target:.2f}% (age={_hold_age_mon:.0f}s), closing NOW")
-                        try:
-                            _MANUAL_CLOSES[coin] = time.time()
-                            hl.market_close(coin)
-                            _reset_signal_dominance(coin)
-                            continue
-                        except Exception as e:
-                            log.warning(f"  💰 {coin}: profit lock failed: {e}")
-                    
-                    # ── PEAK PROFIT LOCK: multi-fire at escalating thresholds ──
-                    _peak_lock_tier_key = f"_peak_lock_tier:{cu}"
-                    _lock_tier = getattr(_monitor_positions, _peak_lock_tier_key, -1) if hasattr(_monitor_positions, _peak_lock_tier_key) else -1
-                    _lock_tiers = [
-                        (0.25, 0.15, 0.30, 0),
-                        (0.50, 0.35, 0.40, 1),
-                        (1.50, 1.00, 0.50, 2),
-                        (3.00, 2.00, 1.00, 3),
-                    ]
-                    for _t_peak, _t_net, _t_frac, _t_tier in _lock_tiers:
-                        if _lock_tier < _t_tier and _peak_pnl >= _t_peak and net_pnl_pct >= _t_net:
-                            _close_sz = abs(szi) * _t_frac
-                            if _close_sz > 0:
-                                setattr(_monitor_positions, _peak_lock_tier_key, _t_tier)
-                                _label = "CLOSING ALL" if _t_frac >= 1.0 else f"closing {_t_frac*100:.0f}%"
-                                log.info(f"  🔒 {coin}: PEAK LOCK TIER {_t_tier} — peak {_peak_pnl:+.2f}% → {_label} ({_close_sz:.1f}u)")
-                                try:
-                                    _MANUAL_CLOSES[coin] = time.time()
-                                    hl.market_close(coin, sz=_close_sz)
-                                    szi = szi * (1 - _t_frac)
-                                    if _t_frac >= 1.0:
-                                        continue
-                                    continue
-                                except Exception as e:
-                                    log.warning(f"  ⚠️ {coin}: peak lock tier {_t_tier} close failed: {type(e).__name__}: {e}")
-                                    setattr(_monitor_positions, _peak_lock_tier_key, _lock_tier)
-                            break
                     
                     # ── Only hard exit allowed beyond this point: liquidation survival ──
                     if exit_reason:
