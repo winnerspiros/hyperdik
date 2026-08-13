@@ -244,6 +244,11 @@ MIN_NOTIONAL_USD = 20
 # Dynamic: compute in run() based on equity, floor at 1 for micro accounts
 BASE_MAX_POSITIONS = 5
 BASE_LEVERAGE = 6  # AI-driven: AI can override up to 12x based on conviction/equity/regime (matches config)
+# ── Winners run forever (Aug 13 user directive) ──
+# Fixed take-profit orders cap a winner at +2%/+3% and throw away the move we entered for.
+# A position with a good entry should climb as far as the trend goes (5%, 5000%, whatever).
+# Exit on trend reversal only — the trailing stop / chandelier exit handles that.
+_TAKE_PROFIT_ENABLED = _cfg("exit.take_profit", False)
 
 # ============================================================
 # Logging
@@ -1123,11 +1128,12 @@ def _place_retry_tpsl(coin: str, is_buy: bool, size_usd: float,
         sz = round_size(sz_dec, size_usd / px)
         sl_px = round_price(px_dec, stop_price, is_buy=is_buy)
         hl.trigger_order(coin, not is_buy, sz, sl_px, order_type="sl", is_market=True, reduce_only=True)
-        for tp in tp_levels[:3]:
-            tp_px = round_price(px_dec, float(tp.get("price", 0)), is_buy=is_buy)
-            tp_sz = round_size(sz_dec, float(tp.get("size", sz * 0.33)))
-            if tp_px > 0 and tp_sz > 0:
-                hl.order(coin, not is_buy, tp_sz, tp_px, order_type="gtc", reduce_only=True)
+        if _TAKE_PROFIT_ENABLED:
+            for tp in tp_levels[:3]:
+                tp_px = round_price(px_dec, float(tp.get("price", 0)), is_buy=is_buy)
+                tp_sz = round_size(sz_dec, float(tp.get("size", sz * 0.33)))
+                if tp_px > 0 and tp_sz > 0:
+                    hl.order(coin, not is_buy, tp_sz, tp_px, order_type="gtc", reduce_only=True)
         log.info(f"  🎯 {coin} TP/SL set on retry: SL={sl_px}")
     except Exception as e:
         log.warning(f"  DIRECT OPEN {coin}: retry TP/SL failed ({e})")
@@ -1312,7 +1318,7 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
         tp_oids = []
         sl_oid = 0
         tp_sl_placed = False
-        if stop_price and stop_price > 0 and tp_levels:
+        if stop_price and stop_price > 0 and tp_levels and _TAKE_PROFIT_ENABLED:
             tp_sl_errors = []
             for tp_sl_attempt in range(3):
                 try:
@@ -1372,8 +1378,8 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
                 except Exception as close_err:
                     log.error(f"  🚨 DIRECT OPEN {coin}: CRITICAL — position OPEN but NAKED (close also failed: {close_err})")
                 return False  # Don't proceed — position was closed or is dangerously naked
-        elif stop_price and stop_price > 0 and not tp_levels:
-            # Has stop but no TP levels — at minimum place the SL
+        elif stop_price and stop_price > 0 and (not tp_levels or not _TAKE_PROFIT_ENABLED):
+            # Has stop but no TP levels (or TP disabled) — place SL only, let winners run
             for tp_sl_attempt in range(2):
                 try:
                     from hyperliquid_execution import round_size, round_price
@@ -1551,10 +1557,11 @@ def _submit_action(action_type: str, coin: str, details: dict):
         except Exception:
             pass
 
-    # Store TP levels for position monitoring
-    if action_type in ("buy", "sell") and details.get("tp_levels"):
-        position_tps[coin.upper()] = details["tp_levels"]
-        # Also initialize trail state
+    # Store TP levels for position monitoring (only if take-profit enabled)
+    if action_type in ("buy", "sell"):
+        if details.get("tp_levels") and _TAKE_PROFIT_ENABLED:
+            position_tps[coin.upper()] = details["tp_levels"]
+        # Always initialize trail state — the trailing stop is the trend-reversal exit
         trail_states[coin.upper()] = TrailState(
             symbol=coin.upper(),
             is_long=(details.get("side") == "BUY"),
@@ -1765,15 +1772,16 @@ def _verify_open_orders(positions: list, mids: dict):
             sl_price = ts.current_stop if ts else (entry * 0.985 if is_long else entry * 1.015)
             tp1_pct = 1.02 if is_long else 0.98
             
-            log.warning(f"  ⚠️ NAKED {coin}: no open orders — re-placing TP/SL")
+            log.warning(f"  ⚠️ NAKED {coin}: no open orders — re-placing SL (winners run, no TP)")
             try:
                 sl_px = round_price(2, sl_price, is_buy=not is_long)
                 hl.trigger_order(coin, not is_long, szi, sl_px, order_type="sl", is_market=True, reduce_only=True)
-                tp_px = round_price(2, entry * tp1_pct, is_buy=not is_long)
-                hl.order(coin, not is_long, szi * 0.5, tp_px, order_type="gtc", reduce_only=True)
-                log.info(f"  ✅ {coin}: TP/SL re-placed — SL=${sl_px:.4f} TP=${tp_px:.4f}")
+                if _TAKE_PROFIT_ENABLED:
+                    tp_px = round_price(2, entry * tp1_pct, is_buy=not is_long)
+                    hl.order(coin, not is_long, szi * 0.5, tp_px, order_type="gtc", reduce_only=True)
+                log.info(f"  ✅ {coin}: SL re-placed — SL=${sl_px:.4f}" + (f" TP=${tp_px:.4f}" if _TAKE_PROFIT_ENABLED else " (no TP — let it run)"))
             except Exception as e:
-                log.warning(f"  ⚠️ {coin}: re-place TP/SL failed: {e}")
+                log.warning(f"  ⚠️ {coin}: re-place SL failed: {e}")
     except Exception as e:
         log.warning(f"  Open order verification error: {type(e).__name__}: {e}")
 
@@ -2299,23 +2307,11 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                                                             log.warning(f"  ➕ {coin}: add failed: {e}")
                     
                     # ── No other exit rules. Position runs to exchange TP or breakeven SL. ──
-                    # ── POSITIVE TIMEOUT: free capital from stale positions ──
-                    # Aug 11: raised thresholds — 0.42% fee means "barely green" is still noise.
-                    # Only close if net > 0.30% (real profit beyond fee noise) AND aged enough.
-                    _fast_key = f"_fast_exit:{cu}"
-                    _is_fast = getattr(_monitor_positions, _fast_key, False) if hasattr(_monitor_positions, _fast_key) else False
-                    _pos_timeout = 600 if _is_fast else 900
-                    _min_profit = 0.30  # Must clear fee cost (0.42%) by meaningful margin
-                    if _net_pnl_mon > _min_profit and _hold_age_mon > _pos_timeout:
-                        _label = "FAST-EXIT" if _is_fast else "POSITIVE TIMEOUT"
-                        log.warning(f"  ⏰ {coin}: {_label} — net={_net_pnl_mon:+.2f}% after {_hold_age_mon:.0f}s, closing to free capital")
-                        try:
-                            _MANUAL_CLOSES[coin] = time.time()
-                            hl.market_close(coin)
-                            _reset_signal_dominance(coin)
-                            continue
-                        except Exception as e:
-                            log.warning(f"  ⏰ {coin}: positive timeout close failed: {e}")
+                    # ── WINNERS RUN FOREVER (Aug 13 user directive) ──
+                    # POSITIVE TIMEOUT REMOVED: never close a position that is UP.
+                    # If we have a good price and it's green, let it climb. Only touch
+                    # a position when it is DOWN (net < 0) — handled by the loss-cut
+                    # blocks above (BLEED / TREND-KILL / NEVER-GREEN).
                     
                     setattr(_monitor_positions, _eval_key, _now_ts)
                     
@@ -3224,11 +3220,12 @@ def run(dry_run: bool = False):
                     log.info(f"  Recovery: {coin} entry_time={datetime.fromtimestamp(best_ts, tz=timezone.utc).strftime('%H:%M:%S')}")
                 except Exception:
                     _position_entry_times[coin.upper()] = time.time()  # Best guess
-                # Set TP levels
-                position_tps[coin.upper()] = [
-                    {"fraction": 0.5, "price": tp1_price, "tier_name": "TP1"},
-                    {"fraction": 0.5, "price": tp2_price, "tier_name": "TP2"},
-                ]
+                # Set TP levels (only if take-profit enabled)
+                if _TAKE_PROFIT_ENABLED:
+                    position_tps[coin.upper()] = [
+                        {"fraction": 0.5, "price": tp1_price, "tier_name": "TP1"},
+                        {"fraction": 0.5, "price": tp2_price, "tier_name": "TP2"},
+                    ]
 
                 # ── Place actual TP/SL orders on Hyperliquid ──
                 try:
@@ -3236,14 +3233,15 @@ def run(dry_run: bool = False):
                     # Stop loss
                     sl_result = hl.trigger_order(coin, not is_long, pos_sz, sl_price, "sl", True, True)
                     sl_oid = _extract_oid(sl_result, "sl") if '_extract_oid' in dir() else 0
-                    # Take profits
+                    # Take profits (skipped when winners-run-forever)
                     tp_oids = []
-                    for tp in position_tps[coin.upper()]:
-                        tp_sz = pos_sz * tp["fraction"]
-                        tp_result = hl.trigger_order(coin, not is_long, tp_sz, tp["price"], "tp", True, True)
-                        tp_oid = _extract_oid(tp_result, "tp") if '_extract_oid' in dir() else 0
-                        if tp_oid:
-                            tp_oids.append(tp_oid)
+                    if _TAKE_PROFIT_ENABLED:
+                        for tp in position_tps[coin.upper()]:
+                            tp_sz = pos_sz * tp["fraction"]
+                            tp_result = hl.trigger_order(coin, not is_long, tp_sz, tp["price"], "tp", True, True)
+                            tp_oid = _extract_oid(tp_result, "tp") if '_extract_oid' in dir() else 0
+                            if tp_oid:
+                                tp_oids.append(tp_oid)
                     # Track orders
                     from action_executor import _track_order
                     _track_order(coin, {
@@ -5565,23 +5563,23 @@ def run(dry_run: bool = False):
                         # Aug 7: enriched+AI agreement at high conf = skip debate
                         _ai_enr_agree = _enriched_agrees and ai_conf_val >= 80
                         _confluence_bonus = 1.0; _confluence_lev = chosen_leverage
-                        _confluence_label = ""; _fast_exit = False
+                        _confluence_label = ""
                         if _confluence:
                             log.info(f"  ⚡ {coin}: DEBATE SKIPPED — enriched+AI+ML+unified all agree on {_trade_side} (comp={sig.composite_score:+.2f})")
                             _confluence_bonus = 1.75; _confluence_lev = min(chosen_leverage + 4, 12)
-                            _confluence_label = "4/4 CONFLUENCE"; _fast_exit = True
+                            _confluence_label = "4/4 CONFLUENCE"
                         elif _ai_enr_agree and _ml_agrees:
                             log.info(f"  ⚡ {coin}: DEBATE SKIPPED — enriched+AI+ML agree on {_trade_side} (comp={sig.composite_score:+.2f})")
                             _confluence_bonus = 1.35; _confluence_lev = min(chosen_leverage + 2, 10)
-                            _confluence_label = "3/4 enriched+AI+ML"; _fast_exit = True
+                            _confluence_label = "3/4 enriched+AI+ML"
                         elif _ai_enr_agree and abs(sig.composite_score) >= 0.12:
                             log.info(f"  ⚡ {coin}: DEBATE SKIPPED — enriched+AI agree at {ai_conf_val}% (comp={sig.composite_score:+.2f})")
                             _confluence_bonus = 1.15; _confluence_lev = chosen_leverage
-                            _confluence_label = "enriched+AI strong"; _fast_exit = False
+                            _confluence_label = "enriched+AI strong"
                         elif _ai_enr_agree and abs(sig.composite_score) >= 0.08:
                             log.info(f"  ⚡ {coin}: DEBATE SKIPPED — enriched+AI agree at {ai_conf_val}% (comp={sig.composite_score:+.2f})")
                             _confluence_bonus = 1.0; _confluence_lev = chosen_leverage
-                            _confluence_label = ""; _fast_exit = False
+                            _confluence_label = ""
                         # Regime-confirmed: AI direction matches macro trend even if enriched disagrees
                         elif ai_conf_val >= 80 and (
                             (regime_is_downtrend and _trade_side == "SELL") or
@@ -5589,7 +5587,7 @@ def run(dry_run: bool = False):
                         ):
                             log.info(f"  ⚡ {coin}: DEBATE SKIPPED — regime confirms {_trade_side} (AI={ai_conf_val}%, enriched={sig.side}, comp={sig.composite_score:+.2f})")
                             _confluence_bonus = 1.0; _confluence_lev = chosen_leverage
-                            _confluence_label = "regime-confirmed"; _fast_exit = False
+                            _confluence_label = "regime-confirmed"
                         else:
                             _is_sell = _trade_side == "SELL"
                             if debate_verdict == "HOLD" and not _is_ft_debate:
@@ -5777,9 +5775,6 @@ def run(dry_run: bool = False):
                     if executed:
                             # Record signal for cooldown + trail (only after confirmed execution)
                             cooldown_state.record(coin)
-                            # ── Store fast-exit flag for positive timeout ──
-                            if _fast_exit:
-                                setattr(_monitor_positions, f"_fast_exit:{coin.upper()}", True)
                             # ── Store regime for trend-aware TREND-KILL ──
                             _regime_val = sig.regime.value if sig and hasattr(sig, 'regime') else ""
                             if "down" in _regime_val.lower():

@@ -42,6 +42,7 @@ exit:
   breakeven_lock: true              # Move SL to entry once net ≥ fees
   trend_kill: true                  # Close positions with 4h strongly against
   bleed_detection: true             # Close positions where peak is dropping + momentum turning
+  take_profit: false                # Fixed TP orders OFF — winners run until trend reversal (5% or 5000%)
 
 # ── Monitoring ──
 monitoring:
