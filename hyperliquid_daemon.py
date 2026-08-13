@@ -5371,7 +5371,7 @@ def run(dry_run: bool = False):
                         bumped_pct = min_notional / (total_eq * chosen_leverage) if total_eq > 0 else 0
                         old_pct = pos_pct
                         pos_pct = max(pos_pct, bumped_pct)
-                        pos_pct = min(pos_pct, 0.35)  # Hard cap at 35% even for micro accounts
+                        pos_pct = min(pos_pct, 0.75)  # Hard cap (matches margin floor; was 0.35)
                         notional = total_eq * pos_pct * chosen_leverage
                         if notional < min_notional:
                             log.info(f"  🪙 {coin}: TOO SMALL — notional=${notional:.0f} < min=${min_notional:.0f} (skip)")
