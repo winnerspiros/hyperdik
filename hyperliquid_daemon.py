@@ -4968,14 +4968,14 @@ def run(dry_run: bool = False):
                     chosen_leverage = int(max(3, min(6, 2 + conf / 100.0 * 5)))  # 3x-6x
                     pos_pct = max(get_position_size_pct(pred, total_eq, max_position_pct=0.40),
                                   target_margin / total_eq if total_eq > 0 else 0.10)
-                    # ── Micro-account caps: bigger positions needed on small equity ──
+                    # ── Micro-account caps: $10 margin floor needs ~70% on tiny equity ──
                     if total_eq < 100:
-                        pos_pct = min(pos_pct, 0.35)   # Max 35% per trade on <$100 (was 20%)
+                        pos_pct = min(pos_pct, 0.75)   # Aug 13: honor $10 margin target on tiny accounts (was 0.35)
                     elif total_eq < 200:
-                        pos_pct = min(pos_pct, 0.40)   # Max 40% on $100-$200
+                        pos_pct = min(pos_pct, 0.50)
                     else:
-                        pos_pct = min(pos_pct, 0.50)   # Max 50% on $200+
-                    pos_pct = min(pos_pct, 0.35)  # Hard cap 35% (was 25%)
+                        pos_pct = min(pos_pct, 0.50)
+                    pos_pct = min(pos_pct, 0.75)  # Hard cap (was 0.35)
                     risk_pct = pos_pct * 0.3
                     # ── Leverage: confidence-driven, no regime overrides ──
                     MAX_LEV = 10
@@ -5709,13 +5709,14 @@ def run(dry_run: bool = False):
                             _final_leverage = _confluence_lev
                             if _confluence_bonus > 1.0:
                                 log.info(f"  🔥 {coin}: {_confluence_label} → size ${_sized_notional:.0f}→${_final_notional:.0f} lev {chosen_leverage}x→{_final_leverage}x")
-                            # ── Kelly-style sizing: scale DOWN when few signals agree (systematic trading principle) ──
-                            # Count independent agreeing signals: enriched, ML, unified, AI (capped at 4)
-                            _agree_count = sum([_enriched_agrees, _ml_agrees, _unified_agrees, ai_conf_val >= 80])
-                            _kelly_frac = max(0.25, _agree_count / 4.0)  # floor 25% even on AI-solo
-                            _final_notional *= _kelly_frac
-                            if _kelly_frac < 0.75:
-                                log.info(f"  📐 {coin}: Kelly fraction {_kelly_frac:.0%} — {_agree_count}/4 signals agree → ${_final_notional:.0f}")
+                            # ── MARGIN FLOOR (Aug 13): good calls must deploy real margin ──
+                            # Kelly downscale removed — it was cutting 3/4-confluence calls to ~1.0x net.
+                            # Enforce $10 minimum margin so a correct call isn't a $2 penny position.
+                            _min_margin = max(10.0, total_eq * 0.5)  # $10 floor, but scale with equity
+                            _min_notional = _min_margin * _final_leverage
+                            if _final_notional < _min_notional:
+                                _final_notional = _min_notional
+                                log.info(f"  💰 {coin}: margin floor → notional ${_final_notional:.0f} (${_min_margin:.0f} margin @ {_final_leverage}x)")
                             
                             # Parse entry zone: AI may return "0.059-0.061" or "0.059"
                             _zone_px = 0.0
