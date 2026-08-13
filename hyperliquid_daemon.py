@@ -753,6 +753,25 @@ def _check_recent_move(coin: str, side: str) -> dict:
         return result  # Return defaults on any error — don't block entry
 
 
+def _patient_limit_price(coin: str, is_buy: bool, entry_zone: float, mids: dict) -> float:
+    """Patient entry limit: sit at the actual swing low (LONG) / high (SHORT).
+
+    User directive (Aug 13): be patient on price, buy the dip / sell the squeeze.
+    Target the real 1h/4h extreme, or the AI zone floor — whichever is MORE favorable
+    (lower for longs, higher for shorts). Returns 0.0 if no level found.
+    """
+    ext = get_extremes(coin, mids)
+    levels = [entry_zone] if entry_zone and entry_zone > 0 else []
+    if ext:
+        if is_buy:
+            levels += [x for x in (ext.low_1h, ext.low_4h) if x > 0]
+        else:
+            levels += [x for x in (ext.high_1h, ext.high_4h) if x > 0]
+    if not levels:
+        return 0.0
+    return min(levels) if is_buy else max(levels)
+
+
 def _build_quick_context(coin: str, mids: dict, total_eq: float,
                          positions: list, candles_15m: list | None = None,
                          enrichment_ctx: str = "") -> dict:
@@ -1210,87 +1229,51 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
         # Step 2: Tick-peak-aware entry — short at local peaks, buy at local bottoms
         _side_str = "BUY" if is_buy else "SELL"
         
-        # ── S/R-AWARE SMART PRICING: near support/resistance, use the bounce for better fill ──
-        # Short at support → price bounces UP → place limit ABOVE market, sell into the squeeze
-        # Long at resistance → price dips → place limit BELOW market, buy into the dip
-        # Reuses PENDING_ZONE infrastructure — non-blocking, 90s timeout.
-        if not entry_zone or entry_zone <= 0:
-            try:
-                _sr_ext = get_extremes(coin, mids)
-                if _sr_ext:
-                    _sr_price = 0.0; _sr_label = ""
-                    if not is_buy and _sr_ext.pct_1h < 3.0:
-                        _sr_price = px * 1.005; _sr_label = "S/R short bounce"
-                    elif is_buy and _sr_ext.pct_low_1h < 3.0:
-                        _sr_price = px * 0.995; _sr_label = "S/R long dip"
-                    if _sr_price > 0:
-                        _sr_limit = round_price(px_dec, _sr_price, is_buy=is_buy)
-                        log.info(f"  🎯 {coin}: {_sr_label} — limit ${_sr_limit:.4f} ({(abs(_sr_price-px)/px*100):.1f}% better), 90s timeout")
-                        result = hl.order(coin, is_buy, sz, _sr_limit, order_type="gtc")
-                        if not (isinstance(result, dict) and result.get("status") == "err"):
-                            _sr_oid = _extract_oid(result)
-                            if _sr_oid:
-                                _PENDING_ZONE[coin.upper()] = {
-                                    "oid": _sr_oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
-                                    "stop_price": stop_price, "tp_levels": tp_levels, "reason": reason,
-                                    "leverage": leverage, "placed_at": time.time(),
-                                    "timeout_s": 90, "label": "sr_smart",
-                                }
-                                log.info(f"  📝 {coin}: S/R limit oid={_sr_oid} queued")
-                                return True
-            except Exception:
-                pass
-        
-        # ── AI ENTRY ZONE: if AI zone is close (<1%), use limit. Otherwise market. ──
-        if entry_zone > 0 and abs(px - entry_zone) / px < 0.01:
-            _zone_limit = round_price(px_dec, entry_zone, is_buy=is_buy)
-            log.info(f"  🎯 {coin}: AI zone=${entry_zone:.4f} close ({abs(px-entry_zone)/px*100:.1f}%) — limit, 45s timeout")
-            result = hl.order(coin, is_buy, sz, _zone_limit, order_type="gtc")
-            if isinstance(result, dict) and result.get("status") == "err":
-                log.warning(f"  DIRECT OPEN {coin}: zone limit failed — {result.get('error', 'unknown')}, falling back with micro-peak timing")
-                _mp_px = _micro_peak_entry_wait(coin, is_buy, px)
-                if _mp_px != px:
-                    log.info(f"  ⚡ {coin}: micro-peak fallback → ${px:.4f}→${_mp_px:.4f}")
+        # ── PATIENT LIMIT ENTRY (Aug 13 user directive) ──
+        # Sit a limit at the real swing low (LONG) / high (SHORT) and WAIT.
+        # Never market-buy into a bounce. Only market-fill if already at/through the level.
+        _patient_px = _patient_limit_price(coin, is_buy, entry_zone, mids)
+        if _patient_px > 0:
+            _patient_px = round_price(px_dec, _patient_px, is_buy=is_buy)
+            _already_at_level = (is_buy and px <= _patient_px) or (not is_buy and px >= _patient_px)
+            _dist_pct = abs(px - _patient_px) / px * 100
+
+            if _dist_pct > 10.0:
+                log.info(f"  🚫 {coin}: patient level ${_patient_px:.4f} is {_dist_pct:.1f}% away (>10%) — skip")
+                return False
+
+            if _already_at_level:
+                log.info(f"  ⚡ {coin}: already at/through patient level ${_patient_px:.4f} — market fill")
                 result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
             else:
-                _z_oid = _extract_oid(result)
-                if _z_oid:
+                log.info(f"  🎯 {coin}: patient limit ${_patient_px:.4f} ({_dist_pct:.1f}% {'below' if is_buy else 'above'} market) — resting, no chase")
+                result = hl.order(coin, is_buy, sz, _patient_px, order_type="gtc")
+                if isinstance(result, dict) and result.get("status") == "err":
+                    log.warning(f"  DIRECT OPEN {coin}: patient limit rejected — {result.get('error','unknown')}")
+                    return False
+                _oid = _extract_oid(result)
+                if _oid:
                     _PENDING_ZONE[coin.upper()] = {
-                        "oid": _z_oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
+                        "oid": _oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
                         "stop_price": stop_price, "tp_levels": tp_levels, "reason": reason,
                         "leverage": leverage, "placed_at": time.time(),
-                        "timeout_s": 45, "label": "zone",
+                        "timeout_s": 300, "label": "patient_limit",
                     }
-                    log.info(f"  📝 {coin}: zone limit oid={_z_oid} queued (45s)")
+                    log.info(f"  📝 {coin}: patient limit oid={_oid} queued (300s)")
                     return True
                 else:
-                    log.warning(f"  DIRECT OPEN {coin}: no oid from zone limit — falling back with micro-peak timing")
-                    _mp_px = _micro_peak_entry_wait(coin, is_buy, px)
-                    if _mp_px != px:
-                        log.info(f"  ⚡ {coin}: micro-peak fallback → ${px:.4f}→${_mp_px:.4f}")
-                    result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
-        
-        elif entry_zone > 0:
-            # AI zone too far — cap at 10% distance
-            _zone_distance = abs(px-entry_zone)/px*100
-            if _zone_distance > 10.0:
-                log.info(f"  🚫 {coin}: ZONE TOO FAR — AI zone=${entry_zone:.4f} is {_zone_distance:.1f}% away (>{10.0}% cap), skip")
+                    log.warning(f"  DIRECT OPEN {coin}: no oid from patient limit — SKIP (no chase)")
+                    return False
+        else:
+            # No extremes available — fall back to market with micro-peak timing
+            _chase = _check_recent_move(coin, _side_str)
+            if _chase["block"]:
+                log.warning(f"  🚫 {coin}: CHASE BLOCK — {_chase['detail']}")
                 return False
-            # AI zone too far — enter at market with micro-peak timing
-            log.info(f"  🎯 {coin}: AI zone=${entry_zone:.4f} too far ({_zone_distance:.1f}%) — market entry")
             _mp_px = _micro_peak_entry_wait(coin, is_buy, px)
             if _mp_px != px:
-                log.info(f"  ⚡ {coin}: micro-peak → ${px:.4f}→${_mp_px:.4f} ({(abs(_mp_px-px)/px*100):.2f}% better)")
+                log.info(f"  ⚡ {coin}: micro-peak → ${px:.4f}→${_mp_px:.4f}")
             result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
-        
-        # Step 3: Pump/dump-aware entry — don't chase, wait for pullback
-        _chase = _check_recent_move(coin, _side_str)
-        
-        if _chase["block"]:
-            log.warning(f"  🚫 {coin}: CHASE BLOCK — {_chase['detail']}")
-            return False
-        
-        result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
         if isinstance(result, dict) and result.get("status") == "err":
             log.error(f"  DIRECT OPEN {coin}: {result.get('error', 'unknown')}")
             return False
@@ -3052,15 +3035,12 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
     for zc, zd in list(_PENDING_ZONE.items()):
         _tmo = zd.get("timeout_s", 90)
         if _now_pt - zd["placed_at"] > _tmo:
-            log.warning(f"  ⏰ {zc}: pending {zd.get('label','limit')} not filled in {_tmo}s — cancelling, entering at market")
+            # Patient entry: a limit that didn't fill is NOT a signal to chase.
+            # Cancel it and let the next cycle re-place a fresh limit at the current
+            # swing level. Never market-buy into a bounce (Aug 13 user directive).
+            log.warning(f"  ⏰ {zc}: pending {zd.get('label','limit')} not filled in {_tmo}s — cancelling (no chase, will re-arm next cycle)")
             try: hl.cancel_order(zc, zd["oid"])
             except Exception: pass
-            try:
-                hl.market_open(zc, zd["is_buy"], zd["size_usd"], slippage=0.005, order_type="Ioc")
-                _place_retry_tpsl(zc, zd["is_buy"], zd["size_usd"],
-                                 zd["stop_price"], zd["tp_levels"] or [])
-            except Exception as _zce:
-                log.warning(f"  ⏰ {zc}: pending fallback failed: {_zce}")
             _PENDING_ZONE.pop(zc, None)
     
     # ── Also clean up stale orders >5min old (safety net) ──
