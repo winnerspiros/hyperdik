@@ -1237,19 +1237,13 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
             _patient_px = round_price(px_dec, _patient_px, is_buy=is_buy)
             _already_at_level = (is_buy and px <= _patient_px) or (not is_buy and px >= _patient_px)
             _dist_pct = abs(px - _patient_px) / px * 100
-
-            if _dist_pct > 10.0:
-                log.info(f"  🚫 {coin}: patient level ${_patient_px:.4f} is {_dist_pct:.1f}% away (>10%) — skip")
-                return False
-
-            if _already_at_level:
-                log.info(f"  ⚡ {coin}: already at/through patient level ${_patient_px:.4f} — market fill")
-                result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
-            else:
-                log.info(f"  🎯 {coin}: patient limit ${_patient_px:.4f} ({_dist_pct:.1f}% {'below' if is_buy else 'above'} market) — resting, no chase")
+            # Aug 13: only sit a limit when the level is CLOSE (≤0.4%). A far swing
+            # level (BSV sat 1.2% above, XRP missed) never fills — we lose the move.
+            if not _already_at_level and _dist_pct <= 0.4:
+                log.info(f"  🎯 {coin}: limit ${_patient_px:.4f} ({_dist_pct:.1f}% {'below' if is_buy else 'above'}) — close, resting")
                 result = hl.order(coin, is_buy, sz, _patient_px, order_type="gtc")
                 if isinstance(result, dict) and result.get("status") == "err":
-                    log.warning(f"  DIRECT OPEN {coin}: patient limit rejected — {result.get('error','unknown')}")
+                    log.warning(f"  DIRECT OPEN {coin}: limit rejected — {result.get('error','unknown')}")
                     return False
                 _oid = _extract_oid(result)
                 if _oid:
@@ -1257,23 +1251,22 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
                         "oid": _oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
                         "stop_price": stop_price, "tp_levels": tp_levels, "reason": reason,
                         "leverage": leverage, "placed_at": time.time(),
-                        "timeout_s": 300, "label": "patient_limit",
+                        "timeout_s": 60, "label": "patient_limit",
                     }
-                    log.info(f"  📝 {coin}: patient limit oid={_oid} queued (300s)")
+                    log.info(f"  📝 {coin}: patient limit oid={_oid} queued (60s)")
                     return True
-                else:
-                    log.warning(f"  DIRECT OPEN {coin}: no oid from patient limit — SKIP (no chase)")
-                    return False
-        else:
-            # No extremes available — fall back to market with micro-peak timing
-            _chase = _check_recent_move(coin, _side_str)
-            if _chase["block"]:
-                log.warning(f"  🚫 {coin}: CHASE BLOCK — {_chase['detail']}")
-                return False
-            _mp_px = _micro_peak_entry_wait(coin, is_buy, px)
-            if _mp_px != px:
-                log.info(f"  ⚡ {coin}: micro-peak → ${px:.4f}→${_mp_px:.4f}")
-            result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
+                log.warning(f"  DIRECT OPEN {coin}: no oid from limit — market fill")
+
+        # Market entry — chase guard + micro-peak timing. Catches the move NOW
+        # instead of waiting on a far limit that never fills.
+        _chase = _check_recent_move(coin, _side_str)
+        if _chase["block"]:
+            log.warning(f"  🚫 {coin}: CHASE BLOCK — {_chase['detail']}")
+            return False
+        _mp_px = _micro_peak_entry_wait(coin, is_buy, px)
+        if _mp_px != px:
+            log.info(f"  ⚡ {coin}: micro-peak → ${px:.4f}→${_mp_px:.4f}")
+        result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
         if isinstance(result, dict) and result.get("status") == "err":
             log.error(f"  DIRECT OPEN {coin}: {result.get('error', 'unknown')}")
             return False
