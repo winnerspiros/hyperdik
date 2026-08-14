@@ -4682,10 +4682,15 @@ def run(dry_run: bool = False):
                         if _cannot_override:
                             log.info(f"  🛑 {coin}: UN-OVERRIDABLE — {block_reason} (AI={ai_conf_val}% cannot bypass this gate)")
                         elif _ml_hard_block:
-                            # ATOM lesson: AI=85% overrode ML=UP@41% and shorted into an uptrend,
-                            # near support, with comp=-0.19 — lost money. ML at 30%+ is data-driven
-                            # and authoritative. AI cannot clear an ML contradiction.
-                            log.info(f"  🛑 {coin}: ML HARD BLOCK — ML strongly contradicts ({ml_pred.direction}@{ml_pred.confidence:.0f}%), AI cannot override (data beats Flash Lite)")
+                            # ACE lesson: AI=90% BUY with ML=DOWN@65% was blocked and the coin pumped
+                            # 200%. ATOM lesson: AI=85% SHORT with ML=UP@41% overrode and lost money.
+                            # The cut: AI >= 90% can override ML contradiction (trust very-high-conf AI);
+                            # AI < 90% cannot (data beats Flash Lite at normal confidence levels).
+                            if ai_conf_val >= 90:
+                                log.info(f"  ⚡ {coin}: AI OVERRIDE ML — AI={ai_conf_val}% >= 90% overrides ML contradiction ({ml_pred.direction}@{ml_pred.confidence:.0f}%)")
+                                block_reason = None
+                            else:
+                                log.info(f"  🛑 {coin}: ML HARD BLOCK — ML strongly contradicts ({ml_pred.direction}@{ml_pred.confidence:.0f}%), AI={ai_conf_val}% < 90% cannot override (data beats Flash Lite)")
                         elif abs(sig.composite_score) < _min_composite:
                             log.info(f"  🛑 {coin}: AI override blocked — composite too weak ({sig.composite_score:+.2f}) for gate override{', bull market' if _bull_market else ''}: {block_reason}")
                         else:
