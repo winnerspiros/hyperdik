@@ -428,7 +428,8 @@ def _replace_trailing_sl(coin: str, side: str, size: float, new_stop: float, rea
         _res = hl.trigger_order(coin, (side == "SHORT"), size, sl_px,
                                 order_type="sl", is_market=True, reduce_only=True)
         # SDK nests oid under response.data.statuses[0].{filled|resting}.oid — use the proper extractor.
-        _new_oid = _extract_oid(_res) if '_extract_oid' in dir() else (_res.get("oid", 0) if isinstance(_res, dict) else 0)
+        # NOTE: no `in dir()` guard — dir() inside a function excludes module-level names.
+        _new_oid = _extract_oid(_res)
         if not _new_oid:
             log.warning(f"  ⚠️ {coin}: trailing SL replace returned no oid ({reason})")
             return False
@@ -1409,7 +1410,7 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
                         sl_px = round_price(px_dec, stop_price, is_buy=is_buy)
                         sl_result = hl.trigger_order(coin, not is_buy, sz, sl_px,
                                                       order_type="sl", is_market=True, reduce_only=True)
-                        sl_oid = sl_result.get("oid", 0) if isinstance(sl_result, dict) else 0
+                        sl_oid = _extract_oid(sl_result)
                         # Place TP levels
                         for tp in tp_levels[:3]:
                             tp_px = round_price(px_dec, float(tp.get("price", 0)), is_buy=is_buy)
@@ -1418,7 +1419,7 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
                             if tp_px > 0 and tp_sz > 0:
                                 tp_result = hl.order(coin, not is_buy, tp_sz, tp_px,
                                                      order_type="gtc", reduce_only=True)
-                                tp_oid = tp_result.get("oid", 0) if isinstance(tp_result, dict) else 0
+                                tp_oid = _extract_oid(tp_result)
                                 if tp_oid:
                                     tp_oids.append(tp_oid)
                         # Track orders for fill verification
@@ -1466,7 +1467,7 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
                         sl_px = round_price(px_dec, stop_price, is_buy=is_buy)
                         sl_result = hl.trigger_order(coin, not is_buy, sz, sl_px,
                                                       order_type="sl", is_market=True, reduce_only=True)
-                        sl_oid = sl_result.get("oid", 0) if isinstance(sl_result, dict) else 0
+                        sl_oid = _extract_oid(sl_result)
                         if sl_oid:
                             from action_executor import _track_order
                             _track_order(coin, {"sl_oid": sl_oid, "tp_oids": [], "entry_oid": oid, "leverage": leverage})
@@ -2716,7 +2717,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                                     pos_sz = abs(float(p.get("szi", 0)))
                                     is_long = pos_sz > 0  # szi > 0 means long
                                     sl_result = hl.trigger_order(coin, not is_long, pos_sz, new_stop, "sl", True, True)
-                                    new_oid = sl_result.get("oid") if isinstance(sl_result, dict) else 0
+                                    new_oid = _extract_oid(sl_result)
                                     tracking["sl_oid"] = new_oid
                                     tracking["stop_loss"] = new_stop
                                     log.info(f"  📐 {coin}: SL updated — old_oid={old_sl_oid} → new_oid={new_oid} @ ${new_stop:.4f}")
@@ -3371,14 +3372,14 @@ def run(dry_run: bool = False):
                     pos_sz = abs(szi)
                     # Stop loss
                     sl_result = hl.trigger_order(coin, not is_long, pos_sz, sl_price, "sl", True, True)
-                    sl_oid = _extract_oid(sl_result) if '_extract_oid' in dir() else 0
+                    sl_oid = _extract_oid(sl_result)
                     # Take profits (skipped when winners-run-forever)
                     tp_oids = []
                     if _TAKE_PROFIT_ENABLED:
                         for tp in position_tps[coin.upper()]:
                             tp_sz = pos_sz * tp["fraction"]
                             tp_result = hl.trigger_order(coin, not is_long, tp_sz, tp["price"], "tp", True, True)
-                            tp_oid = _extract_oid(tp_result) if '_extract_oid' in dir() else 0
+                            tp_oid = _extract_oid(tp_result)
                             if tp_oid:
                                 tp_oids.append(tp_oid)
                     # Track orders
