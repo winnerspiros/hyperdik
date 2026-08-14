@@ -4633,6 +4633,25 @@ def run(dry_run: bool = False):
                         except Exception:
                             pass  # If extremes unavailable, skip this gate
 
+                    # ── Gate 1.6: Direction-composite lock ──
+                    # Composite is signed: positive = bullish, negative = bearish.
+                    # A SELL with comp > 0 means the composite literally says "prices should rise"
+                    # while the bot is trying to short — the data and the trade are in open conflict.
+                    # GRASS: SELL, comp=+0.08 (bullish) → dead in 21s. MELANIA: SELL, comp=+0.09 → dead.
+                    if not block_reason:
+                        if sig.side == "SELL" and sig.composite_score > 0.0:
+                            block_reason = f"COMPOSITE CONTRADICTION: SELL but comp={sig.composite_score:+.2f} (bullish)"
+                        elif sig.side == "BUY" and sig.composite_score < 0.0:
+                            block_reason = f"COMPOSITE CONTRADICTION: BUY but comp={sig.composite_score:+.2f} (bearish)"
+
+                    # ── Gate 1.7: Minimum composite strength ──
+                    # MORPHO: |comp|=0.04 entered, bled 0.12 over 52min underwater.
+                    # FARTCOIN: |comp|=0.04 entered, lost money.
+                    # |comp| < 0.10 is noise — no measurable edge, not a momentum trade.
+                    if not block_reason:
+                        if abs(sig.composite_score) < 0.10:
+                            block_reason = f"COMPOSITE FLOOR: |comp|={abs(sig.composite_score):.2f} < 0.10 minimum (no tradeable edge)"
+
                     # ── Gate 2: ML model contradiction ──
                     # ML models are data-driven. When ML strongly contradicts, AI override
                     # cannot clear it. Data beats Flash Lite opinion.
@@ -4678,7 +4697,8 @@ def run(dry_run: bool = False):
                         _cannot_override = ("VWAP:+" in block_reason and "overbought" in block_reason) or \
                                           ("VWAP:-" in block_reason and "oversold" in block_reason) or \
                                           ("all data layers dead" in block_reason) or \
-                                          ("S/R:" in block_reason)
+                                          ("S/R:" in block_reason) or \
+                                          ("COMPOSITE CONTRADICTION" in block_reason)  # comp sign contradicts direction — data conflict, no AI bypass
                         if _cannot_override:
                             log.info(f"  🛑 {coin}: UN-OVERRIDABLE — {block_reason} (AI={ai_conf_val}% cannot bypass this gate)")
                         elif _ml_hard_block:
@@ -4691,6 +4711,14 @@ def run(dry_run: bool = False):
                                 block_reason = None
                             else:
                                 log.info(f"  🛑 {coin}: ML HARD BLOCK — ML strongly contradicts ({ml_pred.direction}@{ml_pred.confidence:.0f}%), AI={ai_conf_val}% < 90% cannot override (data beats Flash Lite)")
+                        elif "COMPOSITE FLOOR" in block_reason:
+                            # ACE lesson: AI=90% BUY, comp=+0.06 (weak but correct) → pumped 200%.
+                            # MORPHO lesson: AI=85% SELL, comp=-0.04 (weak, wrong) → bled 0.12 over 52min.
+                            if ai_conf_val >= 90:
+                                log.info(f"  ⚡ {coin}: AI OVERRIDE COMP FLOOR — AI={ai_conf_val}% >= 90% overrides comp floor ({sig.composite_score:+.2f})")
+                                block_reason = None
+                            else:
+                                log.info(f"  🛑 {coin}: COMPOSITE FLOOR — |comp|={abs(sig.composite_score):.2f} < 0.10, AI={ai_conf_val}% < 90% cannot override")
                         elif abs(sig.composite_score) < _min_composite:
                             log.info(f"  🛑 {coin}: AI override blocked — composite too weak ({sig.composite_score:+.2f}) for gate override{', bull market' if _bull_market else ''}: {block_reason}")
                         else:
