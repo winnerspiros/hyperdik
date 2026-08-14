@@ -2206,27 +2206,39 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                         except Exception as e:
                             log.warning(f"  ⚠️ {coin}: partial close failed: {e}")
 
-                    # ── GREEN-SIDE PEAK SCALE-OUT (Aug 14) — bank a fraction at each ATR-confirmed peak ──
+                    # ── GREEN-SIDE PEAK SCALE-OUT (Aug 14) — bank a fraction at each confirmed peak ──
                     # "Winners run forever" removed every profit-taker, and the loss-cutters below
                     # only fire when net < 0 — so a green position gave back 100% of every peak
-                    # (55/56 trades closed red). This banks scale_out_pct at each peak whose reversal
-                    # is confirmed by short-ATR + momentum. Threshold = scale_out_retr_atr × ATR(5m),
-                    # i.e. volatility-scaled — NO hardcoded price %.
+                    # (55/56 trades closed red). This banks a fraction at each peak whose reversal
+                    # is confirmed by short-ATR + momentum.
+                    # ── DATA-DRIVEN (no hardcoded fraction/threshold) ──
+                    # Reuse get_regime_stop_mult(regime): trending→1.25, sideways→0.80, high_vol→2.0.
+                    # Invert for the fraction (bank LESS in trends so winners run, MORE in chop) and
+                    # scale the retracement bar by it (wider in trends so noise pullbacks don't fire).
+                    # Min-profit gate = 1× ATR(5m) in net terms (below) so we never chop a fresh
+                    # +0.4% wiggle (the ETHFI mistake).
+                    _regime_val = regime.value if hasattr(regime, "value") else str(regime)
+                    _regime_mult = get_regime_stop_mult(_regime_val)
+                    _scale_frac = _SCALE_OUT_PCT / _regime_mult       # bank less in trends, more in chop
+                    _scale_retr = _SCALE_OUT_RETR_ATR * _regime_mult  # wider reversal bar in trends
                     if _SCALE_OUT_ENABLED and _net_pnl_mon > _fee_covered_at and _peak_pnl > _fee_covered_at:
                         _so_peak_key = f"_scaleout_peak:{cu}"
                         _last_so_peak = getattr(_monitor_positions, _so_peak_key, -999.0) if hasattr(_monitor_positions, _so_peak_key) else -999.0
                         if _peak_pnl > _last_so_peak:  # new peak since last bank → eligible
                             _atr_pct = _calc_atr_pct(coin, _TRAIL_ATR_TF, 14)
                             _drop_atr = (drop_from_peak_pct / _atr_pct) if _atr_pct > 0 else 0.0
+                            # Min-profit gate: require a real move (≥1 ATR(5m) in net terms) before
+                            # scaling out — never chop a winner at barely-above-fees.
+                            _min_peak = _atr_pct * leverage if _atr_pct > 0 else 0.0
                             # mom1 is direction-normalized above (line ~2055: for SHORT it's inverted,
                             # so positive = in our favor for BOTH sides). "Against" = negative.
                             _mom_against = mom1 < 0
                             _do_bank = False
                             _so_reason = ""
-                            if _drop_atr >= _SCALE_OUT_RETR_ATR and _mom_against:
+                            if _peak_pnl >= _min_peak and _drop_atr >= _scale_retr and _mom_against:
                                 _do_bank = True
                                 _so_reason = f"peak {_peak_pnl:+.2f}% retraced {_drop_atr:.1f}×ATR(5m), mom against"
-                            elif _AI_PEAK_CLASSIFY and 0.4 <= _drop_atr < _SCALE_OUT_RETR_ATR and _mom_against:
+                            elif _peak_pnl >= _min_peak and _AI_PEAK_CLASSIFY and 0.4 * _regime_mult <= _drop_atr < _scale_retr and _mom_against:
                                 # Borderline reversal — ask AI: local peak (bank) vs continuation (hold)
                                 try:
                                     _ai = ai_evaluate_exit(
@@ -2245,10 +2257,10 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                                     log.warning(f"  ⚠️ {coin}: AI peak-classify crashed ({type(_ai_err).__name__}) — skip scale-out")
                             if _do_bank:
                                 setattr(_monitor_positions, _so_peak_key, _peak_pnl)  # don't re-bank same peak
-                                _close_sz = abs(szi) * _SCALE_OUT_PCT
+                                _close_sz = abs(szi) * _scale_frac
                                 try:
                                     hl.market_close(coin, sz=_close_sz)
-                                    log.warning(f"  💰 {coin}: SCALE-OUT {_SCALE_OUT_PCT:.0%} — {_so_reason}, banked {_close_sz:.2f}u @ net {_net_pnl_mon:+.2f}%")
+                                    log.warning(f"  💰 {coin}: SCALE-OUT {_scale_frac:.0%} — {_so_reason}, banked {_close_sz:.2f}u @ net {_net_pnl_mon:+.2f}%")
                                     # Record the banked fraction for the ledger / self-learning
                                     try:
                                         _record_close_trade(coin, mid, entry, _close_sz, side,
