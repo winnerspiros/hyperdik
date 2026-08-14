@@ -4636,17 +4636,18 @@ def run(dry_run: bool = False):
                     # ── Gate 2: ML model contradiction ──
                     # ML models are data-driven. When ML strongly contradicts, AI override
                     # cannot clear it. Data beats Flash Lite opinion.
+                    # (Always evaluated — even if S/R or VWAP already set a block, because the
+                    # ML direction is an independent hard data signal.)
                     _ml_hard_block = False
-                    if not block_reason:
-                        try:
-                            if (sig.side == "BUY" and ml_pred.direction == "down" and ml_pred.confidence >= 30):
-                                _ml_hard_block = True  # ML at 30%+ is authoritative — data beats Flash Lite
-                                block_reason = f"ML says DOWN ({ml_pred.confidence:.0f}%→${ml_pred.target_price:.2f}) but signal is BUY"
-                            elif (sig.side == "SELL" and ml_pred.direction == "up" and ml_pred.confidence >= 30):
-                                _ml_hard_block = True  # ML at 30%+ is authoritative — data beats Flash Lite
-                                block_reason = f"ML says UP ({ml_pred.confidence:.0f}%→${ml_pred.target_price:.2f}) but signal is SELL"
-                        except (NameError, AttributeError):
-                            pass  # ml_pred not set — skip this gate
+                    try:
+                        if (sig.side == "BUY" and ml_pred.direction == "down" and ml_pred.confidence >= 30):
+                            _ml_hard_block = True  # ML at 30%+ is authoritative — data beats Flash Lite
+                            block_reason = f"ML says DOWN ({ml_pred.confidence:.0f}%→${ml_pred.target_price:.2f}) but signal is BUY"
+                        elif (sig.side == "SELL" and ml_pred.direction == "up" and ml_pred.confidence >= 30):
+                            _ml_hard_block = True  # ML at 30%+ is authoritative — data beats Flash Lite
+                            block_reason = f"ML says UP ({ml_pred.confidence:.0f}%→${ml_pred.target_price:.2f}) but signal is SELL"
+                    except (NameError, AttributeError):
+                        pass  # ml_pred not set — skip this gate
 
                     # ── Gate 3: Weak composite in sideways → let AI decide (don't hard block) ──
                     ai_override_needed = False
@@ -4677,13 +4678,10 @@ def run(dry_run: bool = False):
                         if _cannot_override:
                             log.info(f"  🛑 {coin}: UN-OVERRIDABLE — {block_reason} (AI={ai_conf_val}% cannot bypass VWAP extreme)")
                         elif _ml_hard_block:
-                            _ai_plan_ml = _ai_trade_plan.get(coin.upper(), {})
-                            _ai_conf_ml = _ai_plan_ml.get("confidence", 0)
-                            if _ai_conf_ml >= 80:  # Aug 7: 85→80 — zero-loss exits protect downside
-                                log.info(f"  ⚡ {coin}: AI OVERRIDE ML — AI={_ai_conf_ml}% overrides ML contradiction ({ml_pred.direction}@{ml_pred.confidence:.0f}%)")
-                                block_reason = None  # AI trumps ML at high confidence
-                            else:
-                                log.info(f"  🛑 {coin}: ML HARD BLOCK — ML strongly contradicts ({ml_pred.direction}@{ml_pred.confidence:.0f}%), AI={_ai_conf_ml}% < 80% cannot override")
+                            # ATOM lesson: AI=85% overrode ML=UP@41% and shorted into an uptrend,
+                            # near support, with comp=-0.19 — lost money. ML at 30%+ is data-driven
+                            # and authoritative. AI cannot clear an ML contradiction.
+                            log.info(f"  🛑 {coin}: ML HARD BLOCK — ML strongly contradicts ({ml_pred.direction}@{ml_pred.confidence:.0f}%), AI cannot override (data beats Flash Lite)")
                         elif abs(sig.composite_score) < _min_composite:
                             log.info(f"  🛑 {coin}: AI override blocked — composite too weak ({sig.composite_score:+.2f}) for gate override{', bull market' if _bull_market else ''}: {block_reason}")
                         else:
