@@ -732,6 +732,13 @@ _CHASE_THRESHOLDS = [
     ("4h",  2,  8.0, 0.025, 90, 15.0),
 ]
 
+# Fade guard (Aug 14): entering AGAINST a strong recent move is a knife-catch.
+# SHORT into a +2% 5m pump, LONG into a -2% 5m dump = the losing pattern that
+# bled the account. Tighter than chase thresholds because fading is more dangerous.
+# These BLOCK the market-IOC entry; the patient-limit path (sell-into-squeeze /
+# buy-the-dip) above still gets the better fill when a level is close.
+_FADE_BLOCK_PCT = {"1m": 1.5, "5m": 2.0, "15m": 3.0, "1h": 5.0, "4h": 8.0}
+
 
 def _micro_peak_entry_wait(coin: str, is_buy: bool, px: float, max_wait: float = 4.0) -> float:
     """Wait for a favorable micro-move before entering. Uses live WebSocket mids (no API).
@@ -790,7 +797,7 @@ def _check_recent_move(coin: str, side: str) -> dict:
       max_move_pct: float — Largest move detected
       timeframe: str  — Which timeframe triggered
     """
-    result = {"block": False, "pullback": False, "edge_pct": 0.003,
+    result = {"block": False, "fade": False, "pullback": False, "edge_pct": 0.003,
               "wait_s": 20, "detail": "", "max_move_pct": 0.0, "timeframe": ""}
     
     try:
@@ -820,7 +827,18 @@ def _check_recent_move(coin: str, side: str) -> dict:
             result["max_move_pct"] = max(result["max_move_pct"], abs_move)
             
             if not move_in_direction:
-                continue  # Price moved against our direction — that's GOOD for entry
+                # Price moved AGAINST our direction. A small counter-move is a fine entry,
+                # but a STRONG one is a knife — market-ordering into it is exactly how we
+                # short pumps / buy dumps (the Aug 14 losing pattern). Block the market entry;
+                # the patient-limit path above handles sell-into-squeeze / buy-the-dip.
+                _fade_block = _FADE_BLOCK_PCT.get(tf, 5.0)
+                if abs_move >= _fade_block:
+                    result["fade"] = True
+                    result["detail"] = (f"{tf}:{move_pct:+.1f}% AGAINST {side} — fading a strong move "
+                                        f"(knife-catch); sit a limit, don't market-chase")
+                    result["timeframe"] = tf
+                    return result
+                continue  # Small counter-move — acceptable entry
             
             # Price moved in our direction — how much?
             if abs_move >= block_pct:
@@ -1157,9 +1175,11 @@ def _execute_direct_close(coin: str, size_fraction: float = 1.0, reason: str = "
             result = hl.market_close(coin)
             log.info(f"  DIRECT CLOSE: {coin} full — {reason}")
             # ── Cancel any orphaned TP/SL orders for this coin ──
+            # NOTE: hl.Info() here would spawn a NEW WebSocket connection each call
+            # (skip_ws defaults False) — leaking connections toward the 15-conn cap.
+            # Use hl.get_open_orders() which reuses the skip_ws=True module-level Info.
             try:
-                _info = hl.Info()
-                _ords = _info.open_orders(hl._main_wallet)
+                _ords = hl.get_open_orders()
                 if _ords:
                     for o in _ords:
                         if o.get('coin','').upper() == coin.upper():
@@ -1325,7 +1345,15 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
         
         # Step 2: Tick-peak-aware entry — short at local peaks, buy at local bottoms
         _side_str = "BUY" if is_buy else "SELL"
-        
+
+        # ── Chase / fade check FIRST (drives entry type) ──
+        # chase = price already moved in our direction → too late, block
+        # fade  = price moving strongly AGAINST us → sit a limit, don't market-chase
+        _chase = _check_recent_move(coin, _side_str)
+        if _chase["block"]:
+            log.warning(f"  🚫 {coin}: CHASE BLOCK — {_chase['detail']}")
+            return False
+
         # ── PATIENT LIMIT ENTRY (Aug 13 user directive) ──
         # Sit a limit at the real swing low (LONG) / high (SHORT) and WAIT.
         # Never market-buy into a bounce. Only market-fill if already at/through the level.
@@ -1336,8 +1364,14 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
             _dist_pct = abs(px - _patient_px) / px * 100
             # Aug 13: only sit a limit when the level is CLOSE (≤0.4%). A far swing
             # level (BSV sat 1.2% above, XRP missed) never fills — we lose the move.
-            if not _already_at_level and _dist_pct <= 0.4:
-                log.info(f"  🎯 {coin}: limit ${_patient_px:.4f} ({_dist_pct:.1f}% {'below' if is_buy else 'above'}) — close, resting")
+            # Aug 14 FADE: when fading a strong counter-move, sit the level REGARDLESS
+            # of distance (sell into the squeeze / buy the dip) — the whole point is to
+            # wait for price to come to us, not chase the pump/dump.
+            _sit_limit = (not _already_at_level and _dist_pct <= 0.4) or _chase.get("fade")
+            if _sit_limit:
+                _to_s = 120 if _chase.get("fade") else 60  # fade = wait longer
+                _why = "fading, resting" if _chase.get("fade") else "close, resting"
+                log.info(f"  🎯 {coin}: limit ${_patient_px:.4f} ({_dist_pct:.1f}% {'below' if is_buy else 'above'}) — {_why}")
                 result = hl.order(coin, is_buy, sz, _patient_px, order_type="gtc")
                 if isinstance(result, dict) and result.get("status") == "err":
                     log.warning(f"  DIRECT OPEN {coin}: limit rejected — {result.get('error','unknown')}")
@@ -1348,18 +1382,18 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
                         "oid": _oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
                         "stop_price": stop_price, "tp_levels": tp_levels, "reason": reason,
                         "leverage": leverage, "placed_at": time.time(),
-                        "timeout_s": 60, "label": "patient_limit",
+                        "timeout_s": _to_s, "label": "patient_limit",
                     }
-                    log.info(f"  📝 {coin}: patient limit oid={_oid} queued (60s)")
+                    log.info(f"  📝 {coin}: patient limit oid={_oid} queued ({_to_s}s)")
                     return True
                 log.warning(f"  DIRECT OPEN {coin}: no oid from limit — market fill")
 
-        # Market entry — chase guard + micro-peak timing. Catches the move NOW
-        # instead of waiting on a far limit that never fills.
-        _chase = _check_recent_move(coin, _side_str)
-        if _chase["block"]:
-            log.warning(f"  🚫 {coin}: CHASE BLOCK — {_chase['detail']}")
+        # Fade with no limit level to sit → don't market-chase; skip, re-arm next cycle
+        if _chase.get("fade"):
+            log.warning(f"  🚫 {coin}: FADE — no limit level; skipping ({_chase['detail']})")
             return False
+
+        # Market entry — micro-peak timing. Catches the move NOW (only when not fading).
         _mp_px = _micro_peak_entry_wait(coin, is_buy, px)
         if _mp_px != px:
             log.info(f"  ⚡ {coin}: micro-peak → ${px:.4f}→${_mp_px:.4f}")
@@ -1547,7 +1581,10 @@ def _submit_action(action_type: str, coin: str, details: dict):
         # ── Guard: skip if we already have an open position in this coin ──
         if action_type in ("buy", "sell"):
             try:
-                positions = hl.info.user_state().get("assetPositions", [])
+                # hl.info does NOT exist (module uses private _info). This guard was
+                # silently failing (AttributeError caught below), so duplicate entries
+                # into the same coin were never blocked — a direct over-leverage cause.
+                positions = hl.get_user_state().get("assetPositions", [])
                 for pos in positions:
                     pos_coin = pos.get("position", {}).get("coin", "")
                     pos_szi = float(pos.get("position", {}).get("szi", 0))
@@ -3217,8 +3254,10 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
     _last_orphan = getattr(_monitor_positions, _orphan_key, 0) if hasattr(_monitor_positions, _orphan_key) else 0
     if _now_pt - _last_orphan > 60:
         try:
-            _info = hl.Info()
-            _all_orders = _info.open_orders(hl._main_wallet)
+            # NOTE: hl.Info() here spawned a NEW WebSocket connection every 60s
+            # (skip_ws defaults False) → hit the exchange 15-conn cap, causing the
+            # "Cannot open more than 15 connections" + 429 spiral. Use get_open_orders().
+            _all_orders = hl.get_open_orders()
             if _all_orders:
                 _held = {p.get('coin','').upper(): abs(float(p.get('szi',0))) for p in positions if abs(float(p.get('szi',0))) > 0.0001}
                 for o in _all_orders:
@@ -3398,13 +3437,13 @@ def run(dry_run: bool = False):
     except Exception as e:
         log.warning(f"  Recovery failed: {e}")
 
-    # ── Cleanup stale open orders on startup ──
-    # Use schedule_cancel instead of Info().open_orders() — lighter, no 429 risk
-    try:
-        hl.schedule_cancel(5000)  # Cancel ALL open orders in 5s
-        log.info(f"  🧹 Scheduled cancel of all open orders")
-    except Exception as _co:
-        log.debug(f"  Order cleanup skipped: {type(_co).__name__}")
+    # ── NOTE: removed the old startup `hl.schedule_cancel(5000)` here ──
+    # It was doubly broken: (1) `5000` was passed as an absolute UTC-ms epoch time
+    # (1970, in the past — the SDK requires ≥5s in the FUTURE, so the exchange
+    # rejected it), and (2) even if fixed, a blanket cancel-all would wipe the
+    # TP/SL orders that recovery just placed above, leaving positions naked.
+    # Stale-order cleanup is already handled by the 60s orphan-order sweep
+    # (get_open_orders + cancel coins with no position) — no startup blanket needed.
 
     last_cycle = 0
     last_monitor = 0
