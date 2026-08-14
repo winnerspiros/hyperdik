@@ -43,6 +43,13 @@ exit:
   trend_kill: true                  # Close positions with 4h strongly against
   bleed_detection: true             # Close positions where peak is dropping + momentum turning
   take_profit: false                # Fixed TP orders OFF — winners run until trend reversal (5% or 5000%)
+  # ── v4 exit (Aug 14): bank peaks + protect runner — all ATR-scaled, no hardcoded price % ──
+  chandelier_trail: true            # Wire the ATR chandelier trail to the exchange (cancel+replace SL)
+  trail_atr_timeframe: "5m"         # Volatility window for trail/scale-out (5m = engages on micro moves)
+  scale_out: true                   # Bank partial profit at confirmed peak reversals while green
+  scale_out_pct: 0.5                # Fraction banked at each peak (position fraction, not a price %)
+  scale_out_retr_atr: 0.75          # Reversal threshold in trail-ATR units (0.75× ATR(5m) retrace)
+  ai_peak_classify: true            # AI tiebreak on borderline peak reversals (0.4–0.75× ATR)
 
 # ── Monitoring ──
 monitoring:

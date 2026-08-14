@@ -250,6 +250,19 @@ BASE_LEVERAGE = 6  # AI-driven: AI can override up to 12x based on conviction/eq
 # Exit on trend reversal only — the trailing stop / chandelier exit handles that.
 _TAKE_PROFIT_ENABLED = _cfg("exit.take_profit", False)
 
+# ── v4 exit (Aug 14) — bank peaks + protect runner. All thresholds ATR-scaled, no hardcoded price %. ──
+# The Aug 13 "winners run forever" change removed every profit-taker but never finished the
+# replacement: update_trail() only mutated LOCAL state (never placed an exchange SL), and the
+# whole exit block was gated behind `net < 0`, so a green position could never bank a peak.
+# Fix: (1) wire the chandelier trail to the exchange, (2) scale out a fraction at each
+# ATR-confirmed peak reversal while green.
+_CHANDELIER_TRAIL = _cfg("exit.chandelier_trail", True)
+_TRAIL_ATR_TF = _cfg("exit.trail_atr_timeframe", "5m")   # short window → engages on the bot's real move size
+_SCALE_OUT_ENABLED = _cfg("exit.scale_out", True)
+_SCALE_OUT_PCT = float(_cfg("exit.scale_out_pct", 0.5))
+_SCALE_OUT_RETR_ATR = float(_cfg("exit.scale_out_retr_atr", 0.75))
+_AI_PEAK_CLASSIFY = _cfg("exit.ai_peak_classify", True)
+
 # ============================================================
 # Logging
 # ============================================================
@@ -369,6 +382,41 @@ def _can_close_position(coin: str, reason: str = "") -> bool:
     remaining = MIN_HOLD_SECONDS - age
     log.info(f"  ⏳ {coin}: min hold active ({age:.0f}s/{MIN_HOLD_SECONDS}s) — blocking close, {remaining:.0f}s remaining — reason: {reason}")
     return False
+
+
+def _replace_trailing_sl(coin: str, side: str, size: float, new_stop: float, reason: str = "") -> bool:
+    """Cancel the existing exchange SL and place a new trailing SL at new_stop.
+
+    The Aug 13 regression: update_trail() moved trail_states[coin].current_stop in
+    LOCAL memory only — the exchange SL stayed parked at breakeven. This is the actual
+    order mutation that makes the trailing stop real.
+    """
+    cu = coin.upper()
+    try:
+        # Cancel any existing SL/stop orders for this coin (breakeven-lock SL included).
+        _open_orders = hl.info(coin).get("open_orders", []) if hasattr(hl, "info") else []
+        for _oo in _open_orders or []:
+            _t = str(_oo.get("type", "") or _oo.get("orderType", "")).lower()
+            if "stop" in _t or "sl" in _t:
+                try:
+                    hl.cancel(coin, _oo.get("oid", 0))
+                except Exception:
+                    pass
+        if size <= 0 or new_stop <= 0:
+            return False
+        _px_dec = max(0, int(5 - abs(math.log10(max(new_stop, 0.0001)))))
+        sl_px = round_price(_px_dec, new_stop, is_buy=(side == "SHORT"))
+        _res = hl.trigger_order(coin, (side == "SHORT"), size, sl_px,
+                                order_type="sl", is_market=True, reduce_only=True)
+        _new_oid = _res.get("oid", 0) if isinstance(_res, dict) else 0
+        if not _new_oid:
+            log.warning(f"  ⚠️ {coin}: trailing SL replace returned no oid ({reason})")
+            return False
+        log.info(f"  🛡️ {coin}: trailing SL → ${sl_px:.5f} (oid={_new_oid}) {reason}")
+        return True
+    except Exception as e:
+        log.warning(f"  ⚠️ {coin}: trailing SL replace failed ({reason}): {type(e).__name__}: {e}")
+        return False
 
 def _record_entry_time(coin: str, entry_time: float | None = None):
     """Record that a position was just entered for this coin."""
@@ -614,6 +662,34 @@ def _calc_momentum(coin: str, timeframe: str = "5m") -> float:
         if first <= 0:
             return 0.0
         return (last - first) / first * 100
+    except Exception:
+        return 0.0
+
+
+def _calc_atr_pct(coin: str, interval: str = "5m", period: int = 14) -> float:
+    """ATR (Average True Range) as % of current price, from cached candles.
+
+    Volatility-scaled reference for exit thresholds. Returns 0.0 on failure.
+    Used so the trail / scale-out scale to each coin's own noise instead of a
+    hardcoded price % (a 15m ATR is ~2x wider than this bot's actual micro moves).
+    """
+    try:
+        c = _fetch_candles_cached(coin, interval, period + 2)
+        if not c or len(c) < 3:
+            return 0.0
+        trs = []
+        for i in range(1, len(c)):
+            h = float(c[i].get("h", c[i].get("high", 0)))
+            l = float(c[i].get("l", c[i].get("low", 0)))
+            pc = float(c[i - 1].get("c", c[i - 1].get("close", 0)))
+            if h <= 0 or l <= 0 or pc <= 0:
+                continue
+            trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        if not trs:
+            return 0.0
+        atr = sum(trs) / len(trs)
+        last = float(c[-1].get("c", c[-1].get("close", 0)))
+        return atr / last * 100 if last > 0 else 0.0
     except Exception:
         return 0.0
 
@@ -2058,6 +2134,10 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                             _be_sz = abs(szi)
                             hl.trigger_order(coin, (side == "SHORT"), _be_sz, _be_px,
                                            order_type="sl", is_market=True, reduce_only=True)
+                            # Sync the trail baseline to breakeven so the chandelier trail ratchets
+                            # UP from here and never moves the SL back below breakeven.
+                            if cu in trail_states:
+                                trail_states[cu].current_stop = _be_px
                             log.info(f"  🔒 {coin}: BREAKEVEN LOCKED — net={_net_pnl_mon:+.2f}% ≥ fee={_fee_covered_at:+.2f}%, SL moved to entry ${entry:.5f}")
                         except Exception as _be_err:
                             log.warning(f"  ⚠️ {coin}: breakeven lock failed: {_be_err} — will retry next cycle")
@@ -2073,7 +2153,64 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                             log.info(f"  📤 {coin}: partial close {_close_sz:.1f}u — 50% remaining to run")
                         except Exception as e:
                             log.warning(f"  ⚠️ {coin}: partial close failed: {e}")
-                    
+
+                    # ── GREEN-SIDE PEAK SCALE-OUT (Aug 14) — bank a fraction at each ATR-confirmed peak ──
+                    # "Winners run forever" removed every profit-taker, and the loss-cutters below
+                    # only fire when net < 0 — so a green position gave back 100% of every peak
+                    # (55/56 trades closed red). This banks scale_out_pct at each peak whose reversal
+                    # is confirmed by short-ATR + momentum. Threshold = scale_out_retr_atr × ATR(5m),
+                    # i.e. volatility-scaled — NO hardcoded price %.
+                    if _SCALE_OUT_ENABLED and _net_pnl_mon > _fee_covered_at and _peak_pnl > _fee_covered_at:
+                        _so_peak_key = f"_scaleout_peak:{cu}"
+                        _last_so_peak = getattr(_monitor_positions, _so_peak_key, -999.0) if hasattr(_monitor_positions, _so_peak_key) else -999.0
+                        if _peak_pnl > _last_so_peak:  # new peak since last bank → eligible
+                            _atr_pct = _calc_atr_pct(coin, _TRAIL_ATR_TF, 14)
+                            _drop_atr = (drop_from_peak_pct / _atr_pct) if _atr_pct > 0 else 0.0
+                            # mom1 is direction-normalized above (line ~2055: for SHORT it's inverted,
+                            # so positive = in our favor for BOTH sides). "Against" = negative.
+                            _mom_against = mom1 < 0
+                            _do_bank = False
+                            _so_reason = ""
+                            if _drop_atr >= _SCALE_OUT_RETR_ATR and _mom_against:
+                                _do_bank = True
+                                _so_reason = f"peak {_peak_pnl:+.2f}% retraced {_drop_atr:.1f}×ATR(5m), mom against"
+                            elif _AI_PEAK_CLASSIFY and 0.4 <= _drop_atr < _SCALE_OUT_RETR_ATR and _mom_against:
+                                # Borderline reversal — ask AI: local peak (bank) vs continuation (hold)
+                                try:
+                                    _ai = ai_evaluate_exit(
+                                        coin=coin, direction=side, entry_price=entry,
+                                        current_price=mid, pnl_pct=_net_pnl_mon,
+                                        hold_seconds=_hold_age_mon, mom_5m=mom5, mom_15m=0,
+                                        regime=(regime.value if hasattr(regime, "value") else "sideways"),
+                                        target_pct=2.0, stop_pct=0.55, peak_pnl=_peak_pnl,
+                                    )
+                                    if _ai.get("action") == "exit":
+                                        _do_bank = True
+                                        _so_reason = f"AI peak-classify exit@{_ai.get('confidence', 0)}%: {_ai.get('reason', '')[:50]}"
+                                    else:
+                                        log.info(f"  🧠 {coin}: AI peak-classify → HOLD (peak {_peak_pnl:+.2f}%, retrace {_drop_atr:.1f}×ATR)")
+                                except Exception as _ai_err:
+                                    log.warning(f"  ⚠️ {coin}: AI peak-classify crashed ({type(_ai_err).__name__}) — skip scale-out")
+                            if _do_bank:
+                                setattr(_monitor_positions, _so_peak_key, _peak_pnl)  # don't re-bank same peak
+                                _close_sz = abs(szi) * _SCALE_OUT_PCT
+                                try:
+                                    hl.market_close(coin, sz=_close_sz)
+                                    log.warning(f"  💰 {coin}: SCALE-OUT {_SCALE_OUT_PCT:.0%} — {_so_reason}, banked {_close_sz:.2f}u @ net {_net_pnl_mon:+.2f}%")
+                                    # Tighten trail on the runner (half the distance → locks more)
+                                    if coin in trail_states:
+                                        _t = trail_states[coin]
+                                        if side == "LONG":
+                                            _aggr = mid - (mid - _t.current_stop) * 0.5
+                                            if _aggr > _t.current_stop:
+                                                _t.current_stop = _aggr
+                                        elif side == "SHORT":
+                                            _aggr = mid + (_t.current_stop - mid) * 0.5
+                                            if _aggr < _t.current_stop:
+                                                _t.current_stop = _aggr
+                                except Exception as e:
+                                    log.warning(f"  ⚠️ {coin}: scale-out failed: {e}")
+
                     # ── Only hard exit allowed beyond this point: liquidation survival ──
                     if exit_reason:
                         log.info(f"  📤 RULE EXIT: {coin} — {exit_reason}")
@@ -2575,13 +2712,20 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
         elif pnl_pct > 20:
             log.info(f"  🟢 {coin} {side}: +{pnl_pct:.1f}% — consider taking profit")
 
-        # Trailing stop update (Chandelier Exit with dynamic ATR multiplier)
-        if coin in trail_states:
+        # Trailing stop update (Chandelier Exit with dynamic ATR multiplier) — WIRED TO EXCHANGE
+        if coin in trail_states and _CHANDELIER_TRAIL:
             trail = trail_states[coin]
             # Dynamic multiplier from volatility regime (research: 3x base for leveraged crypto)
             dyn_mult = chandelier_atr_mult(atr)
-            new_stop = update_trail(trail, mid, atr, dyn_mult)
+            # Short-ATR so the trail engages on the bot's real move size (15m ATR is ~2x too wide).
+            _s_atr_pct = _calc_atr_pct(coin, _TRAIL_ATR_TF, 14)
+            _s_atr = (_s_atr_pct / 100 * mid) if _s_atr_pct > 0 else atr
+            _act = (_s_atr_pct / 100 * 0.5) if _s_atr_pct > 0 else None
+            new_stop = update_trail(trail, mid, _s_atr, dyn_mult, activation_pct=_act)
             if new_stop:
+                # Aug 14: actually move the exchange SL — was local-only (winners bled back to breakeven)
+                _replace_trailing_sl(coin, side, abs(szi), new_stop,
+                                     f"chandelier high=${trail.highest_price:,.4f} atr×{dyn_mult:.1f}")
                 log.info(f"  📈 {coin} trail stop → ${new_stop:,.2f} "
                          f"(high=${trail.highest_price:,.2f} atr×{dyn_mult:.1f})")
 
