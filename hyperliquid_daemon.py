@@ -2257,8 +2257,14 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                                                             leverage=leverage)
                                     except Exception:
                                         pass
-                                    # Tighten trail on the runner (half the distance → locks more)
-                                    if coin in trail_states:
+                                    # ── Re-arm the SL on the remaining runner (CRITICAL) ──
+                                    # market_close leaves the old reduce-only SL oversized
+                                    # (size > remaining position) → Hyperliquid auto-cancels it,
+                                    # stranding the runner with NO stop. Tighten AND re-place on
+                                    # the exchange for the reduced size. (Aug 14: ETHFI runner
+                                    # liquidated because the SL died after scale-out.)
+                                    _remain = max(abs(szi) - _close_sz, 0.0)
+                                    if coin in trail_states and _remain > 0:
                                         _t = trail_states[coin]
                                         if side == "LONG":
                                             _aggr = mid - (mid - _t.current_stop) * 0.5
@@ -2268,6 +2274,8 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                                             _aggr = mid + (_t.current_stop - mid) * 0.5
                                             if _aggr < _t.current_stop:
                                                 _t.current_stop = _aggr
+                                        _replace_trailing_sl(coin, side, _remain, _t.current_stop,
+                                                             "scale-out re-arm")
                                 except Exception as e:
                                     log.warning(f"  ⚠️ {coin}: scale-out failed: {e}")
 
