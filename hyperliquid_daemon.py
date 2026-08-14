@@ -4671,12 +4671,16 @@ def run(dry_run: bool = False):
                     _bull_aligned = _bull_market and ai_dir_raw == "long"
                     _min_composite = 0.05 if _bull_aligned else (0.08 if ai_dir_raw == "short" else 0.12)
                     if ai_conf_val >= 80 and block_reason:
-                        # ── UN-OVERRIDABLE GATES: VWAP extremes, data consensus — no AI bypass ──
+                        # ── UN-OVERRIDABLE GATES: VWAP extremes, S/R levels, data consensus — no AI bypass ──
+                        # Aug 14: S/R added — shorting near support / longing near resistance are
+                        # chart-level bounces. The user's own rule: "short at support → bounce expected".
+                        # AI cannot override S/R any more than it can override ML contradiction.
                         _cannot_override = ("VWAP:+" in block_reason and "overbought" in block_reason) or \
                                           ("VWAP:-" in block_reason and "oversold" in block_reason) or \
-                                          ("all data layers dead" in block_reason)
+                                          ("all data layers dead" in block_reason) or \
+                                          ("S/R:" in block_reason)
                         if _cannot_override:
-                            log.info(f"  🛑 {coin}: UN-OVERRIDABLE — {block_reason} (AI={ai_conf_val}% cannot bypass VWAP extreme)")
+                            log.info(f"  🛑 {coin}: UN-OVERRIDABLE — {block_reason} (AI={ai_conf_val}% cannot bypass this gate)")
                         elif _ml_hard_block:
                             # ATOM lesson: AI=85% overrode ML=UP@41% and shorted into an uptrend,
                             # near support, with comp=-0.19 — lost money. ML at 30%+ is data-driven
