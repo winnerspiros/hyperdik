@@ -2197,6 +2197,14 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                                 try:
                                     hl.market_close(coin, sz=_close_sz)
                                     log.warning(f"  💰 {coin}: SCALE-OUT {_SCALE_OUT_PCT:.0%} — {_so_reason}, banked {_close_sz:.2f}u @ net {_net_pnl_mon:+.2f}%")
+                                    # Record the banked fraction for the ledger / self-learning
+                                    try:
+                                        _record_close_trade(coin, mid, entry, _close_sz, side,
+                                                            f"scale_out:{_so_reason[:60]}", conviction=0,
+                                                            regime=regime.value if hasattr(regime, 'value') else "sideways",
+                                                            leverage=leverage)
+                                    except Exception:
+                                        pass
                                     # Tighten trail on the runner (half the distance → locks more)
                                     if coin in trail_states:
                                         _t = trail_states[coin]
