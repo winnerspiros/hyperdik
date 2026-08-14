@@ -34,6 +34,7 @@ import sys
 import time
 import logging
 import traceback
+import threading
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -236,7 +237,7 @@ _ROTATE_WINDOW = 40  # pushing from 35
 _ALWAYS_SCAN = {"BTC", "ETH"}
 _rotate_offset = 0
 CYCLE_SECONDS = _cfg("monitoring.cycle_seconds", 3)  # 3s — configurable, fast default
-POSITION_CHECK_SECONDS = 10
+FAST_MONITOR_SECONDS = 3  # fast exit/monitor thread cadence (decoupled from entry pipeline)
 MIN_TRADE_USD = 5.0
 # Minimum notional per trade: $20 floor (HL minimum is $10, $10 margin at 2x = $20)
 # Fast-track coins can go to $10 (HL absolute minimum)
@@ -1154,6 +1155,7 @@ def _compute_signal(coin: str, btc_candles: list[dict] | None,
 # ============================================================
 
 _API_WALLET = None  # Set at daemon init
+_last_total_eq = 0.0  # cached total_equity (module-level so the fast monitor thread can read it)
 
 def _execute_direct_close(coin: str, size_fraction: float = 1.0, reason: str = "") -> bool:
     """Execute a position close DIRECTLY on Hyperliquid, bypassing the
@@ -2111,6 +2113,19 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                     mom5 = _calc_momentum(coin, "5m") or 0
                     if side == "SHORT":
                         mom1 = -mom1; mom5 = -mom5
+
+                    # ── Regime for exit context (scale-out fraction, AI eval, trade ledger) ──
+                    # Was a bare undefined `regime` → NameError aborted the ENTIRE exit-eval block
+                    # every cycle (trail/scale-out/liquidation-survival all dead). Derive it from
+                    # cached candles like the entry pipeline does.
+                    try:
+                        _c15 = _fetch_candles_cached(coin, "15m", 50)
+                        if _c15 and len(_c15) >= 20:
+                            regime, _ = detect_regime(add_basic_indicators(candles_to_frame(_c15)), coin)
+                        else:
+                            regime = MarketRegime.SIDEWAYS
+                    except Exception:
+                        regime = MarketRegime.SIDEWAYS
 
                     net_pnl_pct = _net_pnl_pct(pnl_pct, leverage)
                     
@@ -3292,12 +3307,124 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
             pass
 
 
+def _fast_monitor_cycle(main_wallet: str) -> None:
+    """Fast exit/monitor cycle — runs on its own thread every FAST_MONITOR_SECONDS.
+
+    Decoupled from the entry pipeline (which takes 30-90s scanning the universe)
+    so exits/trails/scale-outs/liquidation-survival react on a tight cadence.
+    No AI and no candle fetches here — just REST mids + WS-backed state + cached signals.
+    """
+    try:
+        state = hl.get_user_state(main_wallet)
+        positions = _normalize_positions(state.get("assetPositions", []))
+        mids = hl.get_all_mids()
+        active = [p for p in positions if abs(float(p.get("szi", 0))) > 0.0001]
+
+        # ── MICRO-CAP SPIKE DETECTOR: catches fast moves on sub-$0.50 coins ──
+        # APE lesson: $0.15 coin spikes 3-5% between 10s checks, bot never sees it.
+        # Track local peaks and set tight trail BEFORE the full eval misses them.
+        for p in active:
+            coin = p.get("coin", "")
+            mid = float(mids.get(coin, 0))
+            if mid <= 0 or mid >= 0.50:
+                continue  # Only sub-$0.50 micro-caps
+            entry = float(p.get("entryPx", 0))
+            if entry <= 0:
+                continue
+            szi = float(p.get("szi", 0))
+            side = "LONG" if szi > 0 else "SHORT"
+            pnl_pct = (mid - entry) / entry * 100 if side == "LONG" else (entry - mid) / entry * 100
+            
+            # Track local peak for this position (reset on new entry or position change)
+            _mc_key = f"_mc_peak:{coin}"
+            _mc_peak = getattr(_monitor_positions, _mc_key, None) if hasattr(_monitor_positions, _mc_key) else None
+            _mc_entry_ts = getattr(_monitor_positions, f"_mc_entry_ts:{coin}", 0) if hasattr(_monitor_positions, f"_mc_entry_ts:{coin}") else 0
+            
+            # Reset tracker if this is a new position
+            _pos_entry_ts = _position_entry_times.get(coin.upper(), 0)
+            if _pos_entry_ts != _mc_entry_ts:
+                _mc_peak = None
+                setattr(_monitor_positions, f"_mc_entry_ts:{coin}", _pos_entry_ts)
+            
+            if pnl_pct > 0.15:  # Any meaningful green
+                if _mc_peak is None or pnl_pct > _mc_peak:
+                    _mc_peak = pnl_pct
+                    setattr(_monitor_positions, _mc_key, _mc_peak)
+                # If we had a peak and now we're fading, set immediate tight trail
+                elif _mc_peak is not None and pnl_pct < _mc_peak * 0.60:
+                    # Lost 40% of local peak — lock remaining with tight trail
+                    if coin in trail_states and not trail_states[coin].activated:
+                        _mc_trail_pct = 0.003  # 0.30% — micro-cap, kill fast on fade
+                        # Cap at 50% of local peak
+                        _mc_trail_pct = min(_mc_trail_pct, max(0.0015, _mc_peak * 0.0050))
+                        _mc_stop = mid * (1 - _mc_trail_pct) if side == "LONG" else mid * (1 + _mc_trail_pct)
+                        trail_states[coin].current_stop = _mc_stop
+                        trail_states[coin].activated = True
+                        trail_states[coin].trail_distance = mid * _mc_trail_pct
+                        log.info(f"  ⚡ {coin}: MICRO-CAP SPIKE FADE — peak {_mc_peak:+.2f}% → {pnl_pct:+.2f}%, trail set at ${_mc_stop:.4f} (0.30%)")
+                        # Force a mini hard-exit if the fade is severe (>60% of local peak gone)
+                        if _mc_peak > 0.50 and pnl_pct < _mc_peak * 0.40:
+                            log.info(f"  ⚡ {coin}: MICRO-CAP SEVERE FADE — peak {_mc_peak:+.2f}% → {pnl_pct:+.2f}%, closing now")
+                            if _can_close_position(coin, "microcap-spike-fade"):
+                                _MANUAL_CLOSES[coin] = time.time()
+                                hl.market_close(coin)
+                                _reset_signal_dominance(coin)
+                                if hasattr(_monitor_positions, _mc_key):
+                                    delattr(_monitor_positions, _mc_key)
+            elif pnl_pct <= 0 and _mc_peak is not None:
+                # Price went back below entry — reset peak tracker
+                _mc_peak = None
+                setattr(_monitor_positions, _mc_key, None)
+
+        if active:
+            # Compute equity for monitor — use spot_free + margin_used (STABLE, excludes unrealized PnL)
+            # total_equity includes unrealized PnL → fluctuates wildly → false flash crash triggers
+            # spot_free + margin_used only changes on real PnL events (close/liquidate/fees)
+            try:
+                acc = hl.get_account()
+                monitor_eq = acc.get("spot_free", 0) + acc.get("margin_used", 0)
+            except Exception:
+                monitor_eq = _last_total_eq  # fallback (skip flash crash if no cycle equity yet)
+            # ── Open order verification (every cycle, NautilusTrader pattern) ──
+            # Catches naked positions within 90s instead of 7.5 min
+            _verify_open_orders(active, mids)
+            _monitor_positions(active, mids, monitor_eq, active)
+
+            # Update exposure
+            pos_map = {p.get("coin", ""): abs(float(p.get("szi", 0))) * float(mids.get(p.get("coin", ""), 0))
+                      for p in active}
+            exposure_state.update(hsl_state.peak_equity or 10000.0, pos_map)
+        else:
+            # No positions — clear exposure state (prevents phantom positions)
+            exposure_state.update(exposure_state.equity or 100.0, {})
+
+        # Check for liquidations
+        _detect_liquidations(positions)
+
+    except Exception as e:
+        # Rate-limit or transient API error — don't crash, just log and skip
+        if "429" in str(e):
+            log.debug(f"  Monitor API 429 — retrying next tick")
+        else:
+            log.warning(f"  Monitor API error: {type(e).__name__}: {e}")
+            log.warning(f"  Monitor traceback: {traceback.format_exc()[:300]}")
+
+
+def _fast_monitor_loop(main_wallet: str) -> None:
+    """Daemon thread: fast exit/monitor on a tight, fixed cadence."""
+    while True:
+        try:
+            _fast_monitor_cycle(main_wallet)
+        except Exception:
+            log.warning(f"  ⚠️ fast monitor loop crashed: {traceback.format_exc()[:300]}")
+        time.sleep(FAST_MONITOR_SECONDS)
+
 # ============================================================
 # MAIN LOOP
 # ============================================================
 
 def run(dry_run: bool = False):
-    global hsl_state, exposure_state, cycle_count, evolution_check_cycles, _forager_skip_cooldown, _API_WALLET, _global_pause_until, _rotate_offset, _losing_streak, _last_closed_equity
+    global hsl_state, exposure_state, cycle_count, evolution_check_cycles, _forager_skip_cooldown, _API_WALLET, _global_pause_until, _rotate_offset, _losing_streak, _last_closed_equity, _last_total_eq
 
     cfg = json.loads(Path("/home/ubuntu/.hyperliquid/config.json").read_text())
     api_wallet = cfg["api_wallet"]
@@ -3466,116 +3593,24 @@ def run(dry_run: bool = False):
     # (get_open_orders + cancel coins with no position) — no startup blanket needed.
 
     last_cycle = 0
-    last_monitor = 0
     last_evolution = 0
     _consecutive_429s = 0  # reset on each daemon restart
     _exec_fails: dict[str, int] = {}  # track repeated execution failures
     _coin_blacklist: set[str] = {"KLUNC"}  # coins blacklisted after 3+ failures (+ permanent dead coins)
     # KLUNC: exists in HL meta but candle fetch always fails — dead listing, zero volume
-    _last_total_eq: float = 0.0  # cached total_equity for flash crash detection
+    _last_total_eq = 0.0  # cached total_equity for flash crash detection (global)
+
+    # ── Fast exit/monitor thread: decoupled from the entry pipeline so exits/trails/
+    # scale-outs/liquidation-survival react every FAST_MONITOR_SECONDS instead of
+    # waiting out a 30-90s entry scan (the ETHFI/LIT liquidation lesson).
+    _fast_monitor_thread = threading.Thread(target=_fast_monitor_loop, args=(main_wallet,), daemon=True)
+    _fast_monitor_thread.start()
+    log.info(f"  ⚡ Fast monitor thread started (every {FAST_MONITOR_SECONDS}s)")
 
     while True:
         now = time.time()
 
-        # ── Monitor positions (every 10s) ──
-        if now - last_monitor >= POSITION_CHECK_SECONDS:
-            last_monitor = now
-            try:
-                state = hl.get_user_state(main_wallet)
-                positions = _normalize_positions(state.get("assetPositions", []))
-                mids = hl.get_all_mids()
-                active = [p for p in positions if abs(float(p.get("szi", 0))) > 0.0001]
-
-                # ── MICRO-CAP SPIKE DETECTOR: catches fast moves on sub-$0.50 coins ──
-                # APE lesson: $0.15 coin spikes 3-5% between 10s checks, bot never sees it.
-                # Track local peaks and set tight trail BEFORE the full eval misses them.
-                for p in active:
-                    coin = p.get("coin", "")
-                    mid = float(mids.get(coin, 0))
-                    if mid <= 0 or mid >= 0.50:
-                        continue  # Only sub-$0.50 micro-caps
-                    entry = float(p.get("entryPx", 0))
-                    if entry <= 0:
-                        continue
-                    szi = float(p.get("szi", 0))
-                    side = "LONG" if szi > 0 else "SHORT"
-                    pnl_pct = (mid - entry) / entry * 100 if side == "LONG" else (entry - mid) / entry * 100
-                    
-                    # Track local peak for this position (reset on new entry or position change)
-                    _mc_key = f"_mc_peak:{coin}"
-                    _mc_peak = getattr(_monitor_positions, _mc_key, None) if hasattr(_monitor_positions, _mc_key) else None
-                    _mc_entry_ts = getattr(_monitor_positions, f"_mc_entry_ts:{coin}", 0) if hasattr(_monitor_positions, f"_mc_entry_ts:{coin}") else 0
-                    
-                    # Reset tracker if this is a new position
-                    _pos_entry_ts = _position_entry_times.get(coin.upper(), 0)
-                    if _pos_entry_ts != _mc_entry_ts:
-                        _mc_peak = None
-                        setattr(_monitor_positions, f"_mc_entry_ts:{coin}", _pos_entry_ts)
-                    
-                    if pnl_pct > 0.15:  # Any meaningful green
-                        if _mc_peak is None or pnl_pct > _mc_peak:
-                            _mc_peak = pnl_pct
-                            setattr(_monitor_positions, _mc_key, _mc_peak)
-                        # If we had a peak and now we're fading, set immediate tight trail
-                        elif _mc_peak is not None and pnl_pct < _mc_peak * 0.60:
-                            # Lost 40% of local peak — lock remaining with tight trail
-                            if coin in trail_states and not trail_states[coin].activated:
-                                _mc_trail_pct = 0.003  # 0.30% — micro-cap, kill fast on fade
-                                # Cap at 50% of local peak
-                                _mc_trail_pct = min(_mc_trail_pct, max(0.0015, _mc_peak * 0.0050))
-                                _mc_stop = mid * (1 - _mc_trail_pct) if side == "LONG" else mid * (1 + _mc_trail_pct)
-                                trail_states[coin].current_stop = _mc_stop
-                                trail_states[coin].activated = True
-                                trail_states[coin].trail_distance = mid * _mc_trail_pct
-                                log.info(f"  ⚡ {coin}: MICRO-CAP SPIKE FADE — peak {_mc_peak:+.2f}% → {pnl_pct:+.2f}%, trail set at ${_mc_stop:.4f} (0.30%)")
-                                # Force a mini hard-exit if the fade is severe (>60% of local peak gone)
-                                if _mc_peak > 0.50 and pnl_pct < _mc_peak * 0.40:
-                                    log.info(f"  ⚡ {coin}: MICRO-CAP SEVERE FADE — peak {_mc_peak:+.2f}% → {pnl_pct:+.2f}%, closing now")
-                                    if _can_close_position(coin, "microcap-spike-fade"):
-                                        _MANUAL_CLOSES[coin] = time.time()
-                                        hl.market_close(coin)
-                                        _reset_signal_dominance(coin)
-                                        if hasattr(_monitor_positions, _mc_key):
-                                            delattr(_monitor_positions, _mc_key)
-                    elif pnl_pct <= 0 and _mc_peak is not None:
-                        # Price went back below entry — reset peak tracker
-                        _mc_peak = None
-                        setattr(_monitor_positions, _mc_key, None)
-
-                if active:
-                    # Compute equity for monitor — use spot_free + margin_used (STABLE, excludes unrealized PnL)
-                    # total_equity includes unrealized PnL → fluctuates wildly → false flash crash triggers
-                    # spot_free + margin_used only changes on real PnL events (close/liquidate/fees)
-                    try:
-                        acc = hl.get_account()
-                        monitor_eq = acc.get("spot_free", 0) + acc.get("margin_used", 0)
-                    except Exception:
-                        monitor_eq = _last_total_eq  # fallback (skip flash crash if no cycle equity yet)
-                    # ── Open order verification (every cycle, NautilusTrader pattern) ──
-                    # Catches naked positions within 90s instead of 7.5 min
-                    _verify_open_orders(active, mids)
-                    _monitor_positions(active, mids, monitor_eq, active)
-
-                    # Update exposure
-                    pos_map = {p.get("coin", ""): abs(float(p.get("szi", 0))) * float(mids.get(p.get("coin", ""), 0))
-                              for p in active}
-                    exposure_state.update(hsl_state.peak_equity or 10000.0, pos_map)
-                else:
-                    # No positions — clear exposure state (prevents phantom positions)
-                    exposure_state.update(exposure_state.equity or 100.0, {})
-
-                # Check for liquidations
-                _detect_liquidations(positions)
-
-            except Exception as e:
-                # Rate-limit or transient API error — don't crash, just log and skip
-                if "429" in str(e):
-                    log.debug(f"  Monitor API 429 — retrying next tick")
-                else:
-                    log.warning(f"  Monitor API error: {type(e).__name__}: {e}")
-                    log.warning(f"  Monitor traceback: {traceback.format_exc()[:300]}")
-
-        # ── AI Cycle (every 60s) ──
+        # ── AI Cycle (entry pipeline) — position monitoring now runs in the fast monitor thread ──
         if now - last_cycle >= CYCLE_SECONDS:
             cycle_start = time.time()
             last_cycle = now
