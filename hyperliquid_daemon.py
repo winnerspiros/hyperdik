@@ -384,6 +384,32 @@ def _can_close_position(coin: str, reason: str = "") -> bool:
     return False
 
 
+def _cancel_coin_sl(coin: str) -> int:
+    """Cancel all open reduce-only (SL/TP) orders for a coin. Returns count cancelled.
+
+    hl.info() does NOT exist — the breakeven lock and trail used it guarded by
+    hasattr(), so they silently cancelled NOTHING and stacked stale SLs until the
+    total reduce-only size exceeded the position and new SLs got rejected
+    ("returned no oid"). get_open_orders() is the real method.
+    """
+    cu = coin.upper()
+    cancelled = 0
+    try:
+        _orders = hl.get_open_orders() if hasattr(hl, "get_open_orders") else []
+        for _oo in (_orders or []):
+            if (_oo.get("coin", "") or "").upper() != cu:
+                continue
+            if _oo.get("reduceOnly"):
+                try:
+                    hl.cancel(coin, _oo.get("oid", 0))
+                    cancelled += 1
+                except Exception:
+                    pass
+    except Exception as e:
+        log.warning(f"  ⚠️ {coin}: cancel SL orders failed: {e}")
+    return cancelled
+
+
 def _replace_trailing_sl(coin: str, side: str, size: float, new_stop: float, reason: str = "") -> bool:
     """Cancel the existing exchange SL and place a new trailing SL at new_stop.
 
@@ -393,15 +419,8 @@ def _replace_trailing_sl(coin: str, side: str, size: float, new_stop: float, rea
     """
     cu = coin.upper()
     try:
-        # Cancel any existing SL/stop orders for this coin (breakeven-lock SL included).
-        _open_orders = hl.info(coin).get("open_orders", []) if hasattr(hl, "info") else []
-        for _oo in _open_orders or []:
-            _t = str(_oo.get("type", "") or _oo.get("orderType", "")).lower()
-            if "stop" in _t or "sl" in _t:
-                try:
-                    hl.cancel(coin, _oo.get("oid", 0))
-                except Exception:
-                    pass
+        # Cancel existing SL/stop orders for this coin (breakeven-lock SL included).
+        _cancel_coin_sl(coin)
         if size <= 0 or new_stop <= 0:
             return False
         _px_dec = max(0, int(5 - abs(math.log10(max(new_stop, 0.0001)))))
@@ -2119,14 +2138,8 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                         _be_locked = True
                         setattr(_monitor_positions, _be_key, True)
                         try:
-                            # Cancel existing exchange SL order(s)
-                            _open_orders = hl.info(coin).get("open_orders", []) if hasattr(hl, 'info') else []
-                            for _oo in _open_orders:
-                                if _oo.get("type") == "stop":
-                                    try:
-                                        hl.cancel(coin, _oo.get("oid", 0))
-                                    except Exception:
-                                        pass
+                            # Cancel existing exchange SL order(s) — hl.info() doesn't exist; use get_open_orders
+                            _cancel_coin_sl(coin)
                             # Place breakeven stop at entry price
                             from hyperliquid_execution import round_price
                             import math as _math
@@ -3358,21 +3371,21 @@ def run(dry_run: bool = False):
                     pos_sz = abs(szi)
                     # Stop loss
                     sl_result = hl.trigger_order(coin, not is_long, pos_sz, sl_price, "sl", True, True)
-                    sl_oid = _extract_oid(sl_result, "sl") if '_extract_oid' in dir() else 0
+                    sl_oid = _extract_oid(sl_result) if '_extract_oid' in dir() else 0
                     # Take profits (skipped when winners-run-forever)
                     tp_oids = []
                     if _TAKE_PROFIT_ENABLED:
                         for tp in position_tps[coin.upper()]:
                             tp_sz = pos_sz * tp["fraction"]
                             tp_result = hl.trigger_order(coin, not is_long, tp_sz, tp["price"], "tp", True, True)
-                            tp_oid = _extract_oid(tp_result, "tp") if '_extract_oid' in dir() else 0
+                            tp_oid = _extract_oid(tp_result) if '_extract_oid' in dir() else 0
                             if tp_oid:
                                 tp_oids.append(tp_oid)
                     # Track orders
                     from action_executor import _track_order
                     _track_order(coin, {
                         "sl_oid": sl_oid, "tp_oids": tp_oids,
-                        "stop_loss": sl_price, "tp_levels": position_tps[coin.upper()],
+                        "stop_loss": sl_price, "tp_levels": position_tps.get(coin.upper(), []),
                         "size": pos_sz, "side": "LONG" if is_long else "SHORT",
                         "placed_at": time.time(),
                     })
