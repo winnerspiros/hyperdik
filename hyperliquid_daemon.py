@@ -408,7 +408,8 @@ def _replace_trailing_sl(coin: str, side: str, size: float, new_stop: float, rea
         sl_px = round_price(_px_dec, new_stop, is_buy=(side == "SHORT"))
         _res = hl.trigger_order(coin, (side == "SHORT"), size, sl_px,
                                 order_type="sl", is_market=True, reduce_only=True)
-        _new_oid = _res.get("oid", 0) if isinstance(_res, dict) else 0
+        # SDK nests oid under response.data.statuses[0].{filled|resting}.oid — use the proper extractor.
+        _new_oid = _extract_oid(_res) if '_extract_oid' in dir() else (_res.get("oid", 0) if isinstance(_res, dict) else 0)
         if not _new_oid:
             log.warning(f"  ⚠️ {coin}: trailing SL replace returned no oid ({reason})")
             return False
