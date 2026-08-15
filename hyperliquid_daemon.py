@@ -1947,6 +1947,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
         _monitor_positions._last_mids = {}     # {coin: mid} for flash crash detection
         _monitor_positions._last_equity = 0.0
         _monitor_positions._last_equity_ts = 0.0  # timestamp to guard against stale baselines
+        _monitor_positions._prev_equity = 0.0  # equity from TWO cycles ago (spike detection)
     _monitor_positions._call_count += 1
     if _monitor_positions._call_count == 1:
         log.info(f"🔧 MONITOR V3.1 ACTIVE — positions={len(positions)} mids={len(mids)}")
@@ -1960,20 +1961,32 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
     # The margin-return from a closed position looks like a crash — don't false-alarm.
     last_mids = _monitor_positions._last_mids
     last_eq = _monitor_positions._last_equity
+    prev_eq = _monitor_positions._prev_equity
     last_coins = getattr(_monitor_positions, '_last_active_coins', set())
     current_coins = {p.get("coin", "").upper() for p in positions if abs(float(p.get("szi", 0))) > 0.0001}
 
     if last_eq > 0 and total_eq > 0 and _monitor_positions._call_count > 3:  # Only after warmup
         eq_drop = (last_eq - total_eq) / last_eq * 100
         coins_changed = last_coins != current_coins
+        # ── SPIKE-SUPPRESSION GUARD ──
+        # unified-mode margin transitions make equity TRANSIENTLY SPIKE ~2x: on a
+        # position open (manual or bot), the account briefly reports spot (not yet
+        # debited) + new position value together, then settles back. If we recorded
+        # that spike as the baseline, the next cycle's settle looks like a crash.
+        # Signature of the artifact: equity jumped UP >15% last cycle, now drops back.
+        # A real crash never spikes UP first. If prev_eq->last_eq was an up-spike,
+        # treat the current drop as normalization, NOT a crash.
+        up_spike_last_cycle = (prev_eq > 0 and last_eq > prev_eq * 1.15)
         # ── Staleness guard: skip crash check if last equity snapshot is >30s old ──
         # Slow cycles (150s+) block the main loop. When the monitor finally fires,
         # _last_equity is stale — a normal gradual decline looks like a crash.
         last_ts = getattr(_monitor_positions, '_last_equity_ts', 0.0)
         stale_baseline = (time.time() - last_ts) > 30
+        if up_spike_last_cycle:
+            log.info(f"  ⏫ equity spike last cycle (${prev_eq:.2f}→${last_eq:.2f}) — settling back to ${total_eq:.2f} is NOT a crash")
         if stale_baseline and len(active) > 0:
             log.debug(f"  ⏱️  Flash crash check skipped — baseline {time.time()-last_ts:.0f}s stale (slow cycle)")
-        if eq_drop > 15 and len(active) > 0 and not coins_changed and last_coins and not stale_baseline:
+        if eq_drop > 15 and len(active) > 0 and not coins_changed and last_coins and not stale_baseline and not up_spike_last_cycle:
             log.error(f"  🚨 FLASH CRASH: equity dropped {eq_drop:.1f}% in one cycle "
                      f"(${last_eq:.2f} → ${total_eq:.2f}) — coin set unchanged — EMERGENCY CLOSE ALL")
             for p in positions:
@@ -2019,6 +2032,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
             log.error(f"  🚨 Emergency close {coin} failed: {_e}")
 
     _monitor_positions._last_mids = dict(mids)
+    _monitor_positions._prev_equity = _monitor_positions._last_equity  # roll: current _last -> _prev
     _monitor_positions._last_equity = total_eq
     _monitor_positions._last_equity_ts = time.time()
     _monitor_positions._last_active_coins = current_coins
