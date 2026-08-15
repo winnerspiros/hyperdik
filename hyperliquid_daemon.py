@@ -341,6 +341,7 @@ _MIN_HOLD_BYPASS_REASONS = {
     "stop_loss", "liquidation", "liq", "adl", "unstuck",
     "ai_loss_eval:execute_now", "ai_exit",
     "critical", "emergency", "rule_exit", "peak_rollover_safety",
+    "tight-trail-hit",  # trailing stop hit — protective exit, must fire immediately
 }
 
 def _net_pnl_pct(gross_pnl_pct: float, leverage: int = BASE_LEVERAGE) -> float:
