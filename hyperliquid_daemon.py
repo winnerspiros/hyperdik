@@ -1396,6 +1396,46 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
             log.warning(f"  🚫 {coin}: FADE — no limit level; skipping ({_chase['detail']})")
             return False
 
+        # ── RANGE-POSITION GUARD (Aug 15): refuse market buy near top, market sell near bottom ──
+        # FIL bought at 88% of 1h range → the Aug 11 rule (long at resistance → dip expected →
+        # limit BELOW market) was never wired into the entry gate. The chase guard measures
+        # candle-to-candle moves, not range position, so a coin that grinds slowly to the top
+        # passes the chase check but enters 4% from the 1h high. Now: when LONG and price is
+        # in the top 20% of the 1h range (>80th percentile), force a patient limit at the
+        # swing low. SHORT near the bottom (<20th percentile) → limit at the swing high.
+        # If no swing level is close enough, skip entirely rather than market-chase.
+        try:
+            _rp_ext = get_extremes(coin, mids)
+            _rp = getattr(_rp_ext, 'range_pos_1h', 50) if _rp_ext else 50
+            if (is_buy and _rp > 80) or (not is_buy and _rp < 20):
+                _desc = f"{'TOP' if is_buy else 'BOTTOM'} of 1h range ({_rp:.0f}%)"
+                log.warning(f"  🚫 {coin}: {_desc} — {'dip expected' if is_buy else 'bounce expected'} (Aug 11 rule), "
+                           f"refusing market {'buy' if is_buy else 'sell'}")
+                # Try patient limit at the swing level as a last resort
+                _ss_px = _patient_limit_price(coin, is_buy, entry_zone, mids)
+                if _ss_px > 0:
+                    _ss_px = round_price(px_dec, _ss_px, is_buy=is_buy)
+                    _ss_dist = abs(px - _ss_px) / px * 100
+                    log.info(f"  🎯 {coin}: patient limit ${_ss_px:.4f} ({_ss_dist:.1f}% "
+                            f"{'below' if is_buy else 'above'}) — {_desc}")
+                    result = hl.order(coin, is_buy, sz, _ss_px, order_type="gtc")
+                    if isinstance(result, dict) and result.get("status") == "err":
+                        log.warning(f"  {coin}: range-block limit rejected — skip")
+                        return False
+                    _oid = _extract_oid(result)
+                    if _oid:
+                        _PENDING_ZONE[coin.upper()] = {
+                            "oid": _oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
+                            "stop_price": stop_price, "tp_levels": tp_levels, "reason": reason,
+                            "leverage": leverage, "placed_at": time.time(),
+                            "timeout_s": 120, "label": "range_position",
+                        }
+                        log.info(f"  📝 {coin}: range-position limit oid={_oid} queued (120s)")
+                        return True
+                return False  # No swing level → skip entirely, don't chase
+        except Exception:
+            pass  # Best-effort guard — if extremes fetch fails, allow market entry
+
         # Market entry — micro-peak timing. Catches the move NOW (only when not fading).
         _mp_px = _micro_peak_entry_wait(coin, is_buy, px)
         if _mp_px != px:
@@ -1933,7 +1973,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
         stale_baseline = (time.time() - last_ts) > 30
         if stale_baseline and len(active) > 0:
             log.debug(f"  ⏱️  Flash crash check skipped — baseline {time.time()-last_ts:.0f}s stale (slow cycle)")
-        if eq_drop > 10 and len(active) > 0 and not coins_changed and last_coins and not stale_baseline:
+        if eq_drop > 15 and len(active) > 0 and not coins_changed and last_coins and not stale_baseline:
             log.error(f"  🚨 FLASH CRASH: equity dropped {eq_drop:.1f}% in one cycle "
                      f"(${last_eq:.2f} → ${total_eq:.2f}) — coin set unchanged — EMERGENCY CLOSE ALL")
             for p in positions:
@@ -3396,12 +3436,19 @@ def _fast_monitor_cycle(main_wallet: str) -> None:
                 setattr(_monitor_positions, _mc_key, None)
 
         if active:
-            # Compute equity for monitor — use spot_free + margin_used (STABLE, excludes unrealized PnL)
-            # total_equity includes unrealized PnL → fluctuates wildly → false flash crash triggers
-            # spot_free + margin_used only changes on real PnL events (close/liquidate/fees)
+            # ── FLASH CRASH EQUITY: use total_equity directly ──
+            # spot_free + margin_used DOUBLE-COUNTS in unified mode during margin
+            # transitions: when a position opens, spot_free still reports the pre-lock
+            # balance while margin_used already shows the new margin, producing a phantom
+            # 2× spike (e.g. $9.60+$9.58=$19.18 on a $9.54 account). The flash crash
+            # detector saw a fake 50% drop and emergency-closed every position on open.
+            # total_equity is Hyperliquid's own unified-mode figure — it handles the
+            # spot↔margin transition correctly and never double-counts.
+            # Unrealized-PnL noise in total_equity is a few % at worst (not 50%), so a
+            # 15% flash-crash threshold is safe against PnL swings but catches real crashes.
             try:
                 acc = hl.get_account()
-                monitor_eq = acc.get("spot_free", 0) + acc.get("margin_used", 0)
+                monitor_eq = acc.get("total_equity", acc.get("spot_free", 0) + acc.get("margin_used", 0))
             except Exception:
                 monitor_eq = _last_total_eq  # fallback (skip flash crash if no cycle equity yet)
             # ── Open order verification (every cycle, NautilusTrader pattern) ──
