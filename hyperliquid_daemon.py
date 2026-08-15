@@ -2094,8 +2094,8 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
         _now_ts = time.time()
         entry_ts = _position_entry_times.get(cu, 0)
         if _monitor_positions._call_count <= 20:
-            log.info(f"  🔍 {cu} eval-state: age={_now_ts-entry_ts:.0f}s call=#{_monitor_positions._call_count} entry_ts={entry_ts:.0f} eligible={_now_ts-entry_ts > 15}")
-        if _now_ts - entry_ts > 15:  # 15s warmup (was 60s — delayed exits too long)
+            log.info(f"  🔍 {cu} eval-state: age={_now_ts-entry_ts:.0f}s call=#{_monitor_positions._call_count} entry_ts={entry_ts:.0f} eligible={_now_ts-entry_ts > 60}")
+        if _now_ts - entry_ts > 60:  # 60s warmup — exit close is gated by _can_close_position (600s MIN_HOLD), warmup only gates breakeven lock + HWM tracking
             _last_eval = getattr(_monitor_positions, _eval_key, 0) if hasattr(_monitor_positions, _eval_key) else 0
             if _now_ts - _last_eval > 30:
                 try:
@@ -2339,6 +2339,10 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                         setattr(_monitor_positions, _ever_green_key, True)
 
                     if _net_pnl_mon < 0 and not exit_reason:
+                        # ── ATR-scaled noise floor: BLEED threshold = max(1.0%, 5m ATR) ──
+                        _bleed_floor = _calc_atr_pct(coin, _TRAIL_ATR_TF, 14)
+                        if _bleed_floor <= 0 or _bleed_floor < 1.0:
+                            _bleed_floor = 1.0  # floor: never kill on <1% noise (0.3% was a single tick)
                         # Check broader trend using extremes (already fetched, no API call)
                         _pct_1h = ext.pct_1h if ext else 0   # % above 1h low
                         _pct_4h = ext.pct_4h if ext else 0   # % above 4h low
@@ -2367,8 +2371,15 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                         if _trend_kill and _net_pnl_mon < -0.15:
                             # Minimum loss 0.15% — don't kill flat positions (S coin: killed at -0.01%)
                             exit_reason = f"TREND-KILL: {side} wrong — {_kill_metric}, net={_net_pnl_mon:+.2f}%"
-                        elif drop_from_peak_pct > 0.3 and (mom1 * (-1 if side == "SHORT" else 1)) < -0.1:
-                            # Bleeding: peak was better, now dropping, mom going the wrong way
+                        elif drop_from_peak_pct > _bleed_floor and mom1 < -0.1:
+                            # Bleeding: price has moved >1 ATR off its best point AND momentum is
+                            # turning against us. mom1 is already direction-normalized above (line 2114:
+                            # positive = in our favor for BOTH sides), so a bare `mom1 < -0.1` means
+                            # "momentum against" regardless of LONG/SHORT. The old `mom1 * (-1 if SHORT)`
+                            # double-inverted SHORTs and fired on FAVORABLE momentum (killed shorts
+                            # the instant they started working). Threshold was a flat 0.3% = one tick
+                            # of noise; now ATR(5m)-scaled with a 1.0% floor so a real adverse move
+                            # is required before a bleed kill can fire.
                             exit_reason = f"BLEED: down {drop_from_peak_pct:.2f}% from peak, mom turning against, net={_net_pnl_mon:+.2f}%"
                         elif not _ever_green and _hold_age_mon > 300 and _net_pnl_mon < -0.55:
                             # -0.55% = fee (-0.42%) + actual adverse move (-0.13%). Below this, trade is truly losing.
@@ -2446,6 +2457,13 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
 
                     if exit_reason:
                         log.warning(f"  💀 {coin}: {exit_reason}")
+                        # ── MIN HOLD GUARD: non-emergency exits must respect MIN_HOLD_SECONDS ──
+                        # BLEED / TREND-KILL / NEVER-GREEN all reached here directly and called
+                        # hl.market_close() with NO min-hold check → positions opened and closed
+                        # within 15-25s on single-tick noise (Aug 15: CHIP -19s, AR -22s, MEGA -20s).
+                        # Life-or-death reasons (liquidation, stop_loss, emergency) still bypass.
+                        if not _can_close_position(coin, exit_reason):
+                            continue
                         try:
                             # ── Record trade for evolution BEFORE closing ──
                             try:
