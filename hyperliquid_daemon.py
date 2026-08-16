@@ -304,6 +304,7 @@ _forager_skip_cooldown: dict[str, float] = {}  # coin → timestamp, 10-min fora
 _global_pause_until: float = 0.0  # Don't open ANY position until this timestamp
 _ai_trade_plan: dict[str, dict] = {}  # coin → {direction, confidence, target_pct, stop_pct, hold_min}
 _PENDING_ZONE: dict[str, dict] = {}  # coin → {oid, is_buy, size_usd, ...} non-blocking zone orders
+_last_trade_time: float = time.time()  # updated on open/close; drives starvation bypass (30+ min idle → relax gates)
 
 # ── STOP-LOSS COOLING ──
 _last_stop_loss_at: dict[str, float] = {}  # coin → timestamp
@@ -440,6 +441,44 @@ def _replace_trailing_sl(coin: str, side: str, size: float, new_stop: float, rea
     except Exception as e:
         log.warning(f"  ⚠️ {coin}: trailing SL replace failed ({reason}): {type(e).__name__}: {e}")
         return False
+
+
+def _safe_close(coin: str) -> bool:
+    """Close position and VERIFY it actually flattened. Retries once on failure.
+    
+    SYRUP bug: market_close() returned success but position stayed open NAKED for 45min.
+    This wrapper verifies the position is actually flat after close, retries once,
+    and logs CRITICAL if it can't close (so we know the position is naked).
+    
+    Returns True if position successfully flattened, False if still open.
+    """
+    cu = coin.upper()
+    for attempt in range(2):
+        try:
+            hl.market_close(coin)
+            time.sleep(2.0)  # Give exchange time to process
+            state = hl.get_user_state()
+            for p in state.get("assetPositions", []):
+                pos_coin = p.get("position", {}).get("coin", "").upper()
+                if pos_coin == cu and abs(float(p["position"].get("szi", 0))) > 0.0001:
+                    if attempt == 0:
+                        log.warning(f"  ⚠️ {coin}: market_close returned ok but position STILL OPEN — retrying")
+                        continue
+                    else:
+                        log.error(f"  🚨 {coin}: CRITICAL — position STILL OPEN after 2 close attempts! NAKED!")
+                        return False
+            # Position is flat — verified
+            if attempt > 0:
+                log.info(f"  ✓ {coin}: position closed on retry (verified flat)")
+            return True
+        except Exception as e:
+            if attempt == 0:
+                log.warning(f"  ⚠️ {coin}: market_close failed ({e}) — retrying")
+                time.sleep(2.0)
+                continue
+            log.error(f"  🚨 {coin}: CRITICAL — market_close failed after 2 attempts: {e}")
+            return False
+    return False
 
 def _record_entry_time(coin: str, entry_time: float | None = None):
     """Record that a position was just entered for this coin."""
@@ -1265,6 +1304,18 @@ def _place_retry_tpsl(coin: str, is_buy: bool, size_usd: float,
         _log_price = abs(math.log10(max(px, 0.0001)))
         px_dec = max(0, int(5 - _log_price))
         sz = round_size(sz_dec, size_usd / px)
+        # ── Cancel any existing SL first (KAS bug: naked-detector SL + this SL stacked,
+        #    and Hyperliquid rejects/ignores the 2nd reduce-only → no real protection) ──
+        try:
+            _cancel_coin_sl(coin)
+        except Exception:
+            pass
+        # ── Sanity-check the stop is on the CORRECT side of the current price ──
+        # KAS: stop_price was the limit/entry price ($0.0260) instead of a real stop
+        # below entry → a LONG with SL at entry triggers instantly and protects nothing.
+        if (is_buy and stop_price >= px) or (not is_buy and stop_price <= px):
+            log.warning(f"  ⚠️ {coin}: stop_price ${stop_price:.5f} is on the WRONG side of mid ${px:.5f} — recomputing 1.5% stop")
+            stop_price = px * (1 - 0.015) if is_buy else px * (1 + 0.015)
         sl_px = round_price(px_dec, stop_price, is_buy=is_buy)
         hl.trigger_order(coin, not is_buy, sz, sl_px, order_type="sl", is_market=True, reduce_only=True)
         if _TAKE_PROFIT_ENABLED:
@@ -1416,6 +1467,13 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
                 if _ss_px > 0:
                     _ss_px = round_price(px_dec, _ss_px, is_buy=is_buy)
                     _ss_dist = abs(px - _ss_px) / px * 100
+                    # ── KAS lesson: a "swing low" only 0.6% away is NOT a dip — it's the
+                    # top of a tight range. Sitting a limit there buys the falling knife
+                    # (KAS filled and liquidated 16s later). Require the limit to sit a
+                    # MEANINGFUL distance away (≥2%) or skip entirely — don't chase. ──
+                    if _ss_dist < 2.0:
+                        log.warning(f"  🚫 {coin}: range-block limit too close ({_ss_dist:.1f}% {'below' if is_buy else 'above'}) — not a real dip/bounce, skipping")
+                        return False
                     log.info(f"  🎯 {coin}: patient limit ${_ss_px:.4f} ({_ss_dist:.1f}% "
                             f"{'below' if is_buy else 'above'}) — {_desc}")
                     result = hl.order(coin, is_buy, sz, _ss_px, order_type="gtc")
@@ -1522,11 +1580,11 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
             if not tp_sl_placed:
                 # ALL retries failed — CLOSE the position, never leave it naked
                 log.error(f"  🚨 DIRECT OPEN {coin}: closing position — TP/SL could not be placed after 3 attempts (errors: {tp_sl_errors})")
-                try:
-                    hl.market_close(coin)
+                _closed_ok = _safe_close(coin)
+                if _closed_ok:
                     log.error(f"  🚨 DIRECT OPEN {coin}: position CLOSED — no SL protection possible")
-                except Exception as close_err:
-                    log.error(f"  🚨 DIRECT OPEN {coin}: CRITICAL — position OPEN but NAKED (close also failed: {close_err})")
+                else:
+                    log.error(f"  🚨 DIRECT OPEN {coin}: CRITICAL — position OPEN but NAKED (close verified failed)")
                 return False  # Don't proceed — position was closed or is dangerously naked
         elif stop_price and stop_price > 0 and (not tp_levels or not _TAKE_PROFIT_ENABLED):
             # Has stop but no TP levels (or TP disabled) — place SL only, let winners run
@@ -1556,11 +1614,11 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
                         time.sleep(3)
                     else:
                         log.error(f"  🚨 DIRECT OPEN {coin}: SL placement failed — closing position")
-                        try:
-                            hl.market_close(coin)
+                        _closed_ok = _safe_close(coin)
+                        if _closed_ok:
                             log.error(f"  🚨 DIRECT OPEN {coin}: position CLOSED — no SL protection possible")
-                        except Exception as close_err:
-                            log.error(f"  🚨 DIRECT OPEN {coin}: CRITICAL — position OPEN but NAKED (close also failed: {close_err})")
+                        else:
+                            log.error(f"  🚨 DIRECT OPEN {coin}: CRITICAL — position OPEN but NAKED (close verified failed)")
                         return False
 
         # Record trade for self-learning (entry tracked when position monitor detects it)
@@ -1927,10 +1985,12 @@ def _verify_open_orders(positions: list, mids: dict):
             
             log.warning(f"  ⚠️ NAKED {coin}: no open orders — re-placing SL (winners run, no TP)")
             try:
-                sl_px = round_price(2, sl_price, is_buy=not is_long)
+                _sz_dec = hl._get_sz_decimals(coin)
+                _px_dec = max(0, int(5 - abs(math.log10(max(mid, 0.0001)))))
+                sl_px = round_price(_px_dec, sl_price, is_buy=not is_long)
                 hl.trigger_order(coin, not is_long, szi, sl_px, order_type="sl", is_market=True, reduce_only=True)
                 if _TAKE_PROFIT_ENABLED:
-                    tp_px = round_price(2, entry * tp1_pct, is_buy=not is_long)
+                    tp_px = round_price(_px_dec, entry * tp1_pct, is_buy=not is_long)
                     hl.order(coin, not is_long, szi * 0.5, tp_px, order_type="gtc", reduce_only=True)
                 log.info(f"  ✅ {coin}: SL re-placed — SL=${sl_px:.4f}" + (f" TP=${tp_px:.4f}" if _TAKE_PROFIT_ENABLED else " (no TP — let it run)"))
             except Exception as e:
@@ -1940,6 +2000,7 @@ def _verify_open_orders(positions: list, mids: dict):
 
 def _monitor_positions(positions: list, mids: dict, total_eq: float, active: list):
     """Check positions for exit conditions, trail stops, and unstuck."""
+    global _last_trade_time  # starvation bypass tracker (updated on open/close)
     pred_checked = 0
     # Heartbeat: count every 10th call
     if not hasattr(_monitor_positions, "_call_count"):
@@ -2066,6 +2127,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
         cu = coin.upper()
         if cu not in _position_entry_times:
             _position_entry_times[cu] = time.time()  # Best estimate — was opened recently
+            _last_trade_time = time.time()  # starvation tracker
 
         side = "LONG" if szi > 0 else "SHORT"
         pnl_pct = ((mid - entry) / entry * 100) * (1 if szi > 0 else -1)
@@ -3322,6 +3384,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
     stale = [c for c in _position_entry_times if c not in active_coins]
     for c in stale:
         del _position_entry_times[c]
+        _last_trade_time = time.time()  # starvation tracker: position was closed
         # Clean up peak-lock tier flag so re-entry on same coin gets fresh protection
         for _clean_key in [f"_peak_locked:{c}", f"_peak_lock_tier:{c}", f"_soft_strikes:{c}",
                            f"_mc_peak:{c}", f"_mc_entry_ts:{c}", f"_tip_start:{c}"]:
@@ -4770,40 +4833,53 @@ def run(dry_run: bool = False):
                     _bull_aligned = _bull_market and ai_dir_raw == "long"
                     _min_composite = 0.05 if _bull_aligned else (0.08 if ai_dir_raw == "short" else 0.12)
                     if ai_conf_val >= 80 and block_reason:
-                        # ── UN-OVERRIDABLE GATES: VWAP extremes, S/R levels, data consensus — no AI bypass ──
-                        # Aug 14: S/R added — shorting near support / longing near resistance are
-                        # chart-level bounces. The user's own rule: "short at support → bounce expected".
-                        # AI cannot override S/R any more than it can override ML contradiction.
-                        _cannot_override = ("VWAP:+" in block_reason and "overbought" in block_reason) or \
-                                          ("VWAP:-" in block_reason and "oversold" in block_reason) or \
-                                          ("all data layers dead" in block_reason) or \
-                                          ("S/R:" in block_reason) or \
-                                          ("COMPOSITE CONTRADICTION" in block_reason)  # comp sign contradicts direction — data conflict, no AI bypass
-                        if _cannot_override:
-                            log.info(f"  🛑 {coin}: UN-OVERRIDABLE — {block_reason} (AI={ai_conf_val}% cannot bypass this gate)")
-                        elif _ml_hard_block:
-                            # ACE lesson: AI=90% BUY with ML=DOWN@65% was blocked and the coin pumped
-                            # 200%. ATOM lesson: AI=85% SHORT with ML=UP@41% overrode and lost money.
-                            # The cut: AI >= 90% can override ML contradiction (trust very-high-conf AI);
-                            # AI < 90% cannot (data beats Flash Lite at normal confidence levels).
-                            if ai_conf_val >= 90:
-                                log.info(f"  ⚡ {coin}: AI OVERRIDE ML — AI={ai_conf_val}% >= 90% overrides ML contradiction ({ml_pred.direction}@{ml_pred.confidence:.0f}%)")
-                                block_reason = None
-                            else:
-                                log.info(f"  🛑 {coin}: ML HARD BLOCK — ML strongly contradicts ({ml_pred.direction}@{ml_pred.confidence:.0f}%), AI={ai_conf_val}% < 90% cannot override (data beats Flash Lite)")
-                        elif "COMPOSITE FLOOR" in block_reason:
-                            # ACE lesson: AI=90% BUY, comp=+0.06 (weak but correct) → pumped 200%.
-                            # MORPHO lesson: AI=85% SELL, comp=-0.04 (weak, wrong) → bled 0.12 over 52min.
-                            if ai_conf_val >= 90:
-                                log.info(f"  ⚡ {coin}: AI OVERRIDE COMP FLOOR — AI={ai_conf_val}% >= 90% overrides comp floor ({sig.composite_score:+.2f})")
-                                block_reason = None
-                            else:
-                                log.info(f"  🛑 {coin}: COMPOSITE FLOOR — |comp|={abs(sig.composite_score):.2f} < 0.10, AI={ai_conf_val}% < 90% cannot override")
-                        elif abs(sig.composite_score) < _min_composite:
-                            log.info(f"  🛑 {coin}: AI override blocked — composite too weak ({sig.composite_score:+.2f}) for gate override{', bull market' if _bull_market else ''}: {block_reason}")
-                        else:
-                            log.info(f"  🧠 {coin}: AI confidence {ai_conf_val}% — overriding gate{' (bull market accel)' if _bull_aligned else ''}: {block_reason}")
+                        # ── STARVATION BYPASS (Aug 16): 30+ min idle → AI trumps exhaustion gates ──
+                        # User directive: "catch momentum pumps — gates blocking strong AI signals are
+                        # the enemy" + "AI trumps exhaustion gates at >=85% conf + comp >=0.15"
+                        _last_trade_age = time.time() - _last_trade_time
+                        _starved = _last_trade_age > 1800
+                        _starvation_ready = _starved and ai_conf_val >= 85 and abs(sig.composite_score) >= 0.15
+                        if _starvation_ready and "COMPOSITE CONTRADICTION" not in block_reason:
+                            # STARVED: AI trumps exhaustion gates at >=85% conf + |comp|>=0.15
+                            # Composite contradiction (sign mismatch = data literally says opposite) stays hard
+                            log.info(f"  🍽️  {coin}: STARVATION BYPASS ({_last_trade_age:.0f}s idle) — AI={ai_conf_val}% comp={sig.composite_score:+.2f} overrides: {block_reason}")
                             block_reason = None
+                        else:
+                            # ── UN-OVERRIDABLE GATES: VWAP extremes, S/R levels, data consensus — no AI bypass ──
+                            # Aug 14: S/R added — shorting near support / longing near resistance are
+                            # chart-level bounces. The user's own rule: "short at support → bounce expected".
+                            # AI cannot override S/R any more than it can override ML contradiction.
+                            _cannot_override = ("VWAP:+" in block_reason and "overbought" in block_reason) or \
+                                              ("VWAP:-" in block_reason and "oversold" in block_reason) or \
+                                              ("all data layers dead" in block_reason) or \
+                                              ("S/R:" in block_reason) or \
+                                              ("COMPOSITE CONTRADICTION" in block_reason)  # comp sign contradicts direction — data conflict, no AI bypass
+                            if _cannot_override:
+                                log.info(f"  🛑 {coin}: UN-OVERRIDABLE — {block_reason} (AI={ai_conf_val}% cannot bypass this gate)" +
+                                        (f" — starved but {'comp too weak' if _starved and not _starvation_ready else 'composite contradiction'}" if _starved else ""))
+                            elif _ml_hard_block:
+                                # ACE lesson: AI=90% BUY with ML=DOWN@65% was blocked and the coin pumped
+                                # 200%. ATOM lesson: AI=85% SHORT with ML=UP@41% overrode and lost money.
+                                # The cut: AI >= 90% can override ML contradiction (trust very-high-conf AI);
+                                # AI < 90% cannot (data beats Flash Lite at normal confidence levels).
+                                if ai_conf_val >= 90:
+                                    log.info(f"  ⚡ {coin}: AI OVERRIDE ML — AI={ai_conf_val}% >= 90% overrides ML contradiction ({ml_pred.direction}@{ml_pred.confidence:.0f}%)")
+                                    block_reason = None
+                                else:
+                                    log.info(f"  🛑 {coin}: ML HARD BLOCK — ML strongly contradicts ({ml_pred.direction}@{ml_pred.confidence:.0f}%), AI={ai_conf_val}% < 90% cannot override (data beats Flash Lite)")
+                            elif "COMPOSITE FLOOR" in block_reason:
+                                # ACE lesson: AI=90% BUY, comp=+0.06 (weak but correct) → pumped 200%.
+                                # MORPHO lesson: AI=85% SELL, comp=-0.04 (weak, wrong) → bled 0.12 over 52min.
+                                if ai_conf_val >= 90:
+                                    log.info(f"  ⚡ {coin}: AI OVERRIDE COMP FLOOR — AI={ai_conf_val}% >= 90% overrides comp floor ({sig.composite_score:+.2f})")
+                                    block_reason = None
+                                else:
+                                    log.info(f"  🛑 {coin}: COMPOSITE FLOOR — |comp|={abs(sig.composite_score):.2f} < 0.10, AI={ai_conf_val}% < 90% cannot override")
+                            elif abs(sig.composite_score) < _min_composite:
+                                log.info(f"  🛑 {coin}: AI override blocked — composite too weak ({sig.composite_score:+.2f}) for gate override{', bull market' if _bull_market else ''}: {block_reason}")
+                            else:
+                                log.info(f"  🧠 {coin}: AI confidence {ai_conf_val}% — overriding gate{' (bull market accel)' if _bull_aligned else ''}: {block_reason}")
+                                block_reason = None
                     elif block_reason and ai_conf_val > 0:
                         log.info(f"  🧠 {coin}: AI conf {ai_conf_val}% too low for override (need 80%)")
 
