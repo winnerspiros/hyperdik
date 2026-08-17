@@ -334,6 +334,43 @@ MAX_TRADE_RISK_PCT = 2.0  # Max 2% of total equity at risk per trade (at stop lo
 _MAX_SKIP_RISK_OVER: set[str] = set()  # Coins temporarily blocked for excessive risk
 _position_entry_times: dict[str, float] = {}  # coin.upper() → epoch timestamp of entry
 
+# ── BOT-OWNED POSITIONS (Aug 17) ──
+# Only manage positions the bot itself opened. Manual trades on the same wallet
+# must be left 100% alone (no SL tampering, no breakeven lock, no scale-out, no
+# force-close). Persisted so a daemon restart resumes managing OUR positions
+# without re-adopting a manual one the user opened while we were down.
+_BOT_OWNED: set[str] = set()  # coin.upper() for positions the bot opened this session
+_BOT_OWNED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "bot_owned.json")
+
+
+def _load_bot_owned() -> set[str]:
+    try:
+        with open(_BOT_OWNED_FILE) as _f:
+            return {str(c).upper() for c in json.load(_f) if str(c).strip()}
+    except Exception:
+        return set()
+
+
+def _save_bot_owned() -> None:
+    try:
+        os.makedirs(os.path.dirname(_BOT_OWNED_FILE), exist_ok=True)
+        with open(_BOT_OWNED_FILE, "w") as _f:
+            json.dump(sorted(_BOT_OWNED), _f)
+    except Exception:
+        pass
+
+
+def _mark_bot_owned(coin: str) -> None:
+    _BOT_OWNED.add(coin.upper())
+    _save_bot_owned()
+
+
+def _unmark_bot_owned(coin: str) -> None:
+    cu = coin.upper()
+    if cu in _BOT_OWNED:
+        _BOT_OWNED.discard(cu)
+        _save_bot_owned()
+
 # ── Risk block throttle ──
 _risk_block_throttle: dict[str, float] = {}  # "coin:reason" → last log timestamp
 
@@ -483,10 +520,12 @@ def _safe_close(coin: str) -> bool:
 def _record_entry_time(coin: str, entry_time: float | None = None):
     """Record that a position was just entered for this coin."""
     _position_entry_times[coin.upper()] = entry_time or time.time()
+    _mark_bot_owned(coin)  # Aug 17: only positions we open are ours to manage
 
 def _clear_entry_time(coin: str):
     """Clear entry tracking when position is closed."""
     _position_entry_times.pop(coin.upper(), None)
+    _unmark_bot_owned(coin)  # Aug 17: stop claiming ownership once flat
 
 def register_stop_loss(coin: str) -> None:
     """Register a stop loss hit to trigger cooling period."""
@@ -1520,6 +1559,7 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
             return False
         log.info(f"  ✅ DIRECT OPEN: {coin} {'LONG' if is_buy else 'SHORT'} "
                  f"${size_usd:.2f} @ {leverage}x (oid={oid}) — {reason[:60]}")
+        _record_entry_time(coin)  # Aug 17: mark bot-owned + record entry (no more adopt-unknown)
 
         # Step 3: Place TP/SL bracket orders (if provided)
         # RETRY with exponential backoff on 429 — NEVER leave a position naked
@@ -2104,6 +2144,19 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
         if _monitor_positions._call_count <= 2:
             log.info(f"  🔧 MONITOR processing: {coin} szi={szi:.4f}")
         if abs(szi) < 0.0001:
+            continue
+
+        # ── BOT-OWNED GUARD (Aug 17): never touch a position we didn't open ──
+        # Manual trades on this wallet are the user's — leave them 100% alone.
+        _owned_cu = coin.upper()
+        if _owned_cu not in _BOT_OWNED:
+            _skip_logged = getattr(_monitor_positions, "_manual_skip_logged", None)
+            if _skip_logged is None:
+                _skip_logged = set()
+                setattr(_monitor_positions, "_manual_skip_logged", _skip_logged)
+            if _owned_cu not in _skip_logged:
+                _skip_logged.add(_owned_cu)
+                log.info(f"  🧑 {coin}: NOT bot-owned — manual position, leaving untouched")
             continue
 
         # ── PENDING ZONE ORDER CHECK: did AI's limit fill? ──
@@ -3384,6 +3437,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
     stale = [c for c in _position_entry_times if c not in active_coins]
     for c in stale:
         del _position_entry_times[c]
+        _unmark_bot_owned(c)  # Aug 17: release ownership when exchange TP/SL flattened us
         _last_trade_time = time.time()  # starvation tracker: position was closed
         # Clean up peak-lock tier flag so re-entry on same coin gets fresh protection
         for _clean_key in [f"_peak_locked:{c}", f"_peak_lock_tier:{c}", f"_soft_strikes:{c}",
@@ -3638,12 +3692,19 @@ def run(dry_run: bool = False):
 
     # ── Recover state for existing positions (survives daemon restart) ──
     try:
+        # Aug 17: restore bot-ownership from disk BEFORE adopting positions.
+        # Only re-adopt positions WE opened; manual trades stay untouched.
+        _BOT_OWNED.update(_load_bot_owned())
+        log.info(f"  Bot-owned on startup: {sorted(_BOT_OWNED) or 'none'}")
         state = hl.get_user_state(main_wallet)
         existing = _normalize_positions(state.get("assetPositions", []))
         mids = hl.get_all_mids()
         for p in existing:
             coin = p.get("coin", "")
             if not coin:
+                continue
+            if coin.upper() not in _BOT_OWNED:
+                log.info(f"  🧑 Recovery: skipping {coin} — not bot-owned (manual/external position left untouched)")
                 continue
             entry = float(p.get("entryPx", 0))
             szi = float(p.get("szi", 0))
