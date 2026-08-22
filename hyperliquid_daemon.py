@@ -5734,20 +5734,18 @@ def run(dry_run: bool = False):
                         risk_pct = min(risk_pct, 0.015)
 
                     # ── WEL cap: scale position to fit within per-coin WEL limit ──
-                    # Aug 22: AI 36% at 6x = 216% notional, WEL per-coin = 80% of equity.
-                    # The risk check computes its own notional from risk_pct — not pos_pct.
-                    # Cap risk_pct so the computed notional fits under WEL.
-                    # calculate_position_size: notional ≈ equity * risk_pct / sl_fraction
-                    # Solve: risk_pct_max = max_notional_wel * sl_fraction / equity
+                    # Aug 22: AI 36% at 6x = 216% notional, WEL per-coin = 80%.
+                    # risk_pct feeds into calculate_position_size: notional = equity * risk_pct * vol_scalar / stop_pct
+                    # vol_scalar ∈ [0.5, 1.5], stop_pct >= 1.5% (enforced min_stop_pct).
+                    # Cap risk_pct so worst-case notional (vol_scalar=1.5, stop_pct=1.5%) fits under WEL.
                     max_notional_wel = total_eq * exposure_state.limits.wel_limit * exposure_state.limits.wel_trigger
-                    sl_fraction = abs(entry_price - stop_price) / entry_price if entry_price > 0 else 0.01
-                    if sl_fraction > 0:
-                        risk_pct_wel_cap = max_notional_wel * sl_fraction / total_eq
-                        if risk_pct > risk_pct_wel_cap:
-                            log.info(f"  📏 {coin}: capping risk {risk_pct*100:.1f}% → {risk_pct_wel_cap*100:.1f}% (WEL=${max_notional_wel:.0f} @ {exposure_state.limits.wel_limit*100:.0f}%)")
-                            risk_pct = risk_pct_wel_cap
-                    # Also cap pos_pct for consistency (used in order placement later)
-                    max_notional_wel = total_eq * exposure_state.limits.wel_limit * exposure_state.limits.wel_trigger
+                    min_stop_pct = 0.015  # matches the enforced minimum above
+                    max_vol = 1.5  # worst-case volatility scalar in calculate_position_size
+                    risk_pct_wel_cap = max_notional_wel * min_stop_pct / (total_eq * max_vol)
+                    if risk_pct > risk_pct_wel_cap and risk_pct_wel_cap > 0:
+                        log.info(f"  📏 {coin}: capping risk {risk_pct*100:.1f}% → {risk_pct_wel_cap*100:.1f}% (WEL=${max_notional_wel:.0f} @ 80%, max vol 1.5x)")
+                        risk_pct = risk_pct_wel_cap
+                    # Also cap pos_pct for order placement consistency
                     if notional_planned > max_notional_wel:
                         capped_pos_pct = (max_notional_wel / chosen_leverage) / total_eq
                         pos_pct = min(pos_pct, capped_pos_pct)

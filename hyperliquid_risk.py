@@ -86,7 +86,16 @@ class ExposureLimits:
     @staticmethod
     def for_equity(equity: float) -> "ExposureLimits":
         """Return appropriate limits for account size."""
-        if equity < 50:
+        if equity < 20:
+            # Ultra-micro: exchange min $10 forces 125% WEL at $8 equity.
+            # 180% WEL = room for one $10 order + margin buffer.
+            return ExposureLimits(
+                wel_limit=1.80,          # must exceed exchange min $10 / equity
+                twel_limit=1.80,         # single-position account, same as WEL
+                group_limit=0.80,
+                min_position_usd=5.0,    # exchange min ($10) is the real gate
+            )
+        elif equity < 50:
             return ExposureLimits(
                 wel_limit=0.80,          # 80% per position on micro (6x lev needs room)
                 twel_limit=1.00,         # 100% — full account can be deployed
