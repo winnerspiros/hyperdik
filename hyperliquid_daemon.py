@@ -2095,6 +2095,10 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                 _szi = float(p.get("szi", 0))
                 if abs(_szi) < 0.0001:
                     continue
+                # ── Skip manual positions — user's trades are sacrosanct ──
+                if _coin.upper() not in _BOT_OWNED:
+                    log.warning(f"  🧑 {_coin}: flash crash ALL skip — manual position, not closing")
+                    continue
                 try:
                     _MANUAL_CLOSES[_coin] = time.time()
                     hl.market_close(_coin)
@@ -2125,6 +2129,10 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                      f"(${last_price:.4f} → ${current:.4f}) — emergency close")
 
     for coin in flash_crashed:
+        # ── Skip manual positions — user's trades are sacrosanct ──
+        if coin.upper() not in _BOT_OWNED:
+            log.warning(f"  🧑 {coin}: flash crash (per-coin) skip — manual position, not closing")
+            continue
         try:
             _MANUAL_CLOSES[coin] = time.time()
             hl.market_close(coin)
@@ -5726,14 +5734,23 @@ def run(dry_run: bool = False):
                         risk_pct = min(risk_pct, 0.015)
 
                     # ── WEL cap: scale position to fit within per-coin WEL limit ──
-                    # Aug 22: micro accounts need this — AI sizes 36% at 6x = 216% notional,
-                    # but WEL per-coin limit is 80% of equity. Without scaling, every entry
-                    # is blocked by wel_exceeded. Cap pos_pct so notional fits under WEL.
+                    # Aug 22: AI 36% at 6x = 216% notional, WEL per-coin = 80% of equity.
+                    # The risk check computes its own notional from risk_pct — not pos_pct.
+                    # Cap risk_pct so the computed notional fits under WEL.
+                    # calculate_position_size: notional ≈ equity * risk_pct / sl_fraction
+                    # Solve: risk_pct_max = max_notional_wel * sl_fraction / equity
+                    max_notional_wel = total_eq * exposure_state.limits.wel_limit * exposure_state.limits.wel_trigger
+                    sl_fraction = abs(entry_price - stop_price) / entry_price if entry_price > 0 else 0.01
+                    if sl_fraction > 0:
+                        risk_pct_wel_cap = max_notional_wel * sl_fraction / total_eq
+                        if risk_pct > risk_pct_wel_cap:
+                            log.info(f"  📏 {coin}: capping risk {risk_pct*100:.1f}% → {risk_pct_wel_cap*100:.1f}% (WEL=${max_notional_wel:.0f} @ {exposure_state.limits.wel_limit*100:.0f}%)")
+                            risk_pct = risk_pct_wel_cap
+                    # Also cap pos_pct for consistency (used in order placement later)
                     max_notional_wel = total_eq * exposure_state.limits.wel_limit * exposure_state.limits.wel_trigger
                     if notional_planned > max_notional_wel:
                         capped_pos_pct = (max_notional_wel / chosen_leverage) / total_eq
-                        log.info(f"  📏 {coin}: capped pos {pos_pct*100:.1f}% → {capped_pos_pct*100:.1f}% (WEL cap=${max_notional_wel:.0f} per coin @ {exposure_state.limits.wel_limit*100:.0f}%)")
-                        pos_pct = capped_pos_pct
+                        pos_pct = min(pos_pct, capped_pos_pct)
 
                     # ── Max risk per trade: dynamic based on account size ──
                     # Aug 7 / Aug 22: micro accounts need higher risk tolerance for meaningful positions.
