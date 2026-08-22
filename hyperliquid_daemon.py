@@ -1402,7 +1402,11 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
     Returns True on success, False on failure (falls back to file-based pipeline).
     """
     global _API_WALLET, _global_pause_until
-    if _global_pause_until > time.time():  # HALT_ENTRIES or flash crash pause
+    # ── Persistent HALT: check the flag EVERY time an entry is attempted, not just
+    # at startup. User touches data/HALT_ENTRIES and the bot stops opening instantly. ──
+    _halt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "HALT_ENTRIES")
+    if _global_pause_until > time.time() or os.path.exists(_halt_file):
+        _global_pause_until = float("inf")  # keep it pinned while the flag is present
         log.info(f"  ⏸️  {coin}: entry paused — global halt active")
         return False
     if not _API_WALLET:
