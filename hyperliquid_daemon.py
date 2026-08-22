@@ -302,6 +302,7 @@ exposure_state = ExposureState()
 cooldown_state = CooldownState(cooldown_seconds=1800)  # 30-min signal cooldown
 _forager_skip_cooldown: dict[str, float] = {}  # coin → timestamp, 10-min forager skip
 _global_pause_until: float = 0.0  # Don't open ANY position until this timestamp
+_config: dict = {}  # state.config.json loaded at startup; drives entries_enabled + wallet
 _ai_trade_plan: dict[str, dict] = {}  # coin → {direction, confidence, target_pct, stop_pct, hold_min}
 _PENDING_ZONE: dict[str, dict] = {}  # coin → {oid, is_buy, size_usd, ...} non-blocking zone orders
 _last_trade_time: float = time.time()  # updated on open/close; drives starvation bypass (30+ min idle → relax gates)
@@ -1402,8 +1403,12 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
     Returns True on success, False on failure (falls back to file-based pipeline).
     """
     global _API_WALLET, _global_pause_until
-    # ── Persistent HALT: check the flag EVERY time an entry is attempted, not just
-    # at startup. User touches data/HALT_ENTRIES and the bot stops opening instantly. ──
+    # ── Entry halt: config entries_enabled=false OR live HALT_ENTRIES file.
+    # Config flag is the easy on/off switch; the file is an instant kill switch
+    # that works without editing config mid-run.──
+    if not _config.get("entries_enabled", True):
+        log.info(f"  ⏸️  {coin}: entry paused — entries_enabled=false in config")
+        return False
     _halt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "HALT_ENTRIES")
     if _global_pause_until > time.time() or os.path.exists(_halt_file):
         _global_pause_until = float("inf")  # keep it pinned while the flag is present
@@ -3647,9 +3652,10 @@ def _fast_monitor_loop(main_wallet: str) -> None:
 # ============================================================
 
 def run(dry_run: bool = False):
-    global hsl_state, exposure_state, cycle_count, evolution_check_cycles, _forager_skip_cooldown, _API_WALLET, _global_pause_until, _rotate_offset, _losing_streak, _last_closed_equity, _last_total_eq
+    global hsl_state, exposure_state, cycle_count, evolution_check_cycles, _forager_skip_cooldown, _API_WALLET, _global_pause_until, _config, _rotate_offset, _losing_streak, _last_closed_equity, _last_total_eq
 
     cfg = json.loads(Path("/home/ubuntu/.hyperliquid/config.json").read_text())
+    _config = cfg  # module-level so _execute_direct_open can read entries_enabled
     api_wallet = cfg["api_wallet"]
     main_wallet = cfg["main_wallet"]
     _API_WALLET = api_wallet  # Make available to _execute_direct_close
@@ -3690,15 +3696,18 @@ def run(dry_run: bool = False):
     log.info(f"  Execution: Multi-tier TP + break-even + trailing")
     log.info("=" * 60)
 
-    # ── Persistent halt flag: if data/HALT_ENTRIES exists, pause all new entries ──
-    # User creates this file when they want to trade manually. Bot monitors exits only.
-    # Delete the file + restart to resume bot entries.
+    # ── Entry flag: entries_enabled in config.json (easy on/off switch). ──
+    # false → no new positions (exit monitoring keeps running for manual trades).
+    # HALT_ENTRIES file still works as an instant kill switch without editing config.
     _halt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "HALT_ENTRIES")
-    if os.path.exists(_halt_file):
+    if not cfg.get("entries_enabled", True):
+        _global_pause_until = float("inf")
+        log.warning("  ⏸️  entries_enabled=false in config — all new entries paused (exit monitoring still running)")
+    elif os.path.exists(_halt_file):
         _global_pause_until = float("inf")
         log.warning("  ⏸️  HALT_ENTRIES active — all new entries paused (exit monitoring still running)")
     else:
-        log.info("  ✅ Entries enabled — data/HALT_ENTRIES not present")
+        log.info("  ✅ Entries enabled — config entries_enabled=true, no HALT_ENTRIES")
 
     # Start WebSocket
     try:
