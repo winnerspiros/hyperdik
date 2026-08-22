@@ -3683,6 +3683,16 @@ def run(dry_run: bool = False):
     log.info(f"  Execution: Multi-tier TP + break-even + trailing")
     log.info("=" * 60)
 
+    # ── Persistent halt flag: if data/HALT_ENTRIES exists, pause all new entries ──
+    # User creates this file when they want to trade manually. Bot monitors exits only.
+    # Delete the file + restart to resume bot entries.
+    _halt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "HALT_ENTRIES")
+    if os.path.exists(_halt_file):
+        _global_pause_until = float("inf")
+        log.warning("  ⏸️  HALT_ENTRIES active — all new entries paused (exit monitoring still running)")
+    else:
+        log.info("  ✅ Entries enabled — data/HALT_ENTRIES not present")
+
     # Start WebSocket
     try:
         from hyperliquid_ws import start_ws
