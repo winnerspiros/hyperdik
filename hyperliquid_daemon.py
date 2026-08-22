@@ -5725,6 +5725,16 @@ def run(dry_run: bool = False):
                         pos_pct = capped_pos_pct
                         risk_pct = min(risk_pct, 0.015)
 
+                    # ── WEL cap: scale position to fit within per-coin WEL limit ──
+                    # Aug 22: micro accounts need this — AI sizes 36% at 6x = 216% notional,
+                    # but WEL per-coin limit is 80% of equity. Without scaling, every entry
+                    # is blocked by wel_exceeded. Cap pos_pct so notional fits under WEL.
+                    max_notional_wel = total_eq * exposure_state.limits.wel_limit * exposure_state.limits.wel_trigger
+                    if notional_planned > max_notional_wel:
+                        capped_pos_pct = (max_notional_wel / chosen_leverage) / total_eq
+                        log.info(f"  📏 {coin}: capped pos {pos_pct*100:.1f}% → {capped_pos_pct*100:.1f}% (WEL cap=${max_notional_wel:.0f} per coin @ {exposure_state.limits.wel_limit*100:.0f}%)")
+                        pos_pct = capped_pos_pct
+
                     # ── Max risk per trade: dynamic based on account size ──
                     # Aug 7 / Aug 22: micro accounts need higher risk tolerance for meaningful positions.
                     # AI consistently sizes at 36% pos / 9.09% risk at 6x — the cap must clear this or
