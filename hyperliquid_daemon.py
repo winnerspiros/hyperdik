@@ -2358,12 +2358,13 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                     # ── INSTANT BREAKEVEN LOCK: the "no loss" core ──
                     # The moment net PnL covers roundtrip fees, cancel the exchange SL
                     # and place a breakeven stop. Trade either hits TP or returns to 0.
-                    # SKIP for manual positions — the user opened the trade intentionally
+                    # _fee_covered_at must be set unconditionally — scale-out block below also uses it.
+                    _fee_covered_at = ROUNDTRIP_FEE_PCT * leverage  # correct: fee scales with actual leverage
+                    # SKIP breakeven lock for manual positions — the user opened the trade intentionally
                     # and we only manage for profit (peak scale-out), not defensively.
                     if not _manual_mode:
                         _be_key = f"_be_locked:{cu}"
                         _be_locked = getattr(_monitor_positions, _be_key, False) if hasattr(_monitor_positions, _be_key) else False
-                        _fee_covered_at = ROUNDTRIP_FEE_PCT * leverage  # correct: fee scales with actual leverage
                         if not _be_locked and _net_pnl_mon >= _fee_covered_at:
                             _be_locked = True
                             setattr(_monitor_positions, _be_key, True)
@@ -5725,8 +5726,15 @@ def run(dry_run: bool = False):
                         risk_pct = min(risk_pct, 0.015)
 
                     # ── Max risk per trade: dynamic based on account size ──
-                    # Aug 7: micro accounts need higher risk tolerance for meaningful positions
-                    _risk_cap_pct = 5.0 if total_eq < 100 else MAX_TRADE_RISK_PCT
+                    # Aug 7 / Aug 22: micro accounts need higher risk tolerance for meaningful positions.
+                    # AI consistently sizes at 36% pos / 9.09% risk at 6x — the cap must clear this or
+                    # the bot starves forever. 12% for <$50 provides 1.33x margin over AI's natural sizing.
+                    if total_eq < 50:
+                        _risk_cap_pct = 12.0
+                    elif total_eq < 100:
+                        _risk_cap_pct = 8.0
+                    else:
+                        _risk_cap_pct = MAX_TRADE_RISK_PCT
                     if total_eq > 0 and stop_price > 0 and entry_price > 0:
                         sl_distance = abs(entry_price - stop_price) / entry_price
                         dollar_risk = sl_distance * pos_pct * total_eq * chosen_leverage
