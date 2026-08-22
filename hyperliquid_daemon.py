@@ -1401,7 +1401,10 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
     Sets leverage first, then places market order with TP/SL brackets.
     Returns True on success, False on failure (falls back to file-based pipeline).
     """
-    global _API_WALLET
+    global _API_WALLET, _global_pause_until
+    if _global_pause_until > time.time():  # HALT_ENTRIES or flash crash pause
+        log.info(f"  ⏸️  {coin}: entry paused — global halt active")
+        return False
     if not _API_WALLET:
         log.error(f"  DIRECT OPEN {coin}: no wallet configured")
         return False
