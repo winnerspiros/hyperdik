@@ -2146,18 +2146,21 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
         if abs(szi) < 0.0001:
             continue
 
-        # ── BOT-OWNED GUARD (Aug 17): never touch a position we didn't open ──
-        # Manual trades on this wallet are the user's — leave them 100% alone.
+        # ── BOT-OWNED GUARD (Aug 17, softened Aug 22): manage manual positions for profit only ──
+        # Manual trades on this wallet are the user's — track peaks and close at confirmed
+        # ATR peaks (scale-out), but skip aggressive defensive exits (breakeven lock, trend-kill,
+        # bleed, never-green, fast-crash). The original "leave 100% alone" approach let a good
+        # SOL trade ride to liquidation because no exit logic ever touched it.
         _owned_cu = coin.upper()
-        if _owned_cu not in _BOT_OWNED:
+        _manual_mode = _owned_cu not in _BOT_OWNED
+        if _manual_mode:
             _skip_logged = getattr(_monitor_positions, "_manual_skip_logged", None)
             if _skip_logged is None:
                 _skip_logged = set()
                 setattr(_monitor_positions, "_manual_skip_logged", _skip_logged)
             if _owned_cu not in _skip_logged:
                 _skip_logged.add(_owned_cu)
-                log.info(f"  🧑 {coin}: NOT bot-owned — manual position, leaving untouched")
-            continue
+                log.info(f"  🧑 {coin}: manual position — managing for profit only (peak scale-out + trail, skip defensive exits)")
 
         # ── PENDING ZONE ORDER CHECK: did AI's limit fill? ──
         cu_upper = coin.upper()
@@ -2180,7 +2183,8 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
         cu = coin.upper()
         if cu not in _position_entry_times:
             _position_entry_times[cu] = time.time()  # Best estimate — was opened recently
-            _last_trade_time = time.time()  # starvation tracker
+            if not _manual_mode:
+                _last_trade_time = time.time()  # starvation tracker — only for bot-owned trades
 
         side = "LONG" if szi > 0 else "SHORT"
         pnl_pct = ((mid - entry) / entry * 100) * (1 if szi > 0 else -1)
@@ -2354,35 +2358,39 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                     # ── INSTANT BREAKEVEN LOCK: the "no loss" core ──
                     # The moment net PnL covers roundtrip fees, cancel the exchange SL
                     # and place a breakeven stop. Trade either hits TP or returns to 0.
-                    _be_key = f"_be_locked:{cu}"
-                    _be_locked = getattr(_monitor_positions, _be_key, False) if hasattr(_monitor_positions, _be_key) else False
-                    _fee_covered_at = ROUNDTRIP_FEE_PCT * leverage  # correct: fee scales with actual leverage
-                    if not _be_locked and _net_pnl_mon >= _fee_covered_at:
-                        _be_locked = True
-                        setattr(_monitor_positions, _be_key, True)
-                        try:
-                            # Cancel existing exchange SL order(s) — hl.info() doesn't exist; use get_open_orders
-                            _cancel_coin_sl(coin)
-                            # Place breakeven stop at entry price
-                            from hyperliquid_execution import round_price
-                            import math as _math
-                            _px_dec = max(0, int(5 - abs(_math.log10(max(entry, 0.0001)))))
-                            _be_px = round_price(_px_dec, entry, is_buy=(side == "SHORT"))
-                            _be_sz = abs(szi)
-                            hl.trigger_order(coin, (side == "SHORT"), _be_sz, _be_px,
-                                           order_type="sl", is_market=True, reduce_only=True)
-                            # Sync the trail baseline to breakeven so the chandelier trail ratchets
-                            # UP from here and never moves the SL back below breakeven.
-                            if cu in trail_states:
-                                trail_states[cu].current_stop = _be_px
-                            log.info(f"  🔒 {coin}: BREAKEVEN LOCKED — net={_net_pnl_mon:+.2f}% ≥ fee={_fee_covered_at:+.2f}%, SL moved to entry ${entry:.5f}")
-                        except Exception as _be_err:
-                            log.warning(f"  ⚠️ {coin}: breakeven lock failed: {_be_err} — will retry next cycle")
+                    # SKIP for manual positions — the user opened the trade intentionally
+                    # and we only manage for profit (peak scale-out), not defensively.
+                    if not _manual_mode:
+                        _be_key = f"_be_locked:{cu}"
+                        _be_locked = getattr(_monitor_positions, _be_key, False) if hasattr(_monitor_positions, _be_key) else False
+                        _fee_covered_at = ROUNDTRIP_FEE_PCT * leverage  # correct: fee scales with actual leverage
+                        if not _be_locked and _net_pnl_mon >= _fee_covered_at:
+                            _be_locked = True
+                            setattr(_monitor_positions, _be_key, True)
+                            try:
+                                # Cancel existing exchange SL order(s) — hl.info() doesn't exist; use get_open_orders
+                                _cancel_coin_sl(coin)
+                                # Place breakeven stop at entry price
+                                from hyperliquid_execution import round_price
+                                import math as _math
+                                _px_dec = max(0, int(5 - abs(_math.log10(max(entry, 0.0001)))))
+                                _be_px = round_price(_px_dec, entry, is_buy=(side == "SHORT"))
+                                _be_sz = abs(szi)
+                                hl.trigger_order(coin, (side == "SHORT"), _be_sz, _be_px,
+                                               order_type="sl", is_market=True, reduce_only=True)
+                                # Sync the trail baseline to breakeven so the chandelier trail ratchets
+                                # UP from here and never moves the SL back below breakeven.
+                                if cu in trail_states:
+                                    trail_states[cu].current_stop = _be_px
+                                log.info(f"  🔒 {coin}: BREAKEVEN LOCKED — net={_net_pnl_mon:+.2f}% ≥ fee={_fee_covered_at:+.2f}%, SL moved to entry ${entry:.5f}")
+                            except Exception as _be_err:
+                                log.warning(f"  ⚠️ {coin}: breakeven lock failed: {_be_err} — will retry next cycle")
                     
                     # ── EXTREME REVERSAL only: if we had 3%+ peak and now losing, protect ──
                     # Aug 12: removed PROFIT LOCK + PEAK LOCK — clipping winners at 0.15% is
                     # stupid when you have a good entry. Let trades run, exit layers handle risk.
-                    if _peak_pnl >= 3.0 and net_pnl_pct < -0.15:
+                    # SKIP for manual positions — scale-out at ATR-confirmed peaks handles this.
+                    if not _manual_mode and _peak_pnl >= 3.0 and net_pnl_pct < -0.15:
                         log.warning(f"  🚨 {coin}: EXTREME REVERSAL — peak was {_peak_pnl:+.2f}%, now losing {net_pnl_pct:+.2f}%, closing 50%")
                         try:
                             _close_sz = abs(szi) * 0.5
@@ -2508,7 +2516,8 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                         _ever_green = True
                         setattr(_monitor_positions, _ever_green_key, True)
 
-                    if _net_pnl_mon < 0 and not exit_reason:
+                    # SKIP defensive exits for manual positions — only manage for profit (peak scale-out)
+                    if not _manual_mode and _net_pnl_mon < 0 and not exit_reason:
                         # ── ATR-scaled noise floor: BLEED threshold = max(1.0%, 5m ATR) ──
                         _bleed_floor = _calc_atr_pct(coin, _TRAIL_ATR_TF, 14)
                         if _bleed_floor <= 0 or _bleed_floor < 1.0:
@@ -3438,7 +3447,8 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
     for c in stale:
         del _position_entry_times[c]
         _unmark_bot_owned(c)  # Aug 17: release ownership when exchange TP/SL flattened us
-        _last_trade_time = time.time()  # starvation tracker: position was closed
+        if c in _BOT_OWNED:
+            _last_trade_time = time.time()  # starvation tracker: bot-owned position was closed
         # Clean up peak-lock tier flag so re-entry on same coin gets fresh protection
         for _clean_key in [f"_peak_locked:{c}", f"_peak_lock_tier:{c}", f"_soft_strikes:{c}",
                            f"_mc_peak:{c}", f"_mc_entry_ts:{c}", f"_tip_start:{c}"]:
