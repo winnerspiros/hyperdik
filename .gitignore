@@ -44,6 +44,8 @@ data/trade_memory.json
 data/eur_reservations.json
 data/learned_weights.json
 data/continuous_weights.json
+data/bot_owned.json
+data/hyperliquid_trades.json
 data/pending_actions/
 data/predictions/
 data/ml_models/
