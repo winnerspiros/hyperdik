@@ -5626,10 +5626,14 @@ def run(dry_run: bool = False):
                                 # In bull market: relax floor to ≥0.00 (just not negative) — AI market
                                 # assessment is the better guide when technicals are noisy for small alts
                                 _bull_market_now = (ai_market.get("bias", "") == "bullish" if "ai_market" in dir() else False)
-                                # In non-bull market with SELL direction, negative composite is EXPECTED (trending down)
-                                # Floor: -0.15 for SELL in non-bull, 0.00 for bull (just not negative), 0.08 otherwise
+                                # Micro SELL in non-bull: composite is the enriched score itself
+                                # (BUY-positive scale). A SELL synthetic has negative composite
+                                # BY CONSTRUCTION - flooring at -0.15 blocked every micro SELL
+                                # (MINA -0.27, APE -0.17, DOGE -0.11 all died here). Directional
+                                # sign + |comp|>=0.05 (measured, not noise) is enough; the EV
+                                # gate downstream still demands R:R>=1.5 + EV>0.
                                 if ai_dir == "SELL" and not _bull_market_now:
-                                    _comp_floor = -0.15
+                                    _comp_floor = -0.50
                                 elif _bull_market_now:
                                     _comp_floor = 0.00
                                 else:
