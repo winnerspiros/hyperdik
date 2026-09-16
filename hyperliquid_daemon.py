@@ -5293,8 +5293,19 @@ def run(dry_run: bool = False):
                             elif "COMPOSITE FLOOR" in block_reason:
                                 # ACE lesson: AI=90% BUY, comp=+0.06 (weak but correct) → pumped 200%.
                                 # MORPHO lesson: AI=85% SELL, comp=-0.04 (weak, wrong) → bled 0.12 over 52min.
+                                _ml_agrees_floor = False
+                                try:
+                                    _ml_agrees_floor = (
+                                        (ai_dir == "SELL" and ml_pred.direction == "down" and ml_pred.confidence >= 30)
+                                        or (ai_dir == "BUY" and ml_pred.direction == "up" and ml_pred.confidence >= 30)
+                                    )
+                                except Exception:
+                                    pass
                                 if ai_conf_val >= 90:
                                     log.info(f"  ⚡ {coin}: AI OVERRIDE COMP FLOOR — AI={ai_conf_val}% >= 90% overrides comp floor ({sig.composite_score:+.2f})")
+                                    block_reason = None
+                                elif ai_conf_val >= 85 and _ml_agrees_floor:
+                                    log.info(f"  AI+ML OVERRIDE COMP FLOOR - AI>=85 pct plus ML agrees, overrides comp floor")
                                     block_reason = None
                                 else:
                                     log.info(f"  🛑 {coin}: COMPOSITE FLOOR — |comp|={abs(sig.composite_score):.2f} < 0.10, AI={ai_conf_val}% < 90% cannot override")
