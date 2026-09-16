@@ -238,7 +238,7 @@ _ALWAYS_SCAN = {"BTC", "ETH"}
 _rotate_offset = 0
 CYCLE_SECONDS = _cfg("monitoring.cycle_seconds", 3)  # 3s — configurable, fast default
 FAST_MONITOR_SECONDS = 3  # fast exit/monitor thread cadence (decoupled from entry pipeline)
-MIN_TRADE_USD = 5.0
+MIN_TRADE_USD = 3.0  # micro-account floor (was 5.0): $3.36 + leverage can fund one $11 min-notional scalp; blocks dust only
 # Minimum notional per trade: $20 floor (HL minimum is $10, $10 margin at 2x = $20)
 # Fast-track coins can go to $10 (HL absolute minimum)
 MIN_NOTIONAL_USD = 20

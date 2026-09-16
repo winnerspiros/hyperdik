@@ -87,12 +87,15 @@ class ExposureLimits:
     def for_equity(equity: float) -> "ExposureLimits":
         """Return appropriate limits for account size."""
         if equity < 20:
-            # Ultra-micro: exchange min $10 forces 125% WEL at $8 equity.
-            # 180% WEL = room for one $10 order + margin buffer.
+            # Ultra-micro: exchange min $10 forces one-position account.
+            # $11 min-notional / equity sets the real WEL: at $3.36 that's 327%.
+            # Formula always fits ONE $11 scalp + ~10% buffer, whatever the dust level.
+            _fit = 12.0 / max(equity, 0.5)
+            _wel = max(1.80, _fit)
             return ExposureLimits(
-                wel_limit=1.80,          # must exceed exchange min $10 / equity
-                twel_limit=1.80,         # single-position account, same as WEL
-                group_limit=0.80,
+                wel_limit=_wel,          # e.g. 3.57 at $3.36 → $12 room
+                twel_limit=_wel,         # single-position account, same as WEL
+                group_limit=_wel,        # group cap must not strangle the one position
                 min_position_usd=5.0,    # exchange min ($10) is the real gate
             )
         elif equity < 50:
