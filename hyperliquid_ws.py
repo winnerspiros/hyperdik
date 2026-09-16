@@ -132,6 +132,17 @@ def _on_message(ws, message):
                     from collections import deque
                     _latest_data["trade_history"][coin] = deque(maxlen=100)
                 _latest_data["trade_history"][coin].append(trade_dict)
+                # ── Queue-proxy + OFI-mid feeds (Sep 2026): best-effort, never breaks WS ──
+                try:
+                    from queue_proxy import record_taker as _qp_rec
+                    _qp_rec(coin, float(trade.get("px", 0) or 0) * float(trade.get("sz", 0) or 0))
+                except Exception:
+                    pass
+                try:
+                    from ofi_engine import record_mid as _ofi_mid
+                    _ofi_mid(coin, float(trade.get("px", 0) or 0))
+                except Exception:
+                    pass
 
         elif channel == "l2Book":
             # Handle both dict (single update) and list (batch) formats
@@ -148,6 +159,18 @@ def _on_message(ws, message):
                     "asks": levels[1][:5],
                     "ts": book.get("time", 0),
                 }
+            # ── OFI feed (Sep 2026): diff consecutive snapshots into 1s OFI buckets ──
+            # Best-effort, never breaks the WS loop.
+            try:
+                from ofi_engine import record_book_snapshot
+                for book in books:
+                    if not isinstance(book, dict):
+                        continue
+                    _lv = book.get("levels", [[], []])
+                    if _lv and _lv[0] and _lv[1]:
+                        record_book_snapshot(book.get("coin", ""), _lv[0][:5], _lv[1][:5])
+            except Exception:
+                pass
 
         elif channel == "allMids":
             if isinstance(payload, dict):

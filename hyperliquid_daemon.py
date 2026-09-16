@@ -324,10 +324,15 @@ _MINIMAL_ROI = {
     1800: 0.10, # 30min: -0.10% (was -0.3%)
     3600: 0.0,  # 60min: breakeven
 }
-# ── Hyperliquid taker fees (market orders) ──
-TAKER_FEE_RATE = 0.00035   # 0.035% per side
-ROUNDTRIP_FEE_PCT = TAKER_FEE_RATE * 2 * 100  # 0.07% of notional, both sides
-ROUNDTRIP_FEE_MARGIN_PCT = ROUNDTRIP_FEE_PCT * BASE_LEVERAGE  # 0.42% of margin at 6x
+# ── Hyperliquid REAL fees (verified Sep 2026, tier-0 base) ──
+# Sources: HL docs + userFees endpoint (0.00045 cross / 0.00015 add) + fee guides.
+# taker 0.045%/side, maker 0.015%/side — maker costs 1/3 of taker, so the
+# maker-first entry in _execute_direct_open is a bigger lever than any signal tweak.
+# Mixed path (Alo entry attempt, IOC take fallback) models at TAKER rate: worst case.
+TAKER_FEE_RATE = 0.00045   # 0.045% per side (was 0.035% — UNDERCHARGED, hid fee bleed)
+MAKER_FEE_RATE = 0.00015   # 0.015% per side (maker-first entries)
+ROUNDTRIP_FEE_PCT = TAKER_FEE_RATE * 2 * 100  # 0.09% of notional, both sides (was 0.07%)
+ROUNDTRIP_FEE_MARGIN_PCT = ROUNDTRIP_FEE_PCT * BASE_LEVERAGE  # 0.54% of margin at 6x (was 0.42%)
 # ── ROI timeout throttle — prevent log spam (one close attempt per coin per threshold) ──
 _ROI_TIMEOUT_ATTEMPTED: set[str] = set()  # "COIN:threshold_secs" — cleared after 60s
 # ── Max risk per trade (Jesse pattern): reject trades that risk too much equity ──
@@ -387,11 +392,13 @@ def _net_pnl_pct(gross_pnl_pct: float, leverage: int = BASE_LEVERAGE) -> float:
     """Convert gross PnL % to net PnL % after round-trip taker fees.
     
     Fees: 0.035% taker per side = 0.07% of notional round-trip.
-    At leverage N, that's 0.07% * N of margin.
-    
+    At leverage N, that's 0.07% * N of margin. Price-move % scales by N too.
+    (Freqtrade/maximal_roi pattern + Hummingbot inventory logic both judge in
+    net-of-fee terms — a "flat" price move at 6x is a -0.42% margin loss.)
+
     Returns net PnL as percentage of margin.
     """
-    return gross_pnl_pct - ROUNDTRIP_FEE_PCT * leverage  # fee scales with leverage, no base division
+    return gross_pnl_pct * leverage - ROUNDTRIP_FEE_PCT * leverage  # both legs in margin %
 
 def _can_close_position(coin: str, reason: str = "") -> bool:
     """Check if position is old enough to close. Returns True if OK to close.
@@ -540,19 +547,29 @@ def is_stop_loss_cooling(coin: str) -> bool:
 
 
 # ── CANDLE CACHE (avoids duplicate API calls) ──
+# Latency reality (Sep 2026 research): HL consensus is 200-500ms per order and the
+# entry pipeline already takes 30-90s scanning the universe — decisions must use
+# FRESH micro data (WS book/trades) and STALE-OK macro data (15m+ candles). Rule:
+#   fast TF (1m/5m): 20-30s TTL — momentum math must see the current move, not last cycle's;
+#   slow TF (15m+): 120s TTL — a 15m candle barely changes inside 2 minutes, cache it hard.
+#   Freqtrade protections pattern: a 5-min global cooldown after any close also caps
+#   re-entry churn without extra API spend.
+_CANDLE_TTL_FAST = 25   # 1m/5m — momentum decisions need fresh micro-structure
+_CANDLE_TTL_SLOW = 120  # 15m/1h/4h — slow candles, cache hard (was everything at 120s)
 _candle_cache: dict[str, tuple[float, list[dict]]] = {}  # key → (timestamp, data)
-CANDLE_CACHE_TTL = 120  # 2 min — reduce API load, 15m candles don't change every cycle
+CANDLE_CACHE_TTL = 120  # default for slow TFs (kept for compat)
 CANDLE_CACHE_MAX_ENTRIES = 150  # Reduced from 200 — Kronos now runs less frequently, less cache needed
 _cache_cleanup_counter = 0
 
 def _fetch_candles_cached(coin: str, interval: str = "15m", limit: int = 200) -> list[dict]:
-    """Fetch candles with 60s cache to avoid duplicate API calls."""
+    """Fetch candles with TF-aware TTL: 25s for 1m/5m (fresh momentum), 120s for 15m+."""
     global _cache_cleanup_counter
     ck = f"{coin}:{interval}:{limit}"
     now = time.time()
+    _ttl = _CANDLE_TTL_FAST if interval in ("1m", "5m") else _CANDLE_TTL_SLOW
     if ck in _candle_cache:
         ts, data = _candle_cache[ck]
-        if now - ts < CANDLE_CACHE_TTL:
+        if now - ts < _ttl:
             return data
     data = _fetch_candles(coin, interval, limit)
     _candle_cache[ck] = (now, data)
@@ -682,10 +699,74 @@ cycle_count = 0
 evolution_check_cycles = 0
 
 # ── Losing streak circuit breaker (systematic trading: when edge isn't working, stop) ──
+# Freqtrade protections pattern (StoplossGuard + MaxDrawdown + CooldownPeriod, Sep 2026):
+# blind re-entry after losers is how micro accounts die. Scale down fast, pause faster.
 _losing_streak: int = 0
 _last_closed_equity: float = 0.0
-_MAX_LOSING_STREAK = 3   # Reduce to 1 position after this many consecutive losers
-_HARD_PAUSE_STREAK = 5   # Pause all entries for 30 min after this many
+_losing_streak_paused_until: float = 0.0  # entries blocked until this ts after hard pause
+_MAX_LOSING_STREAK = 2   # 2 consecutive losers → 1 position max (was 3 — too slow to react)
+_HARD_PAUSE_STREAK = 3   # 3 consecutive losers → 30-min full entry pause (was 5)
+
+# ── LowProfitPairs quarantine (Freqtrade pattern, Sep 2026) ──
+# A coin that prints 2 net-negative closes inside 24h is quarantined 6h: the pair's
+# edge is empirically dead in current regime. 3+ quarantines in 72h → 24h ban.
+# Stored in-memory + persisted to data/pair_quarantine.json (survives restarts).
+_PAIR_QUARANTINE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "pair_quarantine.json")
+_pair_quarantine: dict[str, float] = {}  # coin -> quarantine-until ts
+_pair_q_count: dict[str, list] = {}       # coin -> [quarantine start ts, ...] (72h window)
+
+def _load_pair_quarantine() -> None:
+    try:
+        with open(_PAIR_QUARANTINE_FILE) as _f:
+            _d = json.load(_f)
+        _pair_quarantine.update({k.upper(): float(v) for k, v in _d.get("until", {}).items()})
+        _pair_q_count.update({k.upper(): list(v) for k, v in _d.get("counts", {}).items()})
+    except Exception:
+        pass
+
+def _save_pair_quarantine() -> None:
+    try:
+        os.makedirs(os.path.dirname(_PAIR_QUARANTINE_FILE), exist_ok=True)
+        with open(_PAIR_QUARANTINE_FILE, "w") as _f:
+            json.dump({"until": _pair_quarantine, "counts": _pair_q_count}, _f)
+    except Exception:
+        pass
+
+def pair_quarantined(coin: str) -> tuple[bool, str]:
+    """Freqtrade LowProfitPairs: is this coin quarantined? Returns (yes, reason)."""
+    cu = coin.upper()
+    now = time.time()
+    until = _pair_quarantine.get(cu, 0)
+    if until > now:
+        return True, f"quarantined {((until - now) / 3600):.1f}h left (LowProfitPairs)"
+    return False, ""
+
+def note_pair_result(coin: str, net_pnl_pct: float) -> None:
+    """Record a closed trade; quarantine the pair after 2 net-negative closes in 24h."""
+    try:
+        cu = coin.upper()
+        now = time.time()
+        key = f"_pair_pnls:{cu}"
+        hist = getattr(note_pair_result, key, None)
+        if hist is None:
+            hist = []
+            setattr(note_pair_result, key, hist)
+        hist.append((now, net_pnl_pct))
+        hist[:] = [(t, p) for t, p in hist if now - t < 86400]
+        _save_pair_quarantine()
+        negs = sum(1 for _, p in hist if p < 0)
+        if negs >= 2 and _pair_quarantine.get(cu, 0) <= now:
+            starts = [t for t in _pair_q_count.get(cu, []) if now - t < 72 * 3600]
+            dur = 24 * 3600 if len(starts) >= 2 else 6 * 3600  # 3rd quarantine in 72h → 24h
+            starts.append(now)
+            _pair_q_count[cu] = starts
+            _pair_quarantine[cu] = now + dur
+            _save_pair_quarantine()
+            log.warning(f"  🚫 {coin}: LowProfitPairs quarantine {dur / 3600:.0f}h — {negs} net-negative closes in 24h")
+    except Exception:
+        pass
+
+_load_pair_quarantine()
 
 # ============================================================
 # CANDLE FETCH (from Hyperliquid API)
@@ -1545,33 +1626,183 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
         except Exception:
             pass  # Best-effort guard — if extremes fetch fails, allow market entry
 
-        # Market entry — micro-peak timing. Catches the move NOW (only when not fading).
-        _mp_px = _micro_peak_entry_wait(coin, is_buy, px)
-        if _mp_px != px:
-            log.info(f"  ⚡ {coin}: micro-peak → ${px:.4f}→${_mp_px:.4f}")
-        result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
-        if isinstance(result, dict) and result.get("status") == "err":
-            log.error(f"  DIRECT OPEN {coin}: {result.get('error', 'unknown')}")
-            return False
+        # Maker-first market entry (Hummingbot pure-MM pattern, Sep 2026) — post-only
+        # Alo limit at the touch: LONG bids the best bid, SHORT offers the best ask.
+        # If a maker is already quoting there we join the queue and earn the rebate
+        # instead of paying taker fees; micro-peak timing already picked the moment,
+        # so crossing the spread adds nothing but cost. Alo orders that would take
+        # are rejected by the exchange — fall straight through to the IOC take.
+        # AS-skew + queue guard (Sep 2026, Avellaneda-Stoikov / queue research):
+        # reservation r = mid - q*gamma*sig2*T shifts the quote against our inventory,
+        # and should_join() refuses back-of-queue joins (adverse-selection fills).
+        _made = False
+        try:
+            from hyperliquid_ws import get_field as _ws_ob_field
+            _obs = _ws_ob_field("orderbooks") or {}
+            _ob = _obs.get(coin, {}) or _obs.get(coin.upper(), {})
+            _bids = _ob.get("bids", []) or []
+            _asks = _ob.get("asks", []) or []
+            if _bids and _asks:
+                # L2 levels arrive as [px, sz] lists OR {px, sz} dicts (see normalize_orderbook)
+                def _lv_px(lv):
+                    try:
+                        return float(lv.get("px", 0)) if isinstance(lv, dict) else float(lv[0])
+                    except Exception:
+                        return 0.0
+                def _lv_sz(lv):
+                    try:
+                        return float(lv.get("sz", 0)) if isinstance(lv, dict) else float(lv[1])
+                    except Exception:
+                        return 0.0
+                _bb = _lv_px(_bids[0]); _ba = _lv_px(_asks[0])
+                _mid0 = (_bb + _ba) / 2 if _bb > 0 and _ba > 0 else px
+                # ── AS inventory skew: shift quote against existing inventory ──
+                # q = current signed size in coins (0 when flat → no skew).
+                # gamma 0.2, sig2 = 5m realized variance, T = 300s horizon.
+                _skew = 0.0
+                try:
+                    _ust = hl.get_user_state()
+                    for _up in _ust.get("assetPositions", []):
+                        _pp = _up.get("position", {})
+                        if _pp.get("coin", "").upper() == coin.upper():
+                            _q = float(_pp.get("szi", 0))
+                            break
+                    else:
+                        _q = 0.0
+                    if _q != 0.0 and _mid0 > 0:
+                        _c5 = _fetch_candles_cached(coin, "5m", 30)
+                        _rets = []
+                        if _c5 and len(_c5) >= 10:
+                            _cls = [float(_c.get("c", _c.get("close", 0))) for _c in _c5[-20:]]
+                            _rets = [( _cls[i] - _cls[i-1]) / _cls[i-1]
+                                     for i in range(1, len(_cls)) if _cls[i-1] > 0]
+                        _sig2 = (sum(r * r for r in _rets) / max(len(_rets), 1)) if _rets else 0.0
+                        _skew = _q * 0.2 * _sig2 * 300.0  # reservation shift in price units
+                except Exception:
+                    _skew = 0.0
+                _touch = _lv_px(_bids[0]) if is_buy else _lv_px(_asks[0])
+                # LONG with long inventory (q>0, skew>0): bid LOWER (less eager to add).
+                # SHORT with short inventory: offer HIGHER. Skew never crosses the touch.
+                if _touch > 0:
+                    if is_buy and _skew > 0:
+                        _touch = max(_touch - abs(_skew), _touch * 0.999)
+                    elif not is_buy and _skew < 0:
+                        _touch = min(_touch + abs(_skew), _touch * 1.001)
+                if _touch > 0:
+                    from queue_proxy import should_join as _qp_join, track_maker as _qp_track
+                    _bid_usd = sum(_lv_px(b) * _lv_sz(b) for b in _bids[:5])
+                    _ask_usd = sum(_lv_px(a) * _lv_sz(a) for a in _asks[:5])
+                    _ok, _why = _qp_join(coin, is_buy, _touch, size_usd, _bids, _asks)
+                    if not _ok:
+                        log.info(f"  📚 {coin}: maker queue toxic — {_why} → IOC take")
+                    else:
+                        # ── OFI edge gate: maker join needs non-adverse short-horizon flow ──
+                        # edge_bps > -1 = flow not actively pushing through our quote.
+                        try:
+                            from ofi_engine import get_ofi_signal as _ofi_sig
+                            _ofi = _ofi_sig(coin, _mid0, _bid_usd + _ask_usd)
+                            _adverse = ((_ofi["edge_bps"] < -1.0) if is_buy
+                                        else (_ofi["edge_bps"] > 1.0))
+                            if _adverse:
+                                log.info(f"  📉 {coin}: OFI adverse ({_ofi['edge_bps']:+.1f}bp) — skipping maker join → IOC take")
+                                _ok = False
+                        except Exception:
+                            pass
+                    if _ok:
+                        from hyperliquid_execution import round_size as _rs, round_price as _rp
+                        import math as _mm
+                        _mdec = max(0, int(5 - abs(_mm.log10(max(_touch, 0.0001)))))
+                        _msz = _rs(sz_dec, size_usd / _touch)
+                        _mpx = _rp(_mdec, _touch, is_buy=is_buy)
+                        _ahead = 0.0
+                        try:
+                            from queue_proxy import queue_ahead_usd as _qp_ahead
+                            _ahead = _qp_ahead(_bids, _asks, is_buy, _mpx)
+                        except Exception:
+                            pass
+                        _mres = hl.order(coin, is_buy, _msz, _mpx, order_type="alo")
+                        # markout tracking needs these in scope for the fill branch below
+                        _qp_mpx, _qp_ahead_v = _mpx, _ahead
+                    else:
+                        _mres, _moid = None, 0
+                        _qp_mpx, _qp_ahead_v = 0.0, 0.0
+                    _moid = _extract_oid(_mres) if _mres else 0
+                    _merr = ""
+                    if isinstance(_mres, dict):
+                        try:
+                            _st = _mres.get("response", {}).get("data", {}).get("statuses", [])
+                            if _st and "error" in _st[0]:
+                                _merr = str(_st[0]["error"])
+                        except Exception:
+                            pass
+                    if _moid and "would" not in _merr.lower() and "take" not in _merr.lower():
+                        # Maker order resting — wait briefly for the fill, then verify
+                        # like the IOC path does (fill check is 40 lines below).
+                        time.sleep(1.5)
+                        try:
+                            _mstate = hl.get_user_state()
+                            for _mp in _mstate.get("assetPositions", []):
+                                _mc = _mp.get("position", {}).get("coin", "").upper()
+                                if _mc == coin.upper() and abs(float(_mp["position"].get("szi", 0))) > 0.0001:
+                                    _made = True
+                                    oid = _moid
+                                    log.info(f"  ✅ DIRECT OPEN: {coin} {'LONG' if is_buy else 'SHORT'} "
+                                             f"${size_usd:.2f} @ {leverage}x (oid={oid} MAKER @ ${_qp_mpx}) — {reason[:60]}")
+                                    _record_entry_time(coin)
+                                    # markout log: queue-ahead bin for this passive fill
+                                    try:
+                                        from queue_proxy import track_maker as _qp_trk, resolve_fill as _qp_res
+                                        _qp_trk(_moid, coin, _qp_mpx, size_usd, _qp_ahead_v)
+                                        _mmids = hl.get_all_mids()
+                                        _qp_res(_moid, _qp_mpx, float(_mmids.get(coin, 0)))
+                                    except Exception:
+                                        pass
+                                    break
+                        except Exception:
+                            pass
+                        if not _made:
+                            # Resting but unfilled after 1.5s — cancel and take below
+                            try:
+                                hl.cancel_order(coin, _moid)
+                            except Exception:
+                                pass
+                            log.info(f"  📝 {coin}: maker unfilled in 1.5s — taking liquidity")
+                    # else: rejected as taker (would cross) or errored → fall through to IOC take
+        except Exception:
+            pass  # WS book missing — fall through to IOC take
+        if _made:
+            pass  # skip the IOC take below; jump to TP/SL brackets via shared tail
+        else:
+            _mp_px = _micro_peak_entry_wait(coin, is_buy, px)
+            if _mp_px != px:
+                log.info(f"  ⚡ {coin}: micro-peak → ${px:.4f}→${_mp_px:.4f}")
+            result = hl.market_open(coin, is_buy, size_usd, slippage=0.005, order_type="Ioc")
+        if _made:
+            # Maker path filled — oid already set + entry recorded above; skip IOC tail
+            pass
+        else:
+            if isinstance(result, dict) and result.get("status") == "err":
+                log.error(f"  DIRECT OPEN {coin}: {result.get('error', 'unknown')}")
+                return False
 
-        oid = _extract_oid(result)
-        exchange_error = None
-        if isinstance(result, dict) and not oid:
-            try:
-                statuses = result.get("response", {}).get("data", {}).get("statuses", [])
-                if statuses and "error" in statuses[0]:
-                    exchange_error = statuses[0]["error"]
-            except Exception:
-                pass
-        if exchange_error:
-            log.error(f"  DIRECT OPEN {coin}: exchange rejected — {exchange_error}")
-            return False
-        if not oid or oid == 0:
-            log.error(f"  DIRECT OPEN {coin}: no order ID — result={result}")
-            return False
-        log.info(f"  ✅ DIRECT OPEN: {coin} {'LONG' if is_buy else 'SHORT'} "
-                 f"${size_usd:.2f} @ {leverage}x (oid={oid}) — {reason[:60]}")
-        _record_entry_time(coin)  # Aug 17: mark bot-owned + record entry (no more adopt-unknown)
+            oid = _extract_oid(result)
+            exchange_error = None
+            if isinstance(result, dict) and not oid:
+                try:
+                    statuses = result.get("response", {}).get("data", {}).get("statuses", [])
+                    if statuses and "error" in statuses[0]:
+                        exchange_error = statuses[0]["error"]
+                except Exception:
+                    pass
+            if exchange_error:
+                log.error(f"  DIRECT OPEN {coin}: exchange rejected — {exchange_error}")
+                return False
+            if not oid or oid == 0:
+                log.error(f"  DIRECT OPEN {coin}: no order ID — result={result}")
+                return False
+            log.info(f"  ✅ DIRECT OPEN: {coin} {'LONG' if is_buy else 'SHORT'} "
+                     f"${size_usd:.2f} @ {leverage}x (oid={oid}) — {reason[:60]}")
+            _record_entry_time(coin)  # Aug 17: mark bot-owned + record entry (no more adopt-unknown)
 
         # Step 3: Place TP/SL bracket orders (if provided)
         # RETRY with exponential backoff on 429 — NEVER leave a position naked
@@ -1870,6 +2101,12 @@ def _record_close_trade(coin: str, mid: float, entry: float, szi: float, side: s
             except Exception:
                 pass
         log.info(f"  📚 Learned from {coin} {side}: {'bullish' if was_bullish_correct else 'bearish'} correct")
+
+        # ── LowProfitPairs feed (Sep 2026): every close teaches the quarantine ──
+        try:
+            note_pair_result(coin, net_pnl_pct)
+        except Exception:
+            pass
 
         # ── Post-trade AI analysis (web search, background thread — not blocking) ──
         try:
@@ -2245,6 +2482,47 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                     log.warning(f"  ⏰ {coin}: ROI exit failed: {e}")
             continue
 
+        # ── ROI TIME LADDER (Freqtrade/maximal_roi pattern, Sep 2026) ──
+        # The Aug 7 "zero-loss" system disabled ALL time-based exits, so a trade that
+        # goes nowhere sits forever tying up margin while fees and funding bleed it.
+        # This ladder only fires on FLAT/LOSING positions (never touches green ones —
+        # those belong to the peak scale-out ladder above), demands progressively
+        # LESS profit the longer we hold, and always routes through
+        # _can_close_position (600s MIN_HOLD) + _safe_close (verified flat):
+        #   20 min held + still below fees → exit (dead trade, free the margin)
+        #   30 min held + net < +1 ATR(5m) → exit (move never came)
+        #   60 min held + net < +2 ATR(5m) → exit (capital better deployed elsewhere)
+        # Thresholds use live ATR(5m), not hardcoded % — chop tolerates less, trends more.
+        if not _manual_mode and not exit_reason and _net_pnl_mon <= _fee_covered_at:
+            try:
+                _roi_atr = _calc_atr_pct(coin, _TRAIL_ATR_TF, 14)
+                if _roi_atr > 0:
+                    _roi_need = 0.0
+                    if _hold_age_mon >= 3600:
+                        _roi_need = 2.0 * _roi_atr * leverage
+                    elif _hold_age_mon >= 1800:
+                        _roi_need = 1.0 * _roi_atr * leverage
+                    elif _hold_age_mon >= 1200:
+                        _roi_need = _fee_covered_at  # 20min: must at least cover fees
+                    if _roi_need > 0 and _net_pnl_mon < _roi_need:
+                        _roi_reason = (f"roi-ladder: held {_hold_age_mon/60:.0f}min, net={_net_pnl_mon:+.2f}% "
+                                       f"< need {_roi_need:+.2f}% — freeing margin")
+                        log.info(f"  ⏰ {coin}: {_roi_reason}")
+                        if _can_close_position(coin, "roi-ladder"):
+                            _MANUAL_CLOSES[coin] = time.time()
+                            if _safe_close(coin):
+                                try:
+                                    _record_close_trade(coin, mid, entry, abs(szi), side,
+                                                        "roi-ladder", conviction=0,
+                                                        regime=regime.value if hasattr(regime, 'value') else "sideways",
+                                                        leverage=leverage)
+                                except Exception:
+                                    pass
+                            _reset_signal_dominance(coin)
+                            continue
+            except Exception as _roi_e:
+                log.warning(f"  ⚠️ {coin}: ROI ladder skipped ({type(_roi_e).__name__})")
+
         # Liquidation warning + survival force-close
         if liq > 0:
             liq_dist = abs(mid - liq) / mid * 100
@@ -2438,6 +2716,17 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                     if _SCALE_OUT_ENABLED and _net_pnl_mon > _fee_covered_at and _peak_pnl > _fee_covered_at:
                         _so_peak_key = f"_scaleout_peak:{cu}"
                         _last_so_peak = getattr(_monitor_positions, _so_peak_key, -999.0) if hasattr(_monitor_positions, _so_peak_key) else -999.0
+                        # ── CLOSE-AT-BEST-GAIN LADDER (Freqtrade/maximal_roi pattern, Sep 2026) ──
+                        # Old code banked ONE fixed 50%-of-position slice at the first confirmed
+                        # peak, then let the runner round-trip the rest. Now each NEW peak banks a
+                        # fraction of the REMAINING position, so every leg up locks in profit:
+                        #   peak #1 → bank 50% of position (keep 50%)
+                        #   peak #2 → bank 50% of runner (keep 25% of original)
+                        #   peak #3 → bank 50% of runner (keep 12.5% — the moonbag rides free)
+                        # Fractions come from the regime-scaled _scale_frac (data-driven, not
+                        # hardcoded): chop banks faster, trends keep more runner.
+                        # Every bank tightens + re-arms the exchange SL (scale-out re-arm), so the
+                        # remaining runner can never round-trip below breakeven.
                         if _peak_pnl > _last_so_peak:  # new peak since last bank → eligible
                             _atr_pct = _calc_atr_pct(coin, _TRAIL_ATR_TF, 14)
                             _drop_atr = (drop_from_peak_pct / _atr_pct) if _atr_pct > 0 else 0.0
@@ -2568,8 +2857,9 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                                 _trend_kill = False
                             _kill_metric = f"4h={_pct_4h:.1f}% above low"
 
-                        if _trend_kill and _net_pnl_mon < -0.15:
-                            # Minimum loss 0.15% — don't kill flat positions (S coin: killed at -0.01%)
+                        if _trend_kill and _net_pnl_mon < -0.9:
+                            # Minimum loss 0.9% margin (covers 0.54% fees + 0.36% real move).
+                            # The old -0.15% bar fired inside the fee band — pure fee-bleed exits.
                             exit_reason = f"TREND-KILL: {side} wrong — {_kill_metric}, net={_net_pnl_mon:+.2f}%"
                         elif drop_from_peak_pct > _bleed_floor and mom1 < -0.1:
                             # Bleeding: price has moved >1 ATR off its best point AND momentum is
@@ -2581,8 +2871,9 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                             # of noise; now ATR(5m)-scaled with a 1.0% floor so a real adverse move
                             # is required before a bleed kill can fire.
                             exit_reason = f"BLEED: down {drop_from_peak_pct:.2f}% from peak, mom turning against, net={_net_pnl_mon:+.2f}%"
-                        elif not _ever_green and _hold_age_mon > 300 and _net_pnl_mon < -0.55:
-                            # -0.55% = fee (-0.42%) + actual adverse move (-0.13%). Below this, trade is truly losing.
+                        elif not _ever_green and _hold_age_mon > 300 and _net_pnl_mon < -1.1:
+                            # -1.1% margin = 0.54% fees + ~0.55% real adverse move. Below this the
+                            # trade is truly losing (old -0.55% bar sat ~at fees, killed flat trades).
                             # ── S/R-aware: near support/resistance, bounce expected → wait longer ──
                             _sr_initial_timeout = 600
                             if ext:
@@ -2685,7 +2976,9 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                     # Two strategies: add at better price (flat market), or cut (moving against).
                     # Aug 11: raised mom5 threshold from 1% to 2% — 1% is noise at 6x leverage.
                     # Added net_pnl floor: don't emergency-close if loss is just fees.
-                    _underwater = _net_pnl_mon < -0.55 and _hold_age_mon > 600  # -0.55% = fee + 0.13% real loss
+                    # Real-fee calibrated (Sep 2026): 0.54% margin at 6x, so -1.1% margin =
+                    # fees + ~0.55% real move. Old -0.55% sat at the fee line and churned flat trades.
+                    _underwater = _net_pnl_mon < -1.1 and _hold_age_mon > 600  # fees + 0.55% real loss
                     _added_key = f"_added:{cu}"
                     _already_added = getattr(_monitor_positions, _added_key, False) if hasattr(_monitor_positions, _added_key) else False
                     
@@ -3025,11 +3318,15 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
         elif pnl_pct > 20:
             log.info(f"  🟢 {coin} {side}: +{pnl_pct:.1f}% — consider taking profit")
 
-        # Trailing stop update (Chandelier Exit with dynamic ATR multiplier) — WIRED TO EXCHANGE
+        # Trailing stop update (Chandelier Exit, research-calibrated Sep 2026) — WIRED TO EXCHANGE
+        # Scalp calibration: N=7-10 execution TF, k=2.0-2.5 (day-trade 1.5-2.5x ATR; the old
+        # base 3.0x was position-trade sizing and let scalps round-trip). Ratchet-only:
+        # update_trail() never moves the stop backward; breach exits on closed bars only.
         if coin in trail_states and _CHANDELIER_TRAIL:
             trail = trail_states[coin]
-            # Dynamic multiplier from volatility regime (research: 3x base for leveraged crypto)
-            dyn_mult = chandelier_atr_mult(atr)
+            # Dynamic multiplier from volatility regime, scalp-clamped 2.0-2.5x
+            # (chandelier_atr_mult returns 2.5-4.5 position-trade range — clamp the top).
+            dyn_mult = min(chandelier_atr_mult(atr), 2.5)
             # Short-ATR so the trail engages on the bot's real move size (15m ATR is ~2x too wide).
             _s_atr_pct = _calc_atr_pct(coin, _TRAIL_ATR_TF, 14)
             _s_atr = (_s_atr_pct / 100 * mid) if _s_atr_pct > 0 else atr
@@ -3652,7 +3949,7 @@ def _fast_monitor_loop(main_wallet: str) -> None:
 # ============================================================
 
 def run(dry_run: bool = False):
-    global hsl_state, exposure_state, cycle_count, evolution_check_cycles, _forager_skip_cooldown, _API_WALLET, _global_pause_until, _config, _rotate_offset, _losing_streak, _last_closed_equity, _last_total_eq
+    global hsl_state, exposure_state, cycle_count, evolution_check_cycles, _forager_skip_cooldown, _API_WALLET, _global_pause_until, _config, _rotate_offset, _losing_streak, _last_closed_equity, _last_total_eq, _losing_streak_paused_until
 
     cfg = json.loads(Path("/home/ubuntu/.hyperliquid/config.json").read_text())
     _config = cfg  # module-level so _execute_direct_open can read entries_enabled
@@ -3921,6 +4218,10 @@ def run(dry_run: bool = False):
                         if _losing_streak > 0:
                             log.info(f"  ✅ Losing streak broken at {_losing_streak} — equity recovered")
                         _losing_streak = 0
+                        # Only clear a hard-pause block once its 30 min actually elapsed AND a
+                        # winning flat-to-flat cycle printed — prevents instant re-entry loops.
+                        if time.time() >= _losing_streak_paused_until:
+                            _losing_streak_paused_until = 0.0
                 if not active:
                     _last_closed_equity = total_eq
                 hsl_state.update(total_eq)
@@ -4023,10 +4324,13 @@ def run(dry_run: bool = False):
                     max_pos = 2
                     slots_left = max(0, max_pos - len(active))
                 # ── Losing streak circuit breaker: reduce/block entries when edge is absent ──
+                # Freqtrade StoplossGuard pattern: 2 losers → single-position mode, 3 → 30-min
+                # full pause WITHOUT resetting the counter silently (old code zeroed the streak
+                # on pause so a grinding bleed never accumulated — pause must stick).
                 if _losing_streak >= _HARD_PAUSE_STREAK:
                     log.warning(f"  🛑 HARD PAUSE: {_losing_streak} consecutive losing trades — pausing 30 min")
                     _global_pause_until = max(_global_pause_until, time.time() + 1800)
-                    _losing_streak = 0  # Reset after pausing
+                    _losing_streak_paused_until = time.time() + 1800
                     slots_left = 0
                 elif _losing_streak >= _MAX_LOSING_STREAK:
                     log.warning(f"  ⚠️  LOSING STREAK: {_losing_streak} consecutive losers — reducing to 1 max position")
@@ -4038,6 +4342,19 @@ def run(dry_run: bool = False):
                 # ── Coin rotation: always advance through the universe (even with no slots) ──
                 # This ensures we have fresh data cached when a slot opens
                 candidates_all = [c for c in _ALL_COINS if c not in active_coins and c.upper() not in _coin_blacklist]
+                # ── LowProfitPairs filter (Sep 2026): skip quarantined coins at rotation ──
+                # Cheapest place to enforce it — quarantined pairs never even reach AI scan.
+                try:
+                    _nq = []
+                    for _c in candidates_all:
+                        _qq, _qr = pair_quarantined(_c)
+                        if _qq:
+                            log.info(f"  🚫 {_c}: {_qr} — skipping rotation")
+                        else:
+                            _nq.append(_c)
+                    candidates_all = _nq
+                except Exception:
+                    pass
                 always = [c for c in candidates_all if c in _ALWAYS_SCAN]
                 rest = [c for c in candidates_all if c not in _ALWAYS_SCAN]
                 window_start = _rotate_offset % max(len(rest), 1)
@@ -5002,11 +5319,27 @@ def run(dry_run: bool = False):
                     current_mark = float(mids.get(coin, 0))
 
                     # ── Gather Layer 3 data (sentiment/macro) ──
+                    # WhuffoBot veto pattern (Sep 2026): adverse funding kills the signal
+                    # outright (no AI override — paying to hold the wrong side is a fee
+                    # bleed), favorable funding is an amplifier handled at sizing.
                     try:
                         fund_ctx_sniper = funding_sniper.asset_ctx.get(coin, {})
                         fund_rate = float(fund_ctx_sniper.get("funding", 0)) if fund_ctx_sniper else 0.0
                     except Exception:
                         fund_rate = 0.0
+                    # Hourly funding rate as %: HL reports per-hour fraction (e.g. 0.0001 = 0.01%/h).
+                    # Extreme = top-decile bleed (>0.01%/h ≈ 0.24%/day ≈ 87%/yr).
+                    _FUND_VETO = 0.0001
+                    try:
+                        _fr_side = sig.side  # "BUY"/"SELL" from the enriched signal above
+                        if _fr_side == "BUY" and fund_rate < -_FUND_VETO:
+                            log.info(f"  🛑 {coin}: FUNDING VETO — LONG pays {fund_rate*100:.4f}%/h to shorts, skipping (WhuffoBot pattern)")
+                            continue
+                        elif _fr_side == "SELL" and fund_rate > _FUND_VETO:
+                            log.info(f"  🛑 {coin}: FUNDING VETO — SHORT pays {fund_rate*100:.4f}%/h to longs, skipping (WhuffoBot pattern)")
+                            continue
+                    except Exception:
+                        pass  # sig not ready — skip veto, don't block entry
 
                     # Compute OI delta directly from snapshots (get_oi_delta always 0 — same-source bug)
                     try:
@@ -5195,6 +5528,11 @@ def run(dry_run: bool = False):
                     # ── ENRICHED SELL ACCEL: when enriched+AI agree on SELL, bypass bull market blocker ──
                     # Problem: AI Market says "bullish" → BEAR ACCEL never fires → SELL blocked at market bias gate.
                     # Fix: when enriched=SELL, AI=short, composite≥0.10, and unified≥15%, set ai_override_applied.
+                    # SIGNAL-FIRST (Sep 2026): the two "Aug 7 AI≥80% bypasses X" escape hatches below
+                    # are REMOVED. Those hatches forced SELLs on dead/weak data (ATOM, MELANIA,
+                    # FARTCOIN, MET — all shorts near support that lost $0.45). AI≥80% still helps
+                    # PASS honest gates (composite/unified floors) but can no longer SKIP them: the
+                    # run must satisfy _comp_ok + unified>=15% like every other path.
                     _enriched_sell_accel = (not _bear_market and ai_dir == "SELL" and ai_conf_val >= 80
                                             and not has_pos and action in ("SELL", "HOLD") and not enter)
                     if _enriched_sell_accel:
@@ -5206,7 +5544,8 @@ def run(dry_run: bool = False):
                             _comp_ok = sig.composite_score <= 0.10  # Don't short if composite is bullish-positive
                         else:
                             _comp_ok = sig.composite_score >= 0.10  # Don't enter without conviction
-                        if _reason_ok and _comp_ok and pred.confidence >= 5:
+                        _sell_unified_ok = pred.confidence >= 15  # SIGNAL-FIRST: was 5% (fee-noise band)
+                        if _reason_ok and _comp_ok and _sell_unified_ok:
                             ai_dir_override = "SELL"
                             log.info(f"  🔻 {coin}: SELL ACCEL — enriched+AI agree on SELL (comp={sig.composite_score:+.2f}, "
                                     f"AI={ai_conf_val}%, unified={pred.direction}@{pred.confidence:.0f}%) — bypassing market bias")
@@ -5216,25 +5555,9 @@ def run(dry_run: bool = False):
                         elif not _reason_ok:
                             log.info(f"  🛑 {coin}: SELL ACCEL blocked — no signal data ({sig.reason})")
                         elif not _comp_ok:
-                            # Aug 7: AI≥80% bypasses composite gate
-                            if ai_conf_val >= 80:
-                                log.info(f"  ⚡ {coin}: AI BYPASS — composite {sig.composite_score:+.2f} but AI={ai_conf_val}% overrides SELL ACCEL")
-                                ai_dir_override = "SELL"
-                                action = ai_dir_override
-                                enter = True
-                                ai_override_applied = True
-                            else:
-                                log.info(f"  🛑 {coin}: SELL ACCEL blocked — composite {sig.composite_score:+.2f} too bullish for SELL (need ≤0.10 when enriched, ≥0.10 without)")
+                            log.info(f"  🛑 {coin}: SELL ACCEL blocked — composite {sig.composite_score:+.2f} too bullish for SELL (need ≤0.10 when enriched, ≥0.10 without)")
                         else:
-                            # Aug 7: AI≥80% bypasses unified confidence check
-                            if ai_conf_val >= 80:
-                                log.info(f"  ⚡ {coin}: AI BYPASS — unified={pred.direction}@{pred.confidence:.0f}% weak but AI={ai_conf_val}% overrides SELL ACCEL")
-                                ai_dir_override = "SELL"
-                                action = ai_dir_override
-                                enter = True
-                                ai_override_applied = True
-                            else:
-                                log.info(f"  🛑 {coin}: SELL ACCEL blocked — unified={pred.direction}@{pred.confidence:.0f}% too weak (need ≥5%)")
+                            log.info(f"  🛑 {coin}: SELL ACCEL blocked — unified={pred.direction}@{pred.confidence:.0f}% too weak (need ≥15%)")
 
                     if not enter:
                         # ── AI Trade Plan override: trust AI when unified is weak but non-zero ──
@@ -5256,6 +5579,14 @@ def run(dry_run: bool = False):
                              or (pred_conf >= 3 and ai_conf >= 80 and abs(sig.composite_score) >= 0.15) \
                              or (ai_conf >= 80 and sig.composite_score >= 0.15) \
                              or (_is_fast_track and ai_conf >= 80):
+                            # ── SIGNAL-FIRST ENTRY (Sep 2026): data quality decides, not AI confidence.
+                            # Forensic: every fast-track / AI-forced trade on a dead enriched signal
+                            # (ETH, APE, ATOM, INJ, SYRUP, ORDI) bled fees. AI can CONFIRM a live
+                            # data signal but never CREATE a trade from a dead one. Two hard rules:
+                            # (1) enriched HOLD/dead + unified <15% = no trade at ANY AI confidence
+                            #     (the "all data dead" case the old bypasses kept re-opening);
+                            # (2) unified >=25% opposing the AI direction = hard block (MET lesson).
+                            # The elif branches below are the fast-track/ML/all-dead enforcers.
                             # unified=1-14%+AI≥90% OR unified≥15%+AI≥80% OR composite≥0.15+AI≥80%
                             # OR fast-track synthetic signal with AI≥80% — skip unified/composite gates
                             ai_dir = ai_plan2.get("direction", "long")
@@ -5280,7 +5611,11 @@ def run(dry_run: bool = False):
                                             f"says {ml_dir}@{ml_conf:.0f}% (data beats AI)")
                                     continue
                                 # ── ALL-DATA DEAD: enriched=HOLD, unified≤5%, ML≤10% → AI can't solo
-                                _all_dead = pred_conf <= 5 and (not ml_conf or ml_conf <= 10) and sig.side == "HOLD"
+                                # SIGNAL-FIRST (Sep 2026): widened 5%→15% unified. Forensic: every
+                                # override in the 5-15% unified band on a dead enriched signal lost
+                                # money (INJ flat-4%, APE down-19%, ATOM up-41%-against). Unified
+                                # <15% with no enriched direction = no measurable edge = no trade.
+                                _all_dead = pred_conf < 15 and (not ml_conf or ml_conf <= 10) and sig.side == "HOLD"
                                 if _all_dead:
                                     log.info(f"  🛑 {coin}: AI override blocked — all data layers dead "
                                             f"(unified={pred_conf:.0f}% ML={ml_conf or 0:.0f}% enriched=HOLD), AI can't solo")
@@ -5379,10 +5714,37 @@ def run(dry_run: bool = False):
                                 log.info(f"  🛑 {coin}: AI override blocked — unified={pred_conf:.0f}% + AI={ai_conf}% insufficient (need unified>=3% OR AI>=80%)")
                                 continue
                         elif _is_fast_track and ai_conf >= 80:
-                            # Fast-track: let AI synthetic signal through regardless of unified
+                            # SIGNAL-FIRST (Sep 2026): fast-track no longer means "AI alone is
+                            # enough". The synthetic signal still needs a LIVE micro-confirm:
+                            # unified >=15% aligned, or taker-flow + imbalance-trend both aligned.
+                            # Every historical fast-track fill on dead micro (ETH flat-4%, APE
+                            # down-19%) lost money. Enforced here instead of 20 lines downstream.
+                            _ft_ok = False
+                            _ft_why = ""
+                            try:
+                                _ft_want = str(ai_plan2.get("direction", "long")).lower()
+                                _ft_dir = "BUY" if _ft_want == "long" else "SELL"
+                                _u_aligned = (pred.direction == ("up" if _ft_dir == "BUY" else "down")
+                                              and pred_conf >= 15)
+                                _tr = get_taker_ratio(coin, 60.0)
+                                _tr_dir = (_tr.get("direction", "") or "").lower() if isinstance(_tr, dict) else ""
+                                _ib = get_imbalance_trend(coin)
+                                _ib_sig = (_ib.get("signal", "") or "").lower() if isinstance(_ib, dict) else ""
+                                _want = "bullish" if _ft_dir == "BUY" else "bearish"
+                                _micro_aligned = (_tr_dir == _want and _ib_sig == _want)
+                                _ft_ok = bool(_u_aligned or _micro_aligned)
+                                _ft_why = (f"unified={pred.direction}@{pred_conf:.0f}%"
+                                           + (f" aligned" if _u_aligned else "")
+                                           + (f" micro(taker={_tr_dir},imb={_ib_sig})" if _micro_aligned else ""))
+                            except Exception:
+                                _ft_ok = False
+                            if not _ft_ok:
+                                log.info(f"  🛑 {coin}: FAST-TRACK BLOCKED — synthetic {_ft_dir} has no live confirm "
+                                         f"(need unified>=15% aligned or taker+imbalance aligned) {_ft_why}")
+                                continue
                             ft_dir = ai_plan2.get("direction", "long")
                             action = "BUY" if str(ft_dir).lower() == "long" else "SELL"
-                            log.info(f"  🚀 {coin}: FAST-TRACK ENTRY — AI={ai_conf}% {action} synthetic signal, skipping unified gate")
+                            log.info(f"  🚀 {coin}: FAST-TRACK ENTRY — AI={ai_conf}% {action} synthetic signal, micro-confirmed ({_ft_why})")
                             ai_override_applied = True
                         # For AI-override coins, let the AI have the final say
                         elif ai_override_needed and pred.confidence >= 5:
@@ -5431,6 +5793,10 @@ def run(dry_run: bool = False):
                         # with should_enter()'s naive action (e.g. VWAP fade vs trend), enriched wins.
                         # must_enter bypass + should_enter() can produce action that conflicts with
                         # enriched's read of the same data. Enriched > unified predictor for direction.
+                        # SIGNAL-FIRST (Sep 2026): enriched OVERRIDE that contradicts AI direction now
+                        # needs unified non-opposing (MET lesson: unified DOWN@39% was right, enriched
+                        # +AI BUY was wrong). The old 40% veto bar let through every 25-40% opposing
+                        # read that later lost money. Tightened 40→25 to match the AI-override guard.
                         ai_plan_sanity = _ai_trade_plan.get(coin.upper(), {})
                         ai_conf_sanity = ai_plan_sanity.get("confidence", 0)
                         ai_dir_sanity = ai_plan_sanity.get("direction", "").upper()
@@ -5439,12 +5805,13 @@ def run(dry_run: bool = False):
                             (enriched_final == "SELL" and ai_dir_sanity == "SHORT")
                         )
                         if (sig.composite_score >= 0.00 and enriched_ai_agree) or \
-                           (enriched_final == "SELL" and enriched_ai_agree and sig.composite_score <= 0.15 
+                           (enriched_final == "SELL" and enriched_ai_agree and sig.composite_score <= 0.15
                             and not (ai_market.get("bias", "") == "bullish" if "ai_market" in dir() else False)):
                             # ── Unified predictor guard: block override when unified strongly opposes ──
-                            # Aug 7: 20→40 — unified needs HIGH conviction to veto enriched+AI agreement
+                            # Sep 2026: 40→25 — unified needs real conviction to veto enriched+AI
+                            # agreement (matches the AI-override guard two screens down).
                             _unified_opposes = (
-                                pred.confidence > 40 and (
+                                pred.confidence >= 25 and (
                                     (enriched_final == "BUY" and pred.direction == "down") or
                                     (enriched_final == "SELL" and pred.direction == "up")
                                 )
@@ -5455,13 +5822,16 @@ def run(dry_run: bool = False):
                                            f"says {pred.direction}@{pred.confidence:.0f}% — allowing unified to veto")
                                 continue
                             # ── ML contradiction check: enriched override must also pass ML gate ──
-                            # Aug 7: ML oppose threshold raised 30→50% — zero-loss exits protect downside
+                            # Sep 2026: 50→30% — the 50% bar was a zero-loss-era relic. ML at 30%+
+                            # already hard-blocks AI overrides (ML hard-block gate); letting an
+                            # enriched override sail through at ML-contradicting-40% was incoherent.
+                            # ATOM lesson: AI=85% SHORT vs ML=UP@41% overrode and lost.
                             _ml_opposes_enriched = False
                             try:
                                 if 'ml_pred' in dir():
-                                    if (enriched_final == "SELL" and ml_pred.direction == "up" and ml_pred.confidence >= 50):
+                                    if (enriched_final == "SELL" and ml_pred.direction == "up" and ml_pred.confidence >= 30):
                                         _ml_opposes_enriched = True
-                                    elif (enriched_final == "BUY" and ml_pred.direction == "down" and ml_pred.confidence >= 50):
+                                    elif (enriched_final == "BUY" and ml_pred.direction == "down" and ml_pred.confidence >= 30):
                                         _ml_opposes_enriched = True
                             except (NameError, AttributeError):
                                 pass
@@ -5941,12 +6311,15 @@ def run(dry_run: bool = False):
 
                     # ── Session volume check ──
                     notional = total_eq * pos_pct * chosen_leverage  # Compute before risk overrides
-                    # ── Minimum notional guard: no penny trades ──
-                    min_notional = max(MIN_NOTIONAL_USD, total_eq * 0.35)  # was 0.40 — too high for $60 account
-                    # Fast-track: AI-picked micro caps can go to $10 (HL absolute minimum)
+                    # ── Minimum notional guard (perplobster/chainstack preflight, Sep 2026) ──
+                    # HL absolute minimum is $10 notional; below $11 after rounding the order
+                    # risks exchange rejection ("below_min") and a wasted cycle. $11 floor gives
+                    # 10% headroom for price drift between sizing and fill.
+                    # Fast-track micro caps: $11 floor, no equity-percentage games.
+                    min_notional = max(11.0, total_eq * 0.35)
                     _is_ft_notional = sig.reason.startswith("ai_fast_track:") if hasattr(sig, 'reason') else False
                     if _is_ft_notional and ai_conf_val >= 80:
-                        min_notional = max(10.0, total_eq * 0.18)  # $10 floor, 18% equity cap (was 20%)
+                        min_notional = 11.0
                     if notional < min_notional - 0.01:  # epsilon to avoid float rounding at boundary
                         # Bump position size to meet minimum rather than skipping entirely.
                         # Micro accounts ($60-100) need this to participate.
@@ -6015,7 +6388,7 @@ def run(dry_run: bool = False):
                         regime=sig.regime.value,
                         break_even_after=1,
                         trail_after=2,
-                        trail_atr_mult=tactical.trail_atr_mult,
+                        trail_atr_mult=min(tactical.trail_atr_mult, 2.5),
                         ai_target_pct=ai_target,
                     )
                     log.info(f"\n{describe_exit_plan(exit_plan)}\n")
@@ -6055,7 +6428,8 @@ def run(dry_run: bool = False):
                             tp_levels=tp_list if tp_list else None,
                             composite_score=sig.composite_score,
                             signal_confidence=sig.confidence,
-                            unified_confidence=pred.confidence,
+                            unified_confidence=(pred.confidence if hasattr(pred, "confidence")
+                                                else (pred.get("confidence", 0) if isinstance(pred, dict) else 0)),
                             signal_reason=sig.reason,
                         )
                         if not v.get("ok", True):
@@ -6212,6 +6586,40 @@ def run(dry_run: bool = False):
                             if _entry_price > 0 and _entry_price < 0.02:
                                 log.info(f"  🚫 {coin}: MICRO-CAP — ${_entry_price:.4f} < $0.02 (too illiquid, will ghost fill)")
                                 continue
+                            # ── EV GATE (Sep 2026, Harper method): the math must work ──
+                            # EV = p*reward - (1-p)*risk - costs > 0 AND reward/risk >= 1.5.
+                            # p = min(unified, AI)/100 capped at 0.7 (no 90% fairy tales on micros).
+                            # reward = AI target% (fallback 1.5x stop); risk = stop distance%;
+                            # costs = 0.09% taker round-trip + funding bleed over expected hold.
+                            # ASTER (R:R 0.95) and MET (R:R 1.16) both failed this — the old
+                            # `pass  # EV gate skipped` line let them through to lose.
+                            try:
+                                # p: unified-direction confidence (object) OR short-term dict —
+                                # Stage 4.5 reassigns pred to a dict on high conviction, so
+                                # handle both; fall back to signal confidence.
+                                try:
+                                    _ev_p_raw = pred.confidence
+                                except AttributeError:
+                                    _ev_p_raw = (pred.get("confidence", 0) if isinstance(pred, dict) else 0) or 0
+                                _ev_ai_c = float(ai_plan4.get("confidence", 0) or 0) or float(sig.confidence or 0)
+                                _ev_p = min(_ev_p_raw, _ev_ai_c) / 100.0
+                                _ev_p = min(max(_ev_p, 0.0), 0.7)
+                                _ev_stop_pct = abs(entry_price - stop_price) / entry_price * 100 if entry_price > 0 else 1.5
+                                _ev_ai_tgt = abs(float(ai_plan4.get("target_pct", 0) or 0))
+                                _ev_rew = _ev_ai_tgt if _ev_ai_tgt > 0 else _ev_stop_pct * 1.5
+                                try:
+                                    _ev_fund = float((fund_ctx_sniper or {}).get("funding", 0))
+                                except Exception:
+                                    _ev_fund = 0.0
+                                _ev_cost = 0.09 + abs(_ev_fund) * 100 * 2  # taker RT + ~2h funding
+                                _ev_rr = (_ev_rew / _ev_stop_pct) if _ev_stop_pct > 0 else 0
+                                _ev = _ev_p * _ev_rew - (1 - _ev_p) * _ev_stop_pct - _ev_cost
+                                if _ev_rr < 1.5 or _ev <= 0:
+                                    log.info(f"  🧮 {coin}: EV GATE — p={_ev_p:.0%} rew={_ev_rew:.2f}% risk={_ev_stop_pct:.2f}% "
+                                             f"R:R={_ev_rr:.2f} EV={_ev:+.3f}% (need R:R>=1.5, EV>0) — skip")
+                                    continue
+                            except Exception:
+                                pass  # EV inputs missing — proceed (other gates still apply)
                             # Spread check: skip if bid-ask > 2% (thin book, will ghost/dust)
                             if _entry_price > 0:
                                 try:
