@@ -7173,11 +7173,15 @@ def run(dry_run: bool = False):
                             # at SURVIVAL ENTRY). reward = AI target% (fallback 1.5x
                             # stop); risk = stop%; costs = 0.09% taker RT + funding.
                             # Block when raw R:R<1.0 (risk exceeds reward, like ASTER
-                            # 0.95) or EV<=0, else pass.
+                            # 0.95) or EV<=0, else pass. AI>=85% trumps the R:R
+                            # floor (EV>0 only) — user rule: AI>mechanical gates.
                             try:
                                 from ev_gate import check_ev_gate as _ev_check
                                 _ev_ai_c = float(ai_plan4.get("confidence", 0) or 0) or float(sig.confidence or 0)
-                                _ev_p_conf = min(max(_ev_ai_c, 0.0), 70.0)
+                                # AI>=85% trumps: trust its win prob (cap at AI, not 70),
+                                # so EV reflects the conviction (user rule: AI>mechanical).
+                                _ev_p_cap = _ev_ai_c if _ev_ai_c >= 85 else 70.0
+                                _ev_p_conf = min(max(_ev_ai_c, 0.0), _ev_p_cap)
                                 _ev_stop_pct = abs(entry_price - stop_price) / entry_price * 100 if entry_price > 0 else 1.5
                                 _ev_ai_tgt = abs(float(ai_plan4.get("target_pct", 0) or 0))
                                 _ev_rew = _ev_ai_tgt if _ev_ai_tgt > 0 else _ev_stop_pct * 1.5
@@ -7197,7 +7201,9 @@ def run(dry_run: bool = False):
                                 _ev_raw_rr = (_ev_res.reward_pct / _ev_res.risk_pct
                                               if _ev_res.risk_pct > 0 else 0.0)
                                 _ev_block = ""
-                                if _ev_raw_rr < 1.0:
+                                # AI>=85% trumps R:R floor (user rule): EV>0 only.
+                                _ev_ai_trump = _ev_ai_c >= 85
+                                if _ev_raw_rr < 1.0 and not _ev_ai_trump:
                                     _ev_block = (f"R:R={_ev_raw_rr:.2f} below 1.0 "
                                                  f"(target too close or stop too wide)")
                                 elif _ev_res.expected_return_pct <= 0:
