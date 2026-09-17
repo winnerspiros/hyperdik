@@ -648,3 +648,75 @@ def full_risk_check(
         True, "ok", size_units, notional, leverage,
         adj_kelly, vol_mult, hsl_state.tier, exposure_state.wel_used_pct,
     )
+
+
+# ============================================================
+# LIQ-BUFFER GATE — pre-trade leverage/liquidation safety
+# ============================================================
+# Hyperliquid liquidates an isolated position when the adverse move eats
+# the margin: liq_dist_pct ≈ 100/leverage − maintenance_margin_pct.
+# The stop MUST sit well inside that distance, or a normal wick kills the
+# position before the stop can save it (MINA/MET/INIT died at 8-10x in
+# seconds on micro equity).
+# Rule: stop% ≤ 60% of liq distance at final leverage; otherwise step
+# leverage down (never below 3x) until it fits, else block the trade.
+
+LIQ_MAINT_MARGIN_PCT = 1.0   # conservative maintenance + fee buffer (HL tiers ~0.5%+ at our size)
+LIQ_MAX_STOP_FRAC = 0.60     # stop may use at most 60% of the distance to liquidation
+LIQ_MIN_LEVERAGE = 3         # never step below 3x (matches AI sizing floor)
+
+
+def liquidation_distance_pct(leverage: float) -> float:
+    """Adverse-move % from entry to approximate isolated liquidation.
+
+    Long @ Lx liquidates ~100/L % below entry (minus maintenance margin);
+    symmetric for shorts. Conservative by design (overstates danger).
+    """
+    try:
+        lev = float(leverage)
+    except (TypeError, ValueError):
+        return 0.0
+    if lev <= 0:
+        return 0.0
+    return max(0.0, 100.0 / lev - LIQ_MAINT_MARGIN_PCT)
+
+
+def check_liq_buffer(
+    entry_price: float,
+    stop_price: float,
+    leverage: int,
+    max_stop_frac: float = LIQ_MAX_STOP_FRAC,
+    min_leverage: int = LIQ_MIN_LEVERAGE,
+) -> tuple[bool, int, float, str]:
+    """Pre-trade liq-buffer gate.
+
+    Returns (ok, safe_leverage, liq_dist_pct, detail):
+      - ok=True, safe_leverage==leverage → fits, proceed.
+      - ok=True, safe_leverage<leverage → fits only lower; use safe_leverage.
+      - ok=False → stop exceeds max_stop_frac of liq distance even at
+        min_leverage; block the trade.
+    """
+    try:
+        req = int(leverage)
+    except (TypeError, ValueError):
+        req = min_leverage
+    if not entry_price or not stop_price or entry_price <= 0 or stop_price <= 0:
+        return True, req, 0.0, "no price data — gate skipped"
+    try:
+        stop_pct = abs(float(entry_price) - float(stop_price)) / float(entry_price) * 100.0
+    except (TypeError, ValueError, ZeroDivisionError):
+        return True, req, 0.0, "no price data — gate skipped"
+    # Step down from requested leverage until the stop fits inside the buffer.
+    lev = req
+    while lev >= min_leverage:
+        d = liquidation_distance_pct(lev)
+        if d > 0 and stop_pct <= max_stop_frac * d:
+            if lev == req:
+                return True, req, d, f"stop {stop_pct:.2f}% inside {max_stop_frac:.0%} of liq {d:.1f}% @ {req}x"
+            return True, lev, d, f"stop {stop_pct:.2f}% needs ≤{lev}x (liq {d:.1f}%)"
+        lev -= 1
+    d_min = liquidation_distance_pct(min_leverage)
+    return False, min_leverage, d_min, (
+        f"stop {stop_pct:.2f}% exceeds {max_stop_frac:.0%} of liq distance "
+        f"({max_stop_frac * d_min:.1f}% of {d_min:.1f}%) even at {min_leverage}x"
+    )

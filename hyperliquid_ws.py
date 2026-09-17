@@ -8,7 +8,7 @@ Streams: trades (every fill), order book (L2 updates), user positions.
 Stores to hyperliquid_ws_data.json for daemon consumption.
 """
 import copy
-import json, time, threading, ssl, asyncio
+import json, time, threading, ssl, asyncio, os
 from collections import deque
 import websocket  # pip install websocket-client
 
@@ -253,25 +253,102 @@ def _on_close(ws, close_status_code, close_msg):
         _latest_data["running"] = False
 
 
+# ── Dynamic watchlist subscriptions (Sep 2026) ──────────────────────────
+# The daemon writes data/ws_watchlist.json every cycle (active positions
+# first, then always-scan majors, then the current rotation window, cap 50).
+# The WS feed subscribes trades+l2Book+openInterest for those coins so the
+# spread filter, OFI gate, maker queue guard, CVD and taker-ratio all see
+# live books on ROTATED coins — not just the 10 hardcoded majors.
+# allMids still covers every coin's price regardless.
+_WATCHLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "ws_watchlist.json")
+_WATCHLIST_MAX = 50
+_TRADES_MAX = 30  # full trades feed for the first 30 (active + majors); books for all 50
+_BASE_COINS = ["BTC", "ETH", "SOL", "DOGE", "XRP", "AVAX", "ADA", "LINK", "SUI", "DOT"]
+_ws_app = None
+_ws_app_lock = threading.Lock()
+_sub_trades: set = set()
+_sub_books: set = set()
+_sub_oi: set = set()
+
+
+def _load_watchlist() -> list:
+    """Ordered unique watchlist from daemon file, fallback to majors."""
+    try:
+        with open(_WATCHLIST_FILE) as _f:
+            coins = json.load(_f)
+        seen: list = []
+        for _c in coins:
+            _u = str(_c).upper()
+            if _u and _u not in seen:
+                seen.append(_u)
+        return (seen[:_WATCHLIST_MAX] or list(_BASE_COINS))
+    except Exception:
+        return list(_BASE_COINS)
+
+
+def _sub_send(ws, method: str, sub: dict) -> bool:
+    try:
+        ws.send(json.dumps({"method": method, "subscription": sub}))
+        return True
+    except Exception:
+        return False
+
+
+def _sync_subscriptions(ws, coins: list, stagger: float = 0.05) -> None:
+    """Subscribe deltas for watchlist coins; unsubscribe coins that rotated out."""
+    global _sub_trades, _sub_books, _sub_oi
+    want = [c for c in coins if c]
+    want_trades = set(want[:_TRADES_MAX])
+    want_books = set(want)
+    want_oi = set(want)
+    # ── Subscribe new ──
+    for coin in want:
+        if coin in want_trades and coin not in _sub_trades:
+            if _sub_send(ws, "subscribe", {"type": "trades", "coin": coin}):
+                _sub_trades.add(coin)
+                time.sleep(stagger)
+        if coin not in _sub_books:
+            if _sub_send(ws, "subscribe", {"type": "l2Book", "coin": coin}):
+                _sub_books.add(coin)
+                time.sleep(stagger)
+        if coin not in _sub_oi:
+            if _sub_send(ws, "subscribe", {"type": "openInterest", "coin": coin}):
+                _sub_oi.add(coin)
+                time.sleep(stagger)
+    # ── Unsubscribe rotated-out (keep base majors always) ──
+    for coin in list(_sub_trades - want_trades):
+        if coin in _BASE_COINS:
+            continue
+        if _sub_send(ws, "unsubscribe", {"type": "trades", "coin": coin}):
+            _sub_trades.discard(coin)
+    for coin in list(_sub_books - want_books):
+        if coin in _BASE_COINS:
+            continue
+        if _sub_send(ws, "unsubscribe", {"type": "l2Book", "coin": coin}):
+            _sub_books.discard(coin)
+            with _state_lock:
+                _latest_data["orderbooks"].pop(coin, None)
+                _latest_data["trades"].pop(coin, None)
+                _latest_data["trade_history"].pop(coin, None)
+    for coin in list(_sub_oi - want_oi):
+        if coin in _BASE_COINS:
+            continue
+        if _sub_send(ws, "unsubscribe", {"type": "openInterest", "coin": coin}):
+            _sub_oi.discard(coin)
+
+
 def _on_open(ws):
+    global _ws_app, _sub_trades, _sub_books, _sub_oi
     with _state_lock:
         _latest_data["running"] = True
+    with _ws_app_lock:
+        _ws_app = ws
+    # Fresh connection = fresh server-side subs — clear and resubscribe all
+    _sub_trades = set()
+    _sub_books = set()
+    _sub_oi = set()
 
-    # Subscribe to real-time data
-    coins = ["BTC", "ETH", "SOL", "DOGE", "XRP", "AVAX", "ADA", "LINK", "SUI", "DOT"]
-
-    # Trades for each coin (staggered to avoid rate limits)
-    import time
-    for coin in coins:
-        ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "trades", "coin": coin}}))
-        time.sleep(0.15)  # stagger 150ms
-
-    # Order books (staggered)
-    for coin in coins:
-        ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "l2Book", "coin": coin}}))
-        time.sleep(0.15)
-
-    # All mids (price updates every 500ms)
+    # All mids (price updates every 500ms — covers EVERY coin)
     ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "allMids"}}))
 
     # User data (positions, orders) - requires auth
@@ -283,10 +360,22 @@ def _on_open(ws):
     # User funding — real-time funding payment tracking
     ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "userFunding", "user": ""}}))
 
-    # Open Interest — real-time OI per coin
-    for coin in coins:
-        ws.send(json.dumps({"method": "subscribe", "subscription": {"type": "openInterest", "coin": coin}}))
-        time.sleep(0.15)
+    # Per-coin feeds from the daemon's live watchlist (dynamic, not hardcoded)
+    _sync_subscriptions(ws, _load_watchlist())
+
+
+def _watchlist_poller(interval: float = 20.0):
+    """Re-sync per-coin subscriptions as the daemon rotates its watchlist."""
+    while True:
+        time.sleep(interval)
+        try:
+            with _ws_app_lock:
+                ws = _ws_app
+            if ws is None:
+                continue
+            _sync_subscriptions(ws, _load_watchlist())
+        except Exception:
+            pass
 
 
 def start_ws(address: str):
@@ -309,6 +398,8 @@ def start_ws(address: str):
 
     t = threading.Thread(target=_run, daemon=True)
     t.start()
+    p = threading.Thread(target=_watchlist_poller, args=(20.0,), daemon=True)
+    p.start()
     return t
 
 

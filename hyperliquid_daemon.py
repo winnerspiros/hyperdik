@@ -134,7 +134,7 @@ from hyperliquid_risk import (
     get_leverage_for_regime, RiskCheck,
     compute_portfolio_heat, is_portfolio_heat_safe, compute_max_new_position,
     DEFAULT_BTC_CORRELATIONS, MAX_PORTFOLIO_HEAT, MAX_LEVERAGED_HEAT,
-    get_heat_limits,
+    get_heat_limits, check_liq_buffer,
 )
 from hyperliquid_execution import (
     build_exit_plan, describe_exit_plan, MultiTierTP,
@@ -4403,6 +4403,21 @@ def run(dry_run: bool = False):
                     window += rest[:(_ROTATE_WINDOW - len(always) - len(window))]
                 candidates = always + window
                 _rotate_offset += _ROTATE_WINDOW
+                # ── WS watchlist (Sep 2026): active positions first, then
+                # always-scan majors, then this cycle's rotation window (cap 50).
+                # hyperliquid_ws subscribes trades+l2Book+OI for these so the
+                # spread/OFI/queue/CVD guards see live books on rotated coins.
+                try:
+                    _wl = [c.upper() for c in active_coins if c]
+                    for _c in list(_ALWAYS_SCAN) + list(window):
+                        _u = str(_c).upper()
+                        if _u and _u not in _wl:
+                            _wl.append(_u)
+                    os.makedirs("data", exist_ok=True)
+                    with open("data/ws_watchlist.json", "w") as _wf:
+                        json.dump(_wl[:50], _wf)
+                except Exception:
+                    pass
                 
                 # ── Sector rotation: update momentum per sector ──
                 try:
@@ -6670,10 +6685,8 @@ def run(dry_run: bool = False):
                                 continue
 
                     # ── Stage 5.5: EV Gate (Harper method) ──
-                    # Expected-value check: confidence × reward% − (1−confidence) × risk% − costs > 0
-                    # AND net reward/risk >= 1.5. Data beats opinion.
-                    # ASTER: EV blocked it (R:R=0.95). MET: EV blocked it (R:R=1.16).
-                    # If the math doesn't work, no amount of AI confidence justifies the trade.
+                    # Expected-value check lives inline at Stage 6 (ev_gate.check_ev_gate)
+                    # where the final size/leverage are known — one implementation only.
                     except Exception as _debate_e:
                         log.warning(f"  ⚠️ {coin}: debate failed ({type(_debate_e).__name__}: {_debate_e}) — proceeding without debate")
                         debate_verdict = "OVERWEIGHT"  # fallback
@@ -6718,23 +6731,20 @@ def run(dry_run: bool = False):
                                 log.info(f"  🚫 {coin}: MICRO-CAP — ${_entry_price:.4f} < $0.02 (too illiquid, will ghost fill)")
                                 continue
                             # ── EV GATE (Sep 2026, Harper method): the math must work ──
-                            # EV = p*reward - (1-p)*risk - costs > 0 AND reward/risk >= 1.5.
-                            # p = AI%/100 capped at 0.7 (Sep 17: min(unified,AI) starved every
-                            # AI-forced trade — AI picks arrive as fast-track synthetics with
-                            # unified 0-19%, so the min() punished EXACTLY the user's directive:
-                            # "AI>=85% trumps mechanical gates". Unified opinion still gates
-                            # upstream at SURVIVAL ENTRY; EV just prices the AI's own thesis.)
-                            # reward = AI target% (fallback 1.5x stop); risk = stop distance%;
-                            # costs = 0.09% taker round-trip + funding bleed over expected hold.
-                            # Guardrail kept: R:R>=1.0 (was 1.5 — AI plans 2.0%tgt/1.88%stop =
-                            # R:R 1.07 all failed despite EV=+0.75%; at p=70% that template
-                            # is profitable, the 1.5 bar was pure starvation. R:R<1.0
-                            # = risk exceeds reward = negative expectancy, still blocked
-                            # like ASTER 0.95) + EV>0.
+                            # Single implementation in ev_gate.check_ev_gate (probability-
+                            # weighted EV after costs). R:R uses RAW reward/stop (not net
+                            # of costs): net-RR would block e.g. 2.0%tgt/1.5%stop (net
+                            # 0.94) that the proven raw>=1.0 gate passes — starvation.
+                            # p = AI win prob capped at 70% (Sep 17: min(unified,AI)
+                            # starved AI-forced trades — unified still gates upstream
+                            # at SURVIVAL ENTRY). reward = AI target% (fallback 1.5x
+                            # stop); risk = stop%; costs = 0.09% taker RT + funding.
+                            # Block when raw R:R<1.0 (risk exceeds reward, like ASTER
+                            # 0.95) or EV<=0, else pass.
                             try:
-                                # p: the AI's own win probability, capped at 70%.
+                                from ev_gate import check_ev_gate as _ev_check
                                 _ev_ai_c = float(ai_plan4.get("confidence", 0) or 0) or float(sig.confidence or 0)
-                                _ev_p = min(max(_ev_ai_c, 0.0), 70.0) / 100.0
+                                _ev_p_conf = min(max(_ev_ai_c, 0.0), 70.0)
                                 _ev_stop_pct = abs(entry_price - stop_price) / entry_price * 100 if entry_price > 0 else 1.5
                                 _ev_ai_tgt = abs(float(ai_plan4.get("target_pct", 0) or 0))
                                 _ev_rew = _ev_ai_tgt if _ev_ai_tgt > 0 else _ev_stop_pct * 1.5
@@ -6743,11 +6753,26 @@ def run(dry_run: bool = False):
                                 except Exception:
                                     _ev_fund = 0.0
                                 _ev_cost = 0.09 + abs(_ev_fund) * 100 * 2  # taker RT + ~2h funding
-                                _ev_rr = (_ev_rew / _ev_stop_pct) if _ev_stop_pct > 0 else 0
-                                _ev = _ev_p * _ev_rew - (1 - _ev_p) * _ev_stop_pct - _ev_cost
-                                if _ev_rr < 1.0 or _ev <= 0:
-                                    log.info(f"  🧮 {coin}: EV GATE — p={_ev_p:.0%} rew={_ev_rew:.2f}% risk={_ev_stop_pct:.2f}% "
-                                             f"R:R={_ev_rr:.2f} EV={_ev:+.3f}% (need R:R>=1.0, EV>0) — skip")
+                                _ev_tgt_px = (entry_price * (1 + _ev_rew / 100)
+                                              if _trade_side == "BUY"
+                                              else entry_price * (1 - _ev_rew / 100))
+                                # min_reward_risk=0: module's net-of-costs R:R check
+                                # disabled — raw R:R applied below (proven semantics).
+                                _ev_res = _ev_check(_trade_side, entry_price, _ev_tgt_px,
+                                                    stop_price, _ev_p_conf, _ev_cost,
+                                                    min_reward_risk=0.0)
+                                _ev_raw_rr = (_ev_res.reward_pct / _ev_res.risk_pct
+                                              if _ev_res.risk_pct > 0 else 0.0)
+                                _ev_block = ""
+                                if _ev_raw_rr < 1.0:
+                                    _ev_block = (f"R:R={_ev_raw_rr:.2f} below 1.0 "
+                                                 f"(target too close or stop too wide)")
+                                elif _ev_res.expected_return_pct <= 0:
+                                    _ev_block = (f"EV={_ev_res.expected_return_pct:+.3f}% — "
+                                                 f"negative after costs")
+                                if _ev_block:
+                                    log.info(f"  🧮 {coin}: EV GATE — p={_ev_p_conf:.0f}% rew={_ev_res.reward_pct:.2f}% risk={_ev_res.risk_pct:.2f}% "
+                                             f"R:R={_ev_raw_rr:.2f} EV={_ev_res.expected_return_pct:+.3f}% — {_ev_block} — skip")
                                     continue
                             except Exception:
                                 pass  # EV inputs missing — proceed (other gates still apply)
@@ -6848,6 +6873,25 @@ def run(dry_run: bool = False):
                             if _final_notional > _max_notional:
                                 log.info(f"  💰 {coin}: capping notional ${_final_notional:.0f}→${_max_notional:.0f} (equity ${total_eq:.2f} @ {_final_leverage}x)")
                                 _final_notional = _max_notional
+                            # ── LIQ-BUFFER GATE (Sep 2026): stop must sit well inside
+                            # liquidation distance at FINAL leverage. Steps leverage
+                            # down (never below 3x) until it fits, else blocks.
+                            try:
+                                _liq_ok, _liq_lev, _liq_dist, _liq_detail = check_liq_buffer(
+                                    entry_price, stop_price, _final_leverage)
+                                if not _liq_ok:
+                                    log.info(f"  🧊 {coin}: LIQ-BUFFER BLOCK — {_liq_detail} — skip")
+                                    continue
+                                if _liq_lev != _final_leverage:
+                                    log.info(f"  🧊 {coin}: LIQ-BUFFER — {_liq_detail} → lev {_final_leverage}x→{_liq_lev}x")
+                                    _final_leverage = _liq_lev
+                                    # Lower leverage = more margin per notional — re-cap.
+                                    _max_notional = max(total_eq * 0.9 * _final_leverage, 11.0)
+                                    if _final_notional > _max_notional:
+                                        log.info(f"  💰 {coin}: re-capping notional ${_final_notional:.0f}→${_max_notional:.0f} (equity ${total_eq:.2f} @ {_final_leverage}x)")
+                                        _final_notional = _max_notional
+                            except Exception as _liq_e:
+                                log.warning(f"  ⚠️ {coin}: liq-buffer check failed ({_liq_e}) — proceeding")
                             
                             # Parse entry zone: AI may return "0.059-0.061" or "0.059"
                             _zone_px = 0.0

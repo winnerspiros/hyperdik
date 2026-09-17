@@ -380,17 +380,22 @@ def decide_borderline(
         if ws_trade_price > 0:
             ob_info += f" last={ws_trade_side}@${ws_trade_price:.4f}"
 
-    # Liquidation risk calc -- v4: AI-driven leverage with liquidation awareness
+    # Liquidation risk calc — REAL isolated-margin math (hyperliquid_risk).
+    # liq_dist ≈ 100/lev − 1% maintenance; symmetric for long/short.
+    # (Was a made-up stop×leverage formula that understated liq danger.)
     # Default safe values (actual leverage/sizing decided by decide_sizing)
     _leverage = 2
     _stop_pct = 5.0
     _stop_price = entry_price * 0.95 if signal_side == "BUY" else entry_price * 1.05
+    try:
+        from hyperliquid_risk import liquidation_distance_pct as _liq_dist
+        liq_dist_pct = _liq_dist(_leverage)
+    except Exception:
+        liq_dist_pct = max(0.0, 100.0 / _leverage - 1.0)
     if signal_side == "BUY":
-        liq_dist_pct = (entry_price - _stop_price) / entry_price * _leverage * 100
-        liq_price = entry_price * (1 - (_stop_pct / 100) * _leverage / 2)
+        liq_price = entry_price * (1 - liq_dist_pct / 100)
     else:
-        liq_dist_pct = (_stop_price - entry_price) / entry_price * _leverage * 100
-        liq_price = entry_price * (1 + (_stop_pct / 100) * _leverage / 2)
+        liq_price = entry_price * (1 + liq_dist_pct / 100)
     lev_risk = (
         f"LEV:{_leverage}x liq_dist:{liq_dist_pct:.1f}%_move "
         f"(liq~${liq_price:.2f}) eq:${equity:.0f}"
