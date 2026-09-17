@@ -829,12 +829,12 @@ def _scan_batch(batch: list[dict], equity: float, market_context: str,
             f"hint={c.get('signal_hint','?')}{vwap_str}{oi_str}{fund_str}{cvd_str}{prox_str}"
         )
     prompt = (
-        f'JSON:{{\"picks\":[{{\"coin\":\"X\",\"dir\":\"long\",\"conf\":80,\"tgt\":2.5,\"stop\":0.9,\"hold\":45,'
-        + f'\"entry_type\":\"market\",\"scale\":\"full\",\"exit_at\":\"2.5%\",'
+        f'JSON:{{\"picks\":[{{\"coin\":\"X\",\"dir\":\"long\",\"conf\":80,\"tgt\":1.2,\"stop\":0.55,\"hold\":40,'
+        + f'\"entry_type\":\"market\",\"scale\":\"full\",\"exit_at\":\"1.2%\",'
         + f'\"entry_zone\":\"0.295-0.298\",\"urgency\":\"now\",\"invalidation\":\"m5 turns neg\",'
         + f'\"risk_note\":\"tight rng\",\"reason\":\"m5 accelerating\"}},'
-        + f'{{\"coin\":\"Z\",\"dir\":\"short\",\"conf\":78,\"tgt\":2.0,\"stop\":0.9,\"hold\":40,'
-        + f'\"entry_type\":\"market\",\"scale\":\"full\",\"exit_at\":\"2.0%\",'
+        + f'{{\"coin\":\"Z\",\"dir\":\"short\",\"conf\":78,\"tgt\":1.2,\"stop\":0.55,\"hold\":40,'
+        + f'\"entry_type\":\"market\",\"scale\":\"full\",\"exit_at\":\"1.2%\",'
         + f'\"entry_zone\":\"0.420-0.425\",\"urgency\":\"now\",\"invalidation\":\"m5 turns pos\",'
         + f'\"risk_note\":\"clear downtrend\",\"reason\":\"m1 sharp drop CVD falling\"}}],'
         + f'\"skip\":[\"BAD1\"],\"market_note\":\"BTC neutral\",\"strategy\":\"prioritize A\",\"skip_reason\":\"trending_down\"}}\n'

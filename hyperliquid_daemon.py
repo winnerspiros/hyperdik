@@ -5687,7 +5687,33 @@ def run(dry_run: bool = False):
                         _last_trade_age = time.time() - _last_trade_time
                         _starved = _last_trade_age > 1800
                         _starvation_ready = _starved and ai_conf_val >= 85 and abs(sig.composite_score) >= 0.15
-                        if _starvation_ready and "COMPOSITE CONTRADICTION" not in block_reason:
+                        # ── 4/4 CONFLUENCE BYPASS (Sep 17 backtest): AI≥85% + ML agrees +
+                        # composite sign-aligned + enriched direction-aligned → the whole data
+                        # stack agrees, so VWAP-position and weak-composite vetoes are noise.
+                        # COMPOSITE CONTRADICTION and ML HARD BLOCK still stand (real conflicts).
+                        try:
+                            _ml_ok = ((ai_dir == "SELL" and ml_pred.direction == "down" and ml_pred.confidence >= 30)
+                                      or (ai_dir == "BUY" and ml_pred.direction == "up" and ml_pred.confidence >= 30))
+                        except Exception:
+                            _ml_ok = False
+                        try:
+                            _comp_ok = ((sig.side == "BUY" and sig.composite_score > 0.0)
+                                        or (sig.side == "SELL" and sig.composite_score < 0.0))
+                        except Exception:
+                            _comp_ok = False
+                        try:
+                            _enr_ok = (ai_dir == sig.side)
+                        except Exception:
+                            _enr_ok = False
+                        if (ai_conf_val >= 85 and _ml_ok and _comp_ok and _enr_ok
+                                and "COMPOSITE CONTRADICTION" not in block_reason
+                                and not _ml_hard_block
+                                and ("COMPOSITE FLOOR" in block_reason or "VWAP:" in block_reason
+                                     or "buying above VWAP" in block_reason or "selling below VWAP" in block_reason
+                                     or "composite too weak" in block_reason)):
+                            log.info(f"  ⚡ {coin}: 4/4 CONFLUENCE — AI={ai_conf_val}% ML agrees comp={sig.composite_score:+.2f} sig={sig.side} overrides VWAP/floor veto: {block_reason}")
+                            block_reason = None
+                        elif _starvation_ready and "COMPOSITE CONTRADICTION" not in block_reason:
                             # STARVED: AI trumps exhaustion gates at >=85% conf + |comp|>=0.15
                             # Composite contradiction (sign mismatch = data literally says opposite) stays hard
                             log.info(f"  🍽️  {coin}: STARVATION BYPASS ({_last_trade_age:.0f}s idle) — AI={ai_conf_val}% comp={sig.composite_score:+.2f} overrides: {block_reason}")
@@ -6846,17 +6872,28 @@ def run(dry_run: bool = False):
                     notional = total_eq * pos_pct * chosen_leverage  # Compute before risk overrides
                     # ── Minimum notional guard (perplobster/chainstack preflight, Sep 2026) ──
                     # HL absolute minimum is $10 notional; below $11 after rounding the order
-                    # risks exchange rejection ("below_min") and a wasted cycle. $11 floor gives
-                    # 10% headroom for price drift between sizing and fill.
+                    # risks exchange rejection ("below_min") and a wasted cycle.
+                    # (Sep 17 backtest: $11 floor + lot-step rounding skipped ~25 AI picks
+                    # printing as $11<$11. Fix: bump to $11.50 target for headroom, and
+                    # raise leverage (≤10x) when the floor is unreachable in the 0.75 cap.)
                     # Fast-track micro caps: $11 floor, no equity-percentage games.
                     min_notional = max(11.0, total_eq * 0.35)
                     _is_ft_notional = sig.reason.startswith("ai_fast_track:") if hasattr(sig, 'reason') else False
                     if _is_ft_notional and ai_conf_val >= 80:
                         min_notional = 11.0
+                    _bump_target = min_notional + 0.50  # headroom for lot rounding + price drift
                     if notional < min_notional - 0.01:  # epsilon to avoid float rounding at boundary
                         # Bump position size to meet minimum rather than skipping entirely.
                         # Micro accounts ($60-100) need this to participate.
-                        bumped_pct = min_notional / (total_eq * chosen_leverage) if total_eq > 0 else 0
+                        bumped_pct = _bump_target / (total_eq * chosen_leverage) if total_eq > 0 else 0
+                        if bumped_pct > 0.75 and chosen_leverage < 10:
+                            # Unreachable in cap at this leverage (e.g. $3 equity @3x tops $6.86):
+                            # raise leverage so the $10 exchange minimum stays reachable.
+                            import math as _m
+                            _need_lev = _m.ceil(_bump_target / (total_eq * 0.75)) if total_eq > 0 else chosen_leverage
+                            chosen_leverage = int(max(chosen_leverage, min(_need_lev, 10)))
+                            log.info(f"  📐 {coin}: raising lev→{chosen_leverage}x to reach ${_bump_target:.0f} min notional")
+                            bumped_pct = _bump_target / (total_eq * chosen_leverage) if total_eq > 0 else 0
                         old_pct = pos_pct
                         pos_pct = max(pos_pct, bumped_pct)
                         pos_pct = min(pos_pct, 0.75)  # Hard cap (matches margin floor; was 0.35)
