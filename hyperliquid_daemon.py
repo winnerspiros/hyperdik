@@ -239,9 +239,11 @@ _rotate_offset = 0
 CYCLE_SECONDS = _cfg("monitoring.cycle_seconds", 3)  # 3s — configurable, fast default
 FAST_MONITOR_SECONDS = 3  # fast exit/monitor thread cadence (decoupled from entry pipeline)
 MIN_TRADE_USD = 3.0  # micro-account floor (was 5.0): $3.36 + leverage can fund one $11 min-notional scalp; blocks dust only
-# Minimum notional per trade: $20 floor (HL minimum is $10, $10 margin at 2x = $20)
-# Fast-track coins can go to $10 (HL absolute minimum)
-MIN_NOTIONAL_USD = 20
+# Minimum notional per trade: $11 floor (HL minimum is $10 + headroom for
+# price drift between sizing and fill). Sep 17: was $20 — that mismatched the
+# $11 sizing floor, so every micro scalp filled as $9 "IOC dust" and got
+# closed as dust or liquidated. OctoBot lesson: adapt to the minimum, don't veto above it.
+MIN_NOTIONAL_USD = 11
 # Dynamic: compute in run() based on equity, floor at 1 for micro accounts
 BASE_MAX_POSITIONS = 5
 BASE_LEVERAGE = 6  # AI-driven: AI can override up to 12x based on conviction/equity/regime (matches config)
@@ -5598,7 +5600,7 @@ def run(dry_run: bool = False):
                             _comp_ok = sig.composite_score <= 0.10  # Don't short if composite is bullish-positive
                         else:
                             _comp_ok = sig.composite_score >= 0.10  # Don't enter without conviction
-                        _sell_unified_ok = pred.confidence >= 15  # SIGNAL-FIRST: was 5% (fee-noise band)
+                        _sell_unified_ok = pred.confidence >= 5  # Sep 17 SYMMETRY: was 15% (short-only bar; unified flat@0-7% ~90% of time = zero SHORT fills). Mirrors BULL ACCEL's 5% long bar.
                         if _reason_ok and _comp_ok and _sell_unified_ok:
                             ai_dir_override = "SELL"
                             log.info(f"  🔻 {coin}: SELL ACCEL — enriched+AI agree on SELL (comp={sig.composite_score:+.2f}, "
@@ -5686,14 +5688,21 @@ def run(dry_run: bool = False):
                                 # (MINA -0.27, APE -0.17, DOGE -0.11 all died here). Directional
                                 # sign + |comp|>=0.05 (measured, not noise) is enough; the EV
                                 # gate downstream still demands R:R>=1.5 + EV>0.
-                                if ai_dir == "SELL" and not _bull_market_now:
+                                if ai_dir == "SELL":
+                                    # Sep 17 SYMMETRY: SELL floor uniform -0.50 in every
+                                    # regime. Was: bull regime forced ≥0.00 — impossible
+                                    # for SELL synthetics, negative BY CONSTRUCTION
+                                    # (BERA -0.21, SOPH -0.28 died here). Overly-bullish
+                                    # comp for shorts is still caught downstream by the
+                                    # COMPOSITE FLOOR ceiling check (abs comparison).
                                     _comp_floor = -0.50
                                 elif _bull_market_now:
                                     _comp_floor = 0.00
                                 else:
                                     _comp_floor = 0.08
-                                # Fast-track: synthetic signals from sparse data — relax floor
-                                if _is_fast_track and ai_conf >= 80:
+                                # Fast-track: synthetic signals from sparse data — relax floor (BUY only;
+                                # SELL already at -0.50, and forcing 0.00 here blocked every SELL synthetic)
+                                if _is_fast_track and ai_conf >= 80 and ai_dir != "SELL":
                                     _comp_floor = 0.00  # AI already validated direction, sparse techs unreliable
                                 if sig.composite_score < _comp_floor:
                                     log.info(f"  🛑 {coin}: AI override blocked — composite {sig.composite_score:+.2f} too weak (need ≥{_comp_floor:.2f}), AI={ai_conf}%")
@@ -6064,8 +6073,11 @@ def run(dry_run: bool = False):
                         # Check actual trade direction (_trade_side set below), not unified_dir
                         _trade_dir = _trade_side if '_trade_side' in dir() else unified_dir
                         # Aug 7: thresholds 35→15 / 15→5 — zero-loss exits make entries safer
-                        if (unified_dir == "SELL" or _trade_dir == "SELL") and pred.confidence < 15 and not extreme_signal:
-                            log.info(f"  🛑 {coin}: neutral market — blocking SELL (unified={pred.confidence:.0f}% < 15%)")
+                        # Sep 17 SYMMETRY (freqtrade/hummingbot/OctoBot all gate LONG/SHORT
+                        # identically): SELL 15→5, mirroring BUY. Unified reads flat@0-7%
+                        # ~90% of the time; the 15% bar meant zero SHORT fills ever.
+                        if (unified_dir == "SELL" or _trade_dir == "SELL") and pred.confidence < 5 and not extreme_signal:
+                            log.info(f"  🛑 {coin}: neutral market — blocking SELL (unified={pred.confidence:.0f}% < 5%)")
                             continue
                         elif (unified_dir == "BUY" or _trade_dir == "BUY") and pred.confidence < 5 and not extreme_signal:
                             log.info(f"  🛑 {coin}: neutral market — blocking BUY (unified={pred.confidence:.0f}% < 5%)")
@@ -6607,11 +6619,18 @@ def run(dry_run: bool = False):
                         _confluence_label = ""
                         if _confluence:
                             log.info(f"  ⚡ {coin}: DEBATE SKIPPED — enriched+AI+ML+unified all agree on {_trade_side} (comp={sig.composite_score:+.2f})")
-                            _confluence_bonus = 1.75; _confluence_lev = min(chosen_leverage + 4, 12)
+                            # Sep 17 SURVIVAL (freqtrade liq-buffer + OctoBot OCO lessons):
+                            # confluence size bonus kept (1.75x) but leverage bonus
+                            # removed on micro equity (<$20) — MINA/MET/INIT died at
+                            # 8-10x in seconds. Higher leverage OK on 4/4 confluence
+                            # only when equity can margin the distance (memory rule).
+                            _confluence_bonus = 1.75
+                            _confluence_lev = chosen_leverage if total_eq < 20 else min(chosen_leverage + 4, 12)
                             _confluence_label = "4/4 CONFLUENCE"
                         elif _ai_enr_agree and _ml_agrees:
                             log.info(f"  ⚡ {coin}: DEBATE SKIPPED — enriched+AI+ML agree on {_trade_side} (comp={sig.composite_score:+.2f})")
-                            _confluence_bonus = 1.35; _confluence_lev = min(chosen_leverage + 2, 10)
+                            _confluence_bonus = 1.35
+                            _confluence_lev = chosen_leverage if total_eq < 20 else min(chosen_leverage + 2, 10)
                             _confluence_label = "3/4 enriched+AI+ML"
                         elif _ai_enr_agree and abs(sig.composite_score) >= 0.12:
                             log.info(f"  ⚡ {coin}: DEBATE SKIPPED — enriched+AI agree at {ai_conf_val}% (comp={sig.composite_score:+.2f})")
