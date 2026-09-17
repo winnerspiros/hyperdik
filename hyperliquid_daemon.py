@@ -6659,10 +6659,11 @@ def run(dry_run: bool = False):
                             # upstream at SURVIVAL ENTRY; EV just prices the AI's own thesis.)
                             # reward = AI target% (fallback 1.5x stop); risk = stop distance%;
                             # costs = 0.09% taker round-trip + funding bleed over expected hold.
-                            # Guardrail kept: R:R>=1.1 (was 1.5 — AI plans 2.0%tgt/1.88%stop =
-                            # R:R 1.07 all failed; 1.1 keeps real edge without banning the
-                            # standard AI template) + EV>0. R:R<1.0 (negative-expectancy
-                            # setups like ASTER 0.95) still blocked.
+                            # Guardrail kept: R:R>=1.0 (was 1.5 — AI plans 2.0%tgt/1.88%stop =
+                            # R:R 1.07 all failed despite EV=+0.75%; at p=70% that template
+                            # is profitable, the 1.5 bar was pure starvation. R:R<1.0
+                            # = risk exceeds reward = negative expectancy, still blocked
+                            # like ASTER 0.95) + EV>0.
                             try:
                                 # p: the AI's own win probability, capped at 70%.
                                 _ev_ai_c = float(ai_plan4.get("confidence", 0) or 0) or float(sig.confidence or 0)
@@ -6677,9 +6678,9 @@ def run(dry_run: bool = False):
                                 _ev_cost = 0.09 + abs(_ev_fund) * 100 * 2  # taker RT + ~2h funding
                                 _ev_rr = (_ev_rew / _ev_stop_pct) if _ev_stop_pct > 0 else 0
                                 _ev = _ev_p * _ev_rew - (1 - _ev_p) * _ev_stop_pct - _ev_cost
-                                if _ev_rr < 1.1 or _ev <= 0:
+                                if _ev_rr < 1.0 or _ev <= 0:
                                     log.info(f"  🧮 {coin}: EV GATE — p={_ev_p:.0%} rew={_ev_rew:.2f}% risk={_ev_stop_pct:.2f}% "
-                                             f"R:R={_ev_rr:.2f} EV={_ev:+.3f}% (need R:R>=1.1, EV>0) — skip")
+                                             f"R:R={_ev_rr:.2f} EV={_ev:+.3f}% (need R:R>=1.0, EV>0) — skip")
                                     continue
                             except Exception:
                                 pass  # EV inputs missing — proceed (other gates still apply)
