@@ -454,6 +454,15 @@ MAX_LEVERAGED_HEAT = 0.45   # MAX 45% when using leverage > 2x
 
 def get_heat_limits(equity: float) -> tuple[float, float]:
     """Return (max_portfolio_heat, max_leveraged_heat) for account size."""
+    if equity < 20:
+        # Dust account: a flat 100% cap can never fit even the $11 exchange-minimum
+        # scalp (heat = 11*sqrt(corr)/equity = ~274% at $3.36), so every signal died
+        # at the heat gate with zero fills. Scale the cap so the max fillable
+        # notional (90% equity @ leverage) always fits; heat still blocks a
+        # SECOND concurrent scalp (combined heat ~1100%), keeping this a
+        # single-position account. Floor 8.0 covers 6x (~450%) and 10x (~750%).
+        _cap = max(8.0, 13.0 / max(equity, 0.5))
+        return (_cap, _cap)  # Micro: no heat restrictions — user directive
     if equity < 200:
         return (1.00, 1.00)  # Micro: no heat restrictions — user directive
     elif equity < 1000:

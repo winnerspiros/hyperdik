@@ -1954,6 +1954,25 @@ def _submit_action(action_type: str, coin: str, details: dict):
     global _forager_skip_cooldown, _global_pause_until
     os.makedirs("data/pending_actions", exist_ok=True)
 
+    # ── STALE-FILE PURGE (Sep 17): nothing consumes this directory (no validator,
+    # no executor — action_executor.py is a Revolut-X relic, queue dead since Aug).
+    # 49 files piled up, and the "close already pending" guard below blocks REAL
+    # duplicate detection: write the file FIRST, verify second. Purge files older
+    # than 30 min so a stale buy_VVV from 5h ago can't block anything.
+    try:
+        _now_prune = time.time()
+        for _f in os.listdir("data/pending_actions"):
+            if not _f.endswith(".json"):
+                continue
+            _fp = os.path.join("data/pending_actions", _f)
+            try:
+                if _now_prune - os.path.getmtime(_fp) > 1800:
+                    os.remove(_fp)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     # ── Guard: skip if a close was already submitted for this coin ──
     if action_type in ("close", "buy", "sell"):
         import fnmatch
@@ -2449,6 +2468,15 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
         hold_secs = time.time() - _position_entry_times.get(cu, time.time())
         leverage = float(p.get("leverage", {}).get("value", BASE_LEVERAGE)) if isinstance(p.get("leverage"), dict) else BASE_LEVERAGE
         lev = leverage  # DEFENSIVE: alias so both names always work (prevents UnboundLocalError)
+        # ── Monitor-loop init (Sep 17 FIX): the ROI ladder below reads exit_reason /
+        # _net_pnl_mon / _fee_covered_at BEFORE the exit-eval block assigns them →
+        # UnboundLocalError crashed EVERY monitor cycle (1500+ errors), killing
+        # breakeven lock, scale-out, liq survival and ROI exits. Init here; the
+        # exit-eval block re-derives them later, harmlessly.
+        exit_reason = None
+        _fee_covered_at = ROUNDTRIP_FEE_PCT * leverage
+        _net_pnl_mon = _net_pnl_pct(pnl_pct, leverage=leverage)
+        _hold_age_mon = time.time() - _position_entry_times.get(cu, time.time())
 
         # ── Minimal ROI check: DISABLED for zero-loss ──
         # Aug 7: ROI timeout kills positions at a loss. Disabled.
@@ -5091,6 +5119,8 @@ def run(dry_run: bool = False):
                         pass
 
                     # ── Unified ML prediction (ensemble: XGBoost+LSTM+structure+flow+macro) ──
+                    ml_dir = "flat"
+                    ml_conf = 0.0
                     try:
                         fund_ctx = funding_sniper.asset_ctx.get(coin, {})
                         fund_rate = float(fund_ctx.get("funding", 0)) if fund_ctx else 0.0
@@ -5102,6 +5132,9 @@ def run(dry_run: bool = False):
                         if ml_pred.confidence >= 30:
                             market_context += f" | 🤖ML:{ml_pred.direction}:{ml_pred.confidence:.0f}%→${ml_pred.target_price:.2f}"
                             log.info(f"  🤖 {coin} ML predict: {ml_pred.direction} conf={ml_pred.confidence:.0f}% target=${ml_pred.target_price:.4f}")
+                        # Cache for downstream momentum-bypass guards (VVV lesson Sep 17)
+                        ml_dir = ml_pred.direction
+                        ml_conf = ml_pred.confidence
                     except Exception:
                         pass
 
@@ -5411,11 +5444,11 @@ def run(dry_run: bool = False):
                         taker_val = 0.5
 
                     # ── ML prediction context ──
-                    ml_dir = "flat"
-                    ml_conf = 0.0
+                    # (ml_dir/ml_conf cached at the ML block above; only re-derive if missing)
                     try:
-                        ml_dir = ml_pred.direction if 'ml_pred' in dir() else "flat"
-                        ml_conf = ml_pred.confidence if 'ml_pred' in dir() else 0.0
+                        if ('ml_dir' not in dir() or not ml_dir or ml_dir == "flat") and 'ml_pred' in dir():
+                            ml_dir = ml_pred.direction
+                            ml_conf = ml_pred.confidence
                     except (NameError, AttributeError):
                         pass
 
@@ -6072,6 +6105,22 @@ def run(dry_run: bool = False):
                         continue
                     if _bypass_ok and pred.confidence < 10:
                         log.info(f"  ⚡ {coin}: AI+MOMENTUM BYPASS — AI={ai_conf_final}% mom5={_mom5_surv:+.1f}% overrides unified={pred.confidence:.0f}%")
+                        # ── VVV LESSON (Sep 17): this bypass fired LONG at mom5=+3.6%,
+                        # VWAP+0.9σ, unified=1%, ML=DOWN@40%, no Binance pair — chased an
+                        # overbought top against the data and lost $0.18 with zero exit
+                        # management (monitor was crashed). Two guards:
+                        # (1) VWAP chase block — momentum bypass may not buy >+1.5σ
+                        #     overbought / short <-1.5σ oversold (buying the spike top).
+                        # (2) ML opposition — bypass may not fight ML>=30% head-on.
+                        if (_trade_side == "BUY" and vwap_sigma > 1.5) or \
+                           (_trade_side == "SELL" and vwap_sigma < -1.5):
+                            log.info(f"  🛑 {coin}: MOMENTUM-CHASE BLOCK — VWAP {vwap_sigma:+.1f}σ extended, AI+mom can't chase the spike (need ≤1.5σ)")
+                            continue
+                        if ml_conf and ml_conf >= 30:
+                            _ml_disagrees2 = (ml_dir == "down" and _trade_side == "BUY") or (ml_dir == "up" and _trade_side == "SELL")
+                            if _ml_disagrees2:
+                                log.warning(f"  🛑 {coin}: MOMENTUM-ML BLOCK — ML={ml_dir}@{ml_conf}% opposes { _trade_side} — bypass denied (data beats momentum)")
+                                continue
                         # ── WEAK COMPOSITE GUARD: AI can't solo on near-zero comp + ML contradiction ──
                         # LIT lesson: comp=+0.08, ML=DOWN@45% → AI forced BUY → immediate loss
                         if abs(sig.composite_score) < 0.10 and ml_conf and ml_conf > 30:
@@ -6603,22 +6652,21 @@ def run(dry_run: bool = False):
                                 continue
                             # ── EV GATE (Sep 2026, Harper method): the math must work ──
                             # EV = p*reward - (1-p)*risk - costs > 0 AND reward/risk >= 1.5.
-                            # p = min(unified, AI)/100 capped at 0.7 (no 90% fairy tales on micros).
+                            # p = AI%/100 capped at 0.7 (Sep 17: min(unified,AI) starved every
+                            # AI-forced trade — AI picks arrive as fast-track synthetics with
+                            # unified 0-19%, so the min() punished EXACTLY the user's directive:
+                            # "AI>=85% trumps mechanical gates". Unified opinion still gates
+                            # upstream at SURVIVAL ENTRY; EV just prices the AI's own thesis.)
                             # reward = AI target% (fallback 1.5x stop); risk = stop distance%;
                             # costs = 0.09% taker round-trip + funding bleed over expected hold.
-                            # ASTER (R:R 0.95) and MET (R:R 1.16) both failed this — the old
-                            # `pass  # EV gate skipped` line let them through to lose.
+                            # Guardrail kept: R:R>=1.1 (was 1.5 — AI plans 2.0%tgt/1.88%stop =
+                            # R:R 1.07 all failed; 1.1 keeps real edge without banning the
+                            # standard AI template) + EV>0. R:R<1.0 (negative-expectancy
+                            # setups like ASTER 0.95) still blocked.
                             try:
-                                # p: unified-direction confidence (object) OR short-term dict —
-                                # Stage 4.5 reassigns pred to a dict on high conviction, so
-                                # handle both; fall back to signal confidence.
-                                try:
-                                    _ev_p_raw = pred.confidence
-                                except AttributeError:
-                                    _ev_p_raw = (pred.get("confidence", 0) if isinstance(pred, dict) else 0) or 0
+                                # p: the AI's own win probability, capped at 70%.
                                 _ev_ai_c = float(ai_plan4.get("confidence", 0) or 0) or float(sig.confidence or 0)
-                                _ev_p = min(_ev_p_raw, _ev_ai_c) / 100.0
-                                _ev_p = min(max(_ev_p, 0.0), 0.7)
+                                _ev_p = min(max(_ev_ai_c, 0.0), 70.0) / 100.0
                                 _ev_stop_pct = abs(entry_price - stop_price) / entry_price * 100 if entry_price > 0 else 1.5
                                 _ev_ai_tgt = abs(float(ai_plan4.get("target_pct", 0) or 0))
                                 _ev_rew = _ev_ai_tgt if _ev_ai_tgt > 0 else _ev_stop_pct * 1.5
@@ -6629,9 +6677,9 @@ def run(dry_run: bool = False):
                                 _ev_cost = 0.09 + abs(_ev_fund) * 100 * 2  # taker RT + ~2h funding
                                 _ev_rr = (_ev_rew / _ev_stop_pct) if _ev_stop_pct > 0 else 0
                                 _ev = _ev_p * _ev_rew - (1 - _ev_p) * _ev_stop_pct - _ev_cost
-                                if _ev_rr < 1.5 or _ev <= 0:
+                                if _ev_rr < 1.1 or _ev <= 0:
                                     log.info(f"  🧮 {coin}: EV GATE — p={_ev_p:.0%} rew={_ev_rew:.2f}% risk={_ev_stop_pct:.2f}% "
-                                             f"R:R={_ev_rr:.2f} EV={_ev:+.3f}% (need R:R>=1.5, EV>0) — skip")
+                                             f"R:R={_ev_rr:.2f} EV={_ev:+.3f}% (need R:R>=1.1, EV>0) — skip")
                                     continue
                             except Exception:
                                 pass  # EV inputs missing — proceed (other gates still apply)
@@ -6714,14 +6762,24 @@ def run(dry_run: bool = False):
                             _final_leverage = _confluence_lev
                             if _confluence_bonus > 1.0:
                                 log.info(f"  🔥 {coin}: {_confluence_label} → size ${_sized_notional:.0f}→${_final_notional:.0f} lev {chosen_leverage}x→{_final_leverage}x")
-                            # ── MARGIN FLOOR (Aug 13): good calls must deploy real margin ──
+                            # ── MARGIN FLOOR (Aug 13, dust-fixed Sep 16): good calls must deploy real margin ──
                             # Kelly downscale removed — it was cutting 3/4-confluence calls to ~1.0x net.
-                            # Enforce $10 minimum margin so a correct call isn't a $2 penny position.
-                            _min_margin = max(10.0, total_eq * 0.5)  # $10 floor, but scale with equity
+                            # Dust fix: the flat $10 floor ballooned every $3.36-equity scalp to a
+                            # $60 notional needing $10 margin we don't have — unfillable AND heat-blocked.
+                            # Cap the floor at 90% of equity so size stays fillable; the $11
+                            # exchange-minimum guard above still applies.
+                            _min_margin = min(max(10.0, total_eq * 0.5), total_eq * 0.9)
                             _min_notional = _min_margin * _final_leverage
                             if _final_notional < _min_notional:
                                 _final_notional = _min_notional
                                 log.info(f"  💰 {coin}: margin floor → notional ${_final_notional:.0f} (${_min_margin:.0f} margin @ {_final_leverage}x)")
+                            # Hard cap: never size above what equity can actually margin
+                            # (90% × leverage; 10% buffer for fees/slippage). $11 floor keeps
+                            # the order above the exchange minimum.
+                            _max_notional = max(total_eq * 0.9 * _final_leverage, 11.0)
+                            if _final_notional > _max_notional:
+                                log.info(f"  💰 {coin}: capping notional ${_final_notional:.0f}→${_max_notional:.0f} (equity ${total_eq:.2f} @ {_final_leverage}x)")
+                                _final_notional = _max_notional
                             
                             # Parse entry zone: AI may return "0.059-0.061" or "0.059"
                             _zone_px = 0.0
