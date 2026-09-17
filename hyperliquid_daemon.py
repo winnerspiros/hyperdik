@@ -266,6 +266,42 @@ _SCALE_OUT_PCT = float(_cfg("exit.scale_out_pct", 0.5))
 _SCALE_OUT_RETR_ATR = float(_cfg("exit.scale_out_retr_atr", 0.75))
 _AI_PEAK_CLASSIFY = _cfg("exit.ai_peak_classify", True)
 
+# ── v6 exit (Sep 17) — evidence-backed redesign (bot survey + exit literature) ──
+# v5 autopsy: same-peak re-banking dribbles partials (Tharp: truncates the tail
+# while keeping full risk), 2.5xATR giveback too wide (desk rule: 1.0xATR or
+# 50% of peak), peak-age halving arbitrary (LeBeau: tighten k by PROFIT tier).
+# v6 layers, all ATR-scaled, no hardcoded price %:
+#   (1) SINGLE PARTIAL: one bank per peak (re-extension >0.5xATR stops churn),
+#       remainder-notional clamped to the $11 HL floor — never strand dust.
+#   (2) LEBEAU TRAIL: k = 2.2 base → 1.0 past +1.0xATR net → 0.6 past +2.0xATR
+#       net; ATR = max(ATR(4), ATR(20)) so collapse never pulls stops absurdly
+#       close. Tighten-only, synced to the exchange stop every improvement.
+#   (3) GIVEBACK GUARD: 1.0xATR retrace (regime-widened) OR ≥50% of peak given
+#       back + both momenta against + stale peak → full-close WHILE GREEN.
+#   (4) GREEN TIME CAP: 5m-scalp edge window is minutes — hard cap 45min closes
+#       any green; soft cap 30min closes green+stale+against. Never a loss-cut.
+# A V-bounce recovers before all three confirm; every leg up already banked.
+_GIVEBACK_GUARD = _cfg("exit.giveback_guard", True)
+_GIVEBACK_ATR = float(_cfg("exit.giveback_atr", 1.0))                    # ATR leg: retrace ×ATR(5m) from extreme (×regime mult)
+_GIVEBACK_FRAC = float(_cfg("exit.giveback_frac", 0.5))                  # MFE leg: fraction of peak given back (SMB hard-line 50%)
+_GIVEBACK_MIN_PEAK_AGE = float(_cfg("exit.giveback_min_peak_age", 600))  # fallback: peak this stale (s) before guard fires
+_TRAIL_K_BASE = float(_cfg("exit.trail_k_base", 2.2))                    # LeBeau: wide early room (survives pullbacks)
+_TRAIL_K_T1 = float(_cfg("exit.trail_k_t1", 1.0))                         # past +1xATR net → hug closer
+_TRAIL_K_T2 = float(_cfg("exit.trail_k_t2", 0.6))                         # past +2xATR net → peak-hugging
+_TRAIL_PROFIT_T1 = float(_cfg("exit.trail_profit_t1", 1.0))               # profit tier 1 (×ATR net)
+_TRAIL_PROFIT_T2 = float(_cfg("exit.trail_profit_t2", 2.0))               # profit tier 2 (×ATR net)
+_GREEN_HARD_CAP = float(_cfg("exit.green_hard_cap", 2700))               # fallback: close ANY green after this (s)
+_GREEN_SOFT_CAP = float(_cfg("exit.green_soft_cap", 1800))               # fallback: close green+stale+against after this (s)
+_GREEN_SOFT_STALE = float(_cfg("exit.green_soft_stale", 900))            # fallback: soft cap needs peak this stale (s)
+# ── v7 exit (Sep 17) — AI owns the plan, API owns the measurement ──
+# No hardcoded numbers: per-trade target/hold/invalidation come from the AI
+# entry plan (_ai_trade_plan: tgt/stop/hold) or Kronos forecast; volatility
+# comes from live dual-ATR; the giveback MOMENTUM gate comes from live mom1/
+# mom5. Hardcoded values above are FALLBACKS ONLY, used when no AI plan and no
+# Kronos forecast exist for the coin. Guard/trail/cap each resolve their
+# thresholds per coin: AI-or-Kronos-derived first, fallback constants last.
+_EXIT_AI_PLAN = _cfg("exit.ai_plan", True)   # master switch: AI/Kronos-derived thresholds
+
 # ============================================================
 # Logging
 # ============================================================
@@ -283,7 +319,7 @@ log = logging.getLogger("hyperliquid")
 # import "hyperliquid_daemon" → Python would reload from disk. Register __main__
 # as hyperliquid_daemon so other modules get the already-loaded module.
 sys.modules['hyperliquid_daemon'] = sys.modules['__main__']
-log.info("═══ DAEMON V3.1 LOADED — exit layers active (flashcrash, structure, ai-eval, chandelier) ═══")
+log.info("═══ DAEMON V3.3 LOADED — v7 exit (AI plan owns thresholds, API owns volatility) + flashcrash/ai-eval ═══")
 
 # ── Load full coin universe (after logger is available) ──
 _ALL_COINS = TRADABLE_COINS  # safe default — prevents NameError if anything below fails
@@ -389,6 +425,8 @@ _MIN_HOLD_BYPASS_REASONS = {
     "ai_loss_eval:execute_now", "ai_exit",
     "critical", "emergency", "rule_exit", "peak_rollover_safety",
     "tight-trail-hit",  # trailing stop hit — protective exit, must fire immediately
+    "giveback-guard",   # v6: green runner rolled over — protective exit, fire now
+    "green-time-cap",   # v6: green past its edge window — protective exit, fire now
 }
 
 def _net_pnl_pct(gross_pnl_pct: float, leverage: int = BASE_LEVERAGE) -> float:
@@ -878,6 +916,91 @@ def _calc_atr_pct(coin: str, interval: str = "5m", period: int = 14) -> float:
         return atr / last * 100 if last > 0 else 0.0
     except Exception:
         return 0.0
+
+
+def _dual_atr_pct(coin: str, interval: str = "5m") -> float:
+    """LeBeau dual-ATR: max(short ATR(4), long ATR(20)) as % of price.
+
+    After tiny ranges ATR(3-4 bars) collapses and pulls stops absurdly close
+    (premature stop-outs); the smoothed ATR(20) leg keeps the trail honest.
+    Returns 0.0 if both legs fail.
+    """
+    try:
+        _short = _calc_atr_pct(coin, interval, 4)
+    except Exception:
+        _short = 0.0
+    try:
+        _long = _calc_atr_pct(coin, interval, 20)
+    except Exception:
+        _long = 0.0
+    return max(_short, _long)
+
+
+def _resolve_exit_plan(coin: str, side: str, leverage: float, atr_pct: float) -> dict:
+    """v7: resolve per-trade exit thresholds — AI owns the plan, API the measurement.
+
+    Sources (first hit wins), all expressed in NET-margin % so leverage is baked in:
+      1. AI entry plan (_ai_trade_plan[coin]): target_pct/stop_pct/hold_min the AI
+         itself forecast at entry, plus the free-text invalidation ("m5 turns neg").
+         Giveback trigger = AI stop distance (the invalidation the AI named);
+         hard cap = AI hold_min (the window the AI believed in); soft cap = 2/3 of it.
+      2. Kronos forecast merged into the AI plan (same keys — treated as AI).
+      3. Fallback constants (module-level _cfg values) when neither exists.
+
+    Volatility tiers stay API-measured (dual-ATR), never hardcoded price %.
+    Returns {give_need_atr, min_peak_net, stale_s, hard_s, soft_s, soft_stale_s,
+             trailing: bool, src: str}.
+    """
+    _fb = {
+        "give_need_atr": _GIVEBACK_ATR, "min_peak_net": (atr_pct * leverage if atr_pct > 0 else 0.0),
+        "stale_s": _GIVEBACK_MIN_PEAK_AGE, "hard_s": _GREEN_HARD_CAP,
+        "soft_s": _GREEN_SOFT_CAP, "soft_stale_s": _GREEN_SOFT_STALE, "src": "fallback",
+    }
+    if not _EXIT_AI_PLAN:
+        return _fb
+    try:
+        _plan = _ai_trade_plan.get(coin.upper(), {}) if "_ai_trade_plan" in dir() else {}
+    except Exception:
+        _plan = {}
+    if not _plan:
+        # Entry snapshot keeps the same keys if the plan dict was rotated out.
+        try:
+            _snap = _ENTRY_SNAP.get(coin.upper(), {}) if "_ENTRY_SNAP" in dir() else {}
+        except Exception:
+            _snap = {}
+        if _snap.get("target_pct") or _snap.get("hold_min"):
+            _plan = _snap
+    try:
+        _tgt = float(_plan.get("target_pct", 0) or 0)   # gross price % the AI forecast
+        _stp = float(_plan.get("stop_pct", 0) or 0)     # gross price % the AI named as stop
+        _hld = float(_plan.get("hold_min", 0) or 0) * 60.0
+    except Exception:
+        return _fb
+    if _tgt <= 0 and _hld <= 0:
+        return _fb
+    _out = dict(_fb)
+    _out["src"] = "kronos" if _plan.get("kronos_direction") else "ai-plan"
+    _lev = max(float(leverage or 1), 1.0)
+    if _tgt > 0:
+        # Giveback trigger = the AI's OWN expected-move fraction: a trade that
+        # retraces more (in ATR units) than the AI's whole forecasted move divided
+        # by current volatility has broken the AI's thesis. Floor at half the
+        # fallback so a huge AI target can't disable the guard entirely.
+        _tgt_net = _tgt * _lev
+        _atr_net = (atr_pct * _lev) if atr_pct > 0 else 0.0
+        if _atr_net > 0:
+            _out["give_need_atr"] = max(_tgt_net / _atr_net / 2.0, _GIVEBACK_ATR * 0.5)
+        _out["min_peak_net"] = min(_tgt_net * 0.5, _fb["min_peak_net"] or _tgt_net * 0.5)
+    if _stp > 0:
+        # AI stop distance (gross) doubles as the MFE-fraction sanity leg: the guard
+        # must fire no later than the AI's own invalidation distance in net terms.
+        _out["ai_stop_net"] = _stp * _lev
+    if _hld > 0:
+        _out["hard_s"] = _hld
+        _out["soft_s"] = _hld * 2.0 / 3.0
+        _out["soft_stale_s"] = _hld / 3.0
+        _out["stale_s"] = min(_hld / 3.0, _fb["stale_s"])
+    return _out
 
 
 # ── PUMP/DUMP CHASE DETECTION ──────────────────────────────────────────
@@ -2662,6 +2785,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
         if _now_ts - entry_ts > 60:  # 60s warmup — exit close is gated by _can_close_position (600s MIN_HOLD), warmup only gates breakeven lock + HWM tracking
             _last_eval = getattr(_monitor_positions, _eval_key, 0) if hasattr(_monitor_positions, _eval_key) else 0
             if _now_ts - _last_eval > 30:
+                setattr(_monitor_positions, _eval_key, _now_ts)  # advance eval clock — no stale-peak math
                 try:
                     # Peak HWM tracking
                     _peak_key = f"_hwm:{cu}"
@@ -2790,10 +2914,10 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                         except Exception as e:
                             log.warning(f"  ⚠️ {coin}: partial close failed: {e}")
 
-                    # ── GREEN-SIDE PEAK SCALE-OUT (Aug 14) — bank a fraction at each confirmed peak ──
+                    # ── GREEN-SIDE PEAK SCALE-OUT (Aug 14, v6 single-partial Sep 17) ──
                     # "Winners run forever" removed every profit-taker, and the loss-cutters below
                     # only fire when net < 0 — so a green position gave back 100% of every peak
-                    # (55/56 trades closed red). This banks a fraction at each peak whose reversal
+                    # (55/56 trades closed red). This banks ONE partial per peak whose reversal
                     # is confirmed by short-ATR + momentum.
                     # ── DATA-DRIVEN (no hardcoded fraction/threshold) ──
                     # Reuse get_regime_stop_mult(regime): trending→1.25, sideways→0.80, high_vol→2.0.
@@ -2801,61 +2925,85 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                     # scale the retracement bar by it (wider in trends so noise pullbacks don't fire).
                     # Min-profit gate = 1× ATR(5m) in net terms (below) so we never chop a fresh
                     # +0.4% wiggle (the ETHFI mistake).
+                    # ── v6 single-partial discipline (Tharp expectancy/SQN) ──
+                    # Scaling out does NOT raise expectancy — it truncates the right tail while
+                    # keeping full initial risk. So: ONE partial per peak (+0.5xATR re-extension
+                    # gate stops same-peak churn), remainder-notional clamped to the $11 HL floor
+                    # (never strand dust that can't be managed), and the SECOND decision is always
+                    # the full runner close (LeBeau trail / giveback guard), never a second partial.
                     _regime_val = regime.value if hasattr(regime, "value") else str(regime)
                     _regime_mult = get_regime_stop_mult(_regime_val)
                     _scale_frac = _SCALE_OUT_PCT / _regime_mult       # bank less in trends, more in chop
                     _scale_retr = _SCALE_OUT_RETR_ATR * _regime_mult  # wider reversal bar in trends
+                    # v6: dual-ATR context lives at this level so the giveback guard and
+                    # LeBeau trail below can use it even when no scale-out is due.
+                    try:
+                        _atr_pct = _dual_atr_pct(coin, _TRAIL_ATR_TF)
+                    except Exception:
+                        _atr_pct = 0.0
+                    _drop_atr = (drop_from_peak_pct / _atr_pct) if _atr_pct > 0 else 0.0
                     if _SCALE_OUT_ENABLED and _net_pnl_mon > _fee_covered_at and _peak_pnl > _fee_covered_at:
                         _so_peak_key = f"_scaleout_peak:{cu}"
                         _last_so_peak = getattr(_monitor_positions, _so_peak_key, -999.0) if hasattr(_monitor_positions, _so_peak_key) else -999.0
-                        # ── CLOSE-AT-BEST-GAIN LADDER (Freqtrade/maximal_roi pattern, Sep 2026) ──
-                        # Old code banked ONE fixed 50%-of-position slice at the first confirmed
-                        # peak, then let the runner round-trip the rest. Now each NEW peak banks a
-                        # fraction of the REMAINING position, so every leg up locks in profit:
-                        #   peak #1 → bank 50% of position (keep 50%)
-                        #   peak #2 → bank 50% of runner (keep 25% of original)
-                        #   peak #3 → bank 50% of runner (keep 12.5% — the moonbag rides free)
-                        # Fractions come from the regime-scaled _scale_frac (data-driven, not
-                        # hardcoded): chop banks faster, trends keep more runner.
-                        # Every bank tightens + re-arms the exchange SL (scale-out re-arm), so the
-                        # remaining runner can never round-trip below breakeven.
-                        if _peak_pnl > _last_so_peak:  # new peak since last bank → eligible
-                            _atr_pct = _calc_atr_pct(coin, _TRAIL_ATR_TF, 14)
-                            _drop_atr = (drop_from_peak_pct / _atr_pct) if _atr_pct > 0 else 0.0
-                            # Min-profit gate: require a real move (≥1 ATR(5m) in net terms) before
-                            # scaling out — never chop a winner at barely-above-fees.
-                            _min_peak = _atr_pct * leverage if _atr_pct > 0 else 0.0
-                            # mom1 is direction-normalized above (line ~2055: for SHORT it's inverted,
-                            # so positive = in our favor for BOTH sides). "Against" = negative.
-                            _mom_against = mom1 < 0
-                            _do_bank = False
-                            _so_reason = ""
-                            if _peak_pnl >= _min_peak and _drop_atr >= _scale_retr and _mom_against:
-                                _do_bank = True
-                                _so_reason = f"peak {_peak_pnl:+.2f}% retraced {_drop_atr:.1f}×ATR(5m), mom against"
-                            elif _peak_pnl >= _min_peak and _AI_PEAK_CLASSIFY and 0.4 * _regime_mult <= _drop_atr < _scale_retr and _mom_against:
-                                # Borderline reversal — ask AI: local peak (bank) vs continuation (hold)
-                                try:
-                                    _ai = ai_evaluate_exit(
-                                        coin=coin, direction=side, entry_price=entry,
-                                        current_price=mid, pnl_pct=_net_pnl_mon,
-                                        hold_seconds=_hold_age_mon, mom_5m=mom5, mom_15m=0,
-                                        regime=(regime.value if hasattr(regime, "value") else "sideways"),
-                                        target_pct=2.0, stop_pct=0.55, peak_pnl=_peak_pnl,
-                                    )
-                                    if _ai.get("action") == "exit":
-                                        _do_bank = True
-                                        _so_reason = f"AI peak-classify exit@{_ai.get('confidence', 0)}%: {_ai.get('reason', '')[:50]}"
-                                    else:
-                                        log.info(f"  🧠 {coin}: AI peak-classify → HOLD (peak {_peak_pnl:+.2f}%, retrace {_drop_atr:.1f}×ATR)")
-                                except Exception as _ai_err:
-                                    log.warning(f"  ⚠️ {coin}: AI peak-classify crashed ({type(_ai_err).__name__}) — skip scale-out")
-                            if _do_bank:
-                                setattr(_monitor_positions, _so_peak_key, _peak_pnl)  # don't re-bank same peak
-                                _close_sz = abs(szi) * _scale_frac
+                        # Min-profit gate: require a real move (≥1 ATR(5m) in net terms) before
+                        # scaling out — never chop a winner at barely-above-fees.
+                        _min_peak = _atr_pct * leverage if _atr_pct > 0 else 0.0
+                        # mom1 is direction-normalized above (for SHORT it's inverted,
+                        # so positive = in our favor for BOTH sides). "Against" = negative.
+                        _mom_against = mom1 < 0
+                        # One bank per peak: re-bank the SAME peak only if it re-extends by
+                        # >0.5xATR net past the banked peak (fresh leg up, not bleed churn).
+                        try:
+                            _atr_net = _atr_pct * leverage if _atr_pct > 0 else 0.0
+                        except Exception:
+                            _atr_net = 0.0
+                        _new_peak_bank = _peak_pnl > _last_so_peak + (0.5 * _atr_net if _atr_net > 0 else 0.0)
+                        _do_bank = False
+                        _so_reason = ""
+                        _bank_frac = _scale_frac
+                        if _new_peak_bank and _peak_pnl >= _min_peak and _drop_atr >= _scale_retr and _mom_against:
+                            _do_bank = True
+                            _so_reason = f"peak {_peak_pnl:+.2f}% retraced {_drop_atr:.1f}×ATR(5m), mom against"
+                        elif _new_peak_bank and _peak_pnl >= _min_peak and _AI_PEAK_CLASSIFY and 0.4 * _regime_mult <= _drop_atr < _scale_retr and _mom_against:
+                            # Borderline reversal — ask AI: local peak (bank) vs continuation (hold)
+                            try:
+                                _ai = ai_evaluate_exit(
+                                    coin=coin, direction=side, entry_price=entry,
+                                    current_price=mid, pnl_pct=_net_pnl_mon,
+                                    hold_seconds=_hold_age_mon, mom_5m=mom5, mom_15m=0,
+                                    regime=(regime.value if hasattr(regime, "value") else "sideways"),
+                                    target_pct=2.0, stop_pct=0.55, peak_pnl=_peak_pnl,
+                                )
+                                if _ai.get("action") == "exit":
+                                    _do_bank = True
+                                    _so_reason = f"AI peak-classify exit@{_ai.get('confidence', 0)}%: {_ai.get('reason', '')[:50]}"
+                                else:
+                                    log.info(f"  🧠 {coin}: AI peak-classify → HOLD (peak {_peak_pnl:+.2f}%, retrace {_drop_atr:.1f}×ATR)")
+                            except Exception as _ai_err:
+                                log.warning(f"  ⚠️ {coin}: AI peak-classify crashed ({type(_ai_err).__name__}) — skip scale-out")
+                        if _do_bank:
+                            # One bank per peak: record the banked peak (same peak may only
+                            # bank again after a >0.5xATR re-extension — fresh leg, not churn).
+                            setattr(_monitor_positions, _so_peak_key, _peak_pnl)
+                            # ── $11 notional floor (Jesse/OctoBot lesson, Sep 17) ──
+                            # A partial that strands a sub-$11 runner leaves dust that can't be
+                            # managed or cheaply closed. Shrink the bank so ≥$11 stays in play.
+                            _close_sz = abs(szi) * _bank_frac
+                            try:
+                                _px_now = mid if mid > 0 else entry
+                                _not_after = max(abs(szi) - _close_sz, 0.0) * _px_now
+                                if 0 < _not_after < MIN_NOTIONAL_USD and abs(szi) * _px_now >= MIN_NOTIONAL_USD:
+                                    _close_sz = max(abs(szi) - (MIN_NOTIONAL_USD / _px_now), 0.0)
+                                    if _close_sz > 0:
+                                        log.info(f"  📐 {coin}: bank shrunk to keep runner ≥${MIN_NOTIONAL_USD} notional")
+                            except Exception:
+                                pass
+                            if _close_sz <= 0:
+                                log.info(f"  📐 {coin}: bank skipped — runner already near ${MIN_NOTIONAL_USD} floor, trail/guard own it")
+                            else:
                                 try:
                                     hl.market_close(coin, sz=_close_sz)
-                                    log.warning(f"  💰 {coin}: SCALE-OUT {_scale_frac:.0%} — {_so_reason}, banked {_close_sz:.2f}u @ net {_net_pnl_mon:+.2f}%")
+                                    log.warning(f"  💰 {coin}: SCALE-OUT {_bank_frac:.0%} — {_so_reason}, banked {_close_sz:.2f}u @ net {_net_pnl_mon:+.2f}%")
                                     # Record the banked fraction for the ledger / self-learning
                                     try:
                                         _record_close_trade(coin, mid, entry, _close_sz, side,
@@ -2885,6 +3033,140 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                                                              "scale-out re-arm")
                                 except Exception as e:
                                     log.warning(f"  ⚠️ {coin}: scale-out failed: {e}")
+
+                    # ── v7 GIVEBACK GUARD (Sep 17) — AI owns the plan, API owns the measurement ──
+                    # 0G: peak +6.47%, still green +1.6%, 35min stale, both moms against —
+                    # and NOTHING could close it (one partial banked, ROI ladder ignores
+                    # green, extreme-reversal needs net<0). This fires while STILL GREEN.
+                    # Dual trigger (desk rule: whichever bites first):
+                    #   ATR leg: peak real (≥1xATR net) AND retrace ≥ need (regime-widened)
+                    #   MFE leg: ≥50% of the peak given back (SMB hard-line cap)
+                    # plus short momentum against plus stale peak. Never a loss-cut.
+                    # Thresholds resolve per coin via _resolve_exit_plan: the AI's own
+                    # tgt/hold (or Kronos forecast) first, fallback constants only when
+                    # neither exists. Volatility stays API-measured (dual-ATR). Manual
+                    # positions included: profit-only management, like scale-out.
+                    _xp = _resolve_exit_plan(coin, side, leverage, _atr_pct)
+                    if (_GIVEBACK_GUARD and not exit_reason
+                            and _net_pnl_mon > _fee_covered_at
+                            and _peak_pnl > -999 and _peak_age >= _xp["stale_s"]):
+                        _gb_atr = _atr_pct  # dual-ATR context from the scale-out block above
+                        if _gb_atr > 0:
+                            _gb_min_peak = _xp["min_peak_net"]
+                            _gb_drop = _drop_atr  # price retrace from extreme, ×dual-ATR
+                            _gb_need = _xp["give_need_atr"] * _regime_mult
+                            _gb_frac_given = ((_peak_pnl - _net_pnl_mon) / _peak_pnl) if _peak_pnl > 0 else 0.0
+                            # Momentum confirm: short momentum against, and either the wider
+                            # momentum agrees or the peak is twice-stale (a 35min-old peak with
+                            # 1m bleeding is a rollover even if 5m still prints green — 0G case).
+                            _gb_both_against = (mom1 < 0 and (mom5 < 0 or _peak_age >= 2 * _xp["stale_s"]))
+                            _gb_atr_hit = (_peak_pnl >= _gb_min_peak and _gb_drop >= _gb_need)
+                            _gb_frac_hit = (_peak_pnl >= _gb_min_peak and _gb_frac_given >= _GIVEBACK_FRAC)
+                            if ((_gb_atr_hit or _gb_frac_hit) and _gb_both_against):
+                                _gb_which = (f"retrace {_gb_drop:.1f}xATR≥{_gb_need:.1f}x"
+                                             if _gb_atr_hit else
+                                             f"gave back {_gb_frac_given:.0%}≥{_GIVEBACK_FRAC:.0%}")
+                                _gb_reason = (f"giveback-guard[{_xp['src']}]: peak {_peak_pnl:+.2f}% {_gb_which}, "
+                                              f"mom1={mom1:+.2f}% mom5={mom5:+.2f}% against, "
+                                              f"peak stale {_peak_age / 60:.0f}min — closing green @ net {_net_pnl_mon:+.2f}%")
+                                log.warning(f"  🛟 {coin}: {_gb_reason}")
+                                if _can_close_position(coin, "giveback-guard"):
+                                    try:
+                                        _record_close_trade(coin, mid, entry, abs(szi), side,
+                                                            _gb_reason[:120], conviction=0,
+                                                            regime=regime.value if hasattr(regime, 'value') else "sideways",
+                                                            leverage=leverage)
+                                    except Exception:
+                                        pass
+                                    _MANUAL_CLOSES[coin] = time.time()
+                                    if _safe_close(coin):
+                                        _reset_signal_dominance(coin)
+                                        continue
+                                    log.error(f"  🚨 {coin}: giveback-guard close FAILED — position may be NAKED")
+                                    continue
+
+                    # ── v6 LEBEAU TRAIL (Sep 17) — profit-tiered k, tightened on-exchange ──
+                    # LeBeau's key technique: start wide (room for pullbacks), tighten k as
+                    # profit accrues — 2.2 base → 1.0 past +1xATR net → 0.6 past +2xATR net.
+                    # Tier crossings use the AI's own target when present: the AI's forecasted
+                    # move (in ATR units) becomes tier-1, so the trail starts hugging exactly
+                    # where the AI expected the move to arrive. Fallback: 1x/2xATR constants.
+                    # Converts the wide chandelier into a peak-hugging trail on winners while
+                    # losers keep room. Ratchet-only (never widens), LONG/SHORT symmetric,
+                    # synced to the exchange stop every improvement, dual-ATR so collapse
+                    # never pulls it absurdly close. Manual positions included (SL-trail).
+                    if (cu in trail_states and _atr_pct > 0
+                            and _net_pnl_mon > _fee_covered_at):
+                        try:
+                            _lb_net_atr = _net_pnl_mon / (_atr_pct * leverage) if (_atr_pct * leverage) > 0 else 0.0
+                            # v7: tier-1 = the AI's own forecasted move (in ATR units) when the
+                            # plan exists — the trail starts hugging where the AI expected
+                            # arrival; tier-2 = double that. Else 1x/2xATR fallback constants.
+                            _lb_t1 = _TRAIL_PROFIT_T1
+                            _lb_t2 = _TRAIL_PROFIT_T2
+                            try:
+                                _ai_tgt_gross = 0.0
+                                _pl = _ai_trade_plan.get(coin.upper(), {}) if "_ai_trade_plan" in dir() else {}
+                                if _pl:
+                                    _ai_tgt_gross = float(_pl.get("target_pct", 0) or 0)
+                                if _ai_tgt_gross > 0 and _atr_pct > 0:
+                                    _lb_t1 = (_ai_tgt_gross / _atr_pct) * 0.75
+                                    _lb_t2 = (_ai_tgt_gross / _atr_pct) * 1.5
+                            except Exception:
+                                pass
+                            _lb_k = (_TRAIL_K_T2 if _lb_net_atr >= _lb_t2
+                                     else _TRAIL_K_T1 if _lb_net_atr >= _lb_t1
+                                     else _TRAIL_K_BASE)
+                            _lb_dist = (_atr_pct / 100.0) * mid * _lb_k
+                            _t6 = trail_states[cu]
+                            if side == "LONG":
+                                # TrailState.highest_price tracks the favorable extreme for BOTH
+                                # sides (max for LONG, min for SHORT — see update_trail).
+                                _cand = _t6.highest_price - _lb_dist
+                                _better6 = _cand > _t6.current_stop and _cand < mid
+                            else:
+                                _cand = _t6.highest_price + _lb_dist
+                                _better6 = _cand < _t6.current_stop and _cand > mid
+                            if _better6:
+                                _t6.current_stop = _cand
+                                _replace_trailing_sl(coin, side, abs(szi), _cand,
+                                                     f"lebeau k={_lb_k:.1f} (net {_lb_net_atr:.1f}xATR)")
+                        except Exception as _lb_e:
+                            log.warning(f"  ⚠️ {coin}: lebeau trail failed: {_lb_e}")
+
+                    # ── v7 GREEN TIME CAP (Sep 17) — the AI's own hold_min is the window ──
+                    # 5m-scalp edge window is minutes; stalled holding pays funding/spread/
+                    # slippage against a tiny edge. Per-coin window from _resolve_exit_plan
+                    # (AI hold_min or Kronos; fallback constants only when neither exists):
+                    # hard cap closes ANY green, soft cap closes green+stale+against.
+                    # Flat/losers stay with the ROI ladder (never cut here). Manual
+                    # positions included — dead money is dead money.
+                    if (not exit_reason and _net_pnl_mon > _fee_covered_at):
+                        _gtc_reason = ""
+                        if _hold_age_mon >= _xp["hard_s"]:
+                            _gtc_reason = (f"green-time-cap[{_xp['src']}]: held {_hold_age_mon / 60:.0f}min, "
+                                           f"still green @ net {_net_pnl_mon:+.2f}% — edge window over")
+                        elif (_hold_age_mon >= _xp["soft_s"] and _peak_age >= _xp["soft_stale_s"]
+                                and mom1 < 0 and (mom5 < 0 or _peak_age >= 2 * _xp["soft_stale_s"])):
+                            _gtc_reason = (f"green-time-cap: held {_hold_age_mon / 60:.0f}min, "
+                                           f"peak stale {_peak_age / 60:.0f}min, moms against — "
+                                           f"closing green @ net {_net_pnl_mon:+.2f}%")
+                        if _gtc_reason:
+                            log.warning(f"  ⏳ {coin}: {_gtc_reason}")
+                            if _can_close_position(coin, "green-time-cap"):
+                                try:
+                                    _record_close_trade(coin, mid, entry, abs(szi), side,
+                                                        _gtc_reason[:120], conviction=0,
+                                                        regime=regime.value if hasattr(regime, 'value') else "sideways",
+                                                        leverage=leverage)
+                                except Exception:
+                                    pass
+                                _MANUAL_CLOSES[coin] = time.time()
+                                if _safe_close(coin):
+                                    _reset_signal_dominance(coin)
+                                    continue
+                                log.error(f"  🚨 {coin}: green-time-cap close FAILED — position may be NAKED")
+                                continue
 
                     # ── Only hard exit allowed beyond this point: liquidation survival ──
                     if exit_reason:
@@ -3861,7 +4143,10 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
             _last_trade_time = time.time()  # starvation tracker: bot-owned position was closed
         # Clean up peak-lock tier flag so re-entry on same coin gets fresh protection
         for _clean_key in [f"_peak_locked:{c}", f"_peak_lock_tier:{c}", f"_soft_strikes:{c}",
-                           f"_mc_peak:{c}", f"_mc_entry_ts:{c}", f"_tip_start:{c}"]:
+                           f"_mc_peak:{c}", f"_mc_entry_ts:{c}", f"_tip_start:{c}",
+                           f"_peak_pnl:{c}", f"_peak_time:{c}", f"_scaleout_peak:{c}",
+                           f"_be_locked:{c}", f"_ever_green:{c}", f"_ai_exit_recheck:{c}",
+                           f"_regime_downtrend:{c}", f"_regime_uptrend:{c}"]:
             if hasattr(_monitor_positions, _clean_key):
                 delattr(_monitor_positions, _clean_key)
         # Clean up trail states and TP tracking for closed coins
