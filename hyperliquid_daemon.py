@@ -6021,7 +6021,7 @@ def run(dry_run: bool = False):
                         elif not _comp_ok:
                             log.info(f"  🛑 {coin}: SELL ACCEL blocked — composite {sig.composite_score:+.2f} too bullish for SELL (need ≤0.10 when enriched, ≥0.10 without)")
                         else:
-                            log.info(f"  🛑 {coin}: SELL ACCEL blocked — unified={pred.direction}@{pred.confidence:.0f}% too weak (need ≥15%)")
+                            log.info(f"  🛑 {coin}: SELL ACCEL blocked — unified={pred.direction}@{pred.confidence:.0f}% too weak (need ≥5%)")
 
                     if not enter:
                         # ── AI Trade Plan override: trust AI when unified is weak but non-zero ──
@@ -6139,7 +6139,7 @@ def run(dry_run: bool = False):
                                 # When composite is strong (≥0.08), skip unified check entirely.
                                 # Unified predictor lags and calls tops/divergences that never materialize
                                 # in trending markets. Enriched signal quality is the real gate.
-                                composite_strong = sig.composite_score >= 0.15  # was 0.08 — too low, let unified=39% opposing through
+                                composite_strong = abs(sig.composite_score) >= 0.15  # was >=0.15 positive-only — SELL (negative comp) could never be strong
                                 # MET lesson: composite=+0.10, unified=DOWN@39%, ML=DOWN@59% — all said SELL
                                 # but composite_strong=0.10 skipped unified check, AI forced BUY. Lost money.
                                 # Raise to 0.15. If composite is actually strong, it'll still pass.
