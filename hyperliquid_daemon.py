@@ -4155,6 +4155,18 @@ def run(dry_run: bool = False):
                     log.warning(f"  Recovery: {coin} TP/SL placement failed — {e}")
         if existing:
             log.info(f"  Recovery: restored state for {len(existing)} existing positions")
+            # ── SIGNAL-FIRST (Sep 17): ownership hygiene now that VVV's fate is
+            # unknown. Drop any bot-owned coin with no live position (stale claim
+            # would re-adopt a FUTURE manual position). Trust the exchange, not
+            # the disk file.
+            try:
+                _live = {str(p.get("coin", "")).upper() for p in existing if str(p.get("coin", ""))}
+                for _owned in list(_BOT_OWNED):
+                    if _owned not in _live:
+                        _clear_entry_time(_owned)
+                        log.info(f"  Recovery: released stale ownership {_owned} — no live position")
+            except Exception:
+                pass
     except Exception as e:
         log.warning(f"  Recovery failed: {e}")
 
@@ -5749,17 +5761,40 @@ def run(dry_run: bool = False):
                                 log.info(f"  ⏸️  {coin}: {action} — {reason}")
                                 continue
                         elif ai_conf >= 80 and not _is_fast_track:
-                            # pred_conf 3-5% with AI 80%+ — enough (lowered from 15%→5%→3%)
-                            if pred_conf >= 3:
+                            # ── SIGNAL-FIRST (Sep 17 ATOM lesson): AI confirms, never creates.
+                            # ATOM: enriched BUY 0.35 + unified flat@2% + comp +0.12 + AI 80%
+                            # forced LONG through this hatch — never green (+0.01% peak),
+                            # NEVER-GREEN exit -1.21% net. AI≥80% helps PASS honest gates
+                            # but cannot SKIP them: require a measured edge — direction-
+                            # appropriate |comp|≥0.15, or AI≥85% + ML agreement (Aug 7
+                            # gate-relaxation, commit 97c3f3f). Else block. (pred<15 here
+                            # by construction — the ≥15%+AI≥80% path is handled above.)
+                            if ai_dir == "BUY" and mom5 < -0.5 and ai_conf < 90:
+                                log.info(f"  🛑 {coin}: AI long but 5m momentum {mom5:+.1f}% — rejecting (comp={sig.composite_score:+.2f})")
+                                continue
+                            if ai_dir == "SELL" and mom5 > 0.5 and ai_conf < 90:
+                                log.info(f"  🛑 {coin}: AI short but 5m momentum {mom5:+.1f}% — rejecting (comp={sig.composite_score:+.2f})")
+                                continue
+                            _dir_ok = (ai_dir == "BUY" and sig.composite_score >= 0.15) or \
+                                      (ai_dir == "SELL" and sig.composite_score <= -0.15)
+                            if not _dir_ok:
+                                # Aug 7 gate-relaxation: AI≥85% + ML≥30% same-direction
+                                _ml_agrees2 = False
+                                try:
+                                    _ml_agrees2 = (
+                                        (ai_dir == "BUY" and ml_dir == "up" and ml_conf >= 30) or
+                                        (ai_dir == "SELL" and ml_dir == "down" and ml_conf >= 30)
+                                    )
+                                except (NameError, AttributeError):
+                                    pass
+                                if ai_conf >= 85 and _ml_agrees2:
+                                    _dir_ok = True
+                            if _dir_ok:
                                 action = ai_dir
-                                log.info(f"  🧠 {coin}: AI plan override ({ai_conf}% conf, mom5={mom5:+.1f}%) — unified={pred_conf:.0f}%≥3%, forcing {action}")
-                                ai_override_applied = True
-                            elif ai_conf >= 80:
-                                action = ai_dir
-                                log.info(f"  🧠 {coin}: AI plan override ({ai_conf}% conf≥80%, mom5={mom5:+.1f}%) — unified={pred_conf:.0f}%, forcing {action}")
+                                log.info(f"  🧠 {coin}: AI plan override ({ai_conf}% conf, mom5={mom5:+.1f}%) — unified={pred_conf:.0f}%, comp={sig.composite_score:+.2f}, forcing {action}")
                                 ai_override_applied = True
                             else:
-                                log.info(f"  🛑 {coin}: AI override blocked — unified={pred_conf:.0f}% + AI={ai_conf}% insufficient (need unified>=3% OR AI>=80%)")
+                                log.info(f"  🛑 {coin}: AI override blocked — no measured edge (unified={pred_conf:.0f}%, comp={sig.composite_score:+.2f}, need direction-aligned |comp|≥0.15), AI={ai_conf}% can't solo")
                                 continue
                         elif _is_fast_track and ai_conf >= 80:
                             # SIGNAL-FIRST (Sep 2026): fast-track no longer means "AI alone is
@@ -6096,7 +6131,22 @@ def run(dry_run: bool = False):
                         log.info(f"  🛑 {coin}: SURVIVAL ENTRY — AI={ai_conf_final}% < 70% required, skipping")
                         continue
                     _mom5_surv = _calc_momentum(coin, "5m") or 0
-                    _bypass_ok = (ai_conf_final >= 80 and (
+                    # ── SIGNAL-FIRST (Sep 17 ATOM lesson): momentum bypass needs a
+                    # measured edge too. ATOM: AI=80% + mom5=+0.4% (noise) + unified
+                    # flat@2% + comp+0.12 forced LONG via this bypass — never green,
+                    # NEVER-GREEN exit -1.21% net. Aligned mom5 alone is not an edge.
+                    # Aug 7 gate-relaxation preserved: AI≥85% + ML≥30% same-direction
+                    # counts as a measured edge (commit 97c3f3f).
+                    _comp_edge = (sig.composite_score >= 0.15) if _trade_side == "BUY" \
+                        else (sig.composite_score <= -0.15)
+                    if not _comp_edge:
+                        try:
+                            _comp_edge = ai_conf_final >= 85 and (
+                                (_trade_side == "BUY" and ml_dir == "up" and ml_conf >= 30) or
+                                (_trade_side == "SELL" and ml_dir == "down" and ml_conf >= 30))
+                        except (NameError, AttributeError):
+                            pass
+                    _bypass_ok = (ai_conf_final >= 80 and _comp_edge and (
                         (_trade_side == "BUY" and _mom5_surv > 0.2) or
                         (_trade_side == "SELL" and _mom5_surv < -0.2)
                     ))
