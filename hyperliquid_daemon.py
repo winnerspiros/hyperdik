@@ -4068,6 +4068,16 @@ def run(dry_run: bool = False):
         log.info(f"  Bot-owned on startup: {sorted(_BOT_OWNED) or 'none'}")
         state = hl.get_user_state(main_wallet)
         existing = _normalize_positions(state.get("assetPositions", []))
+        # ── SIGNAL-FIRST (Sep 17): hygiene BEFORE the adoption loop. A stale
+        # disk claim from a coin with no live position must not survive.
+        try:
+            _live_pre = {str(p.get("coin", "")).upper() for p in existing if str(p.get("coin", ""))}
+            for _owned in list(_BOT_OWNED):
+                if _owned not in _live_pre:
+                    _clear_entry_time(_owned)
+                    log.info(f"  Recovery: released stale ownership {_owned} — no live position")
+        except Exception:
+            pass
         mids = hl.get_all_mids()
         for p in existing:
             coin = p.get("coin", "")
@@ -4155,18 +4165,6 @@ def run(dry_run: bool = False):
                     log.warning(f"  Recovery: {coin} TP/SL placement failed — {e}")
         if existing:
             log.info(f"  Recovery: restored state for {len(existing)} existing positions")
-            # ── SIGNAL-FIRST (Sep 17): ownership hygiene now that VVV's fate is
-            # unknown. Drop any bot-owned coin with no live position (stale claim
-            # would re-adopt a FUTURE manual position). Trust the exchange, not
-            # the disk file.
-            try:
-                _live = {str(p.get("coin", "")).upper() for p in existing if str(p.get("coin", ""))}
-                for _owned in list(_BOT_OWNED):
-                    if _owned not in _live:
-                        _clear_entry_time(_owned)
-                        log.info(f"  Recovery: released stale ownership {_owned} — no live position")
-            except Exception:
-                pass
     except Exception as e:
         log.warning(f"  Recovery failed: {e}")
 
