@@ -307,6 +307,7 @@ _global_pause_until: float = 0.0  # Don't open ANY position until this timestamp
 _config: dict = {}  # state.config.json loaded at startup; drives entries_enabled + wallet
 _ai_trade_plan: dict[str, dict] = {}  # coin → {direction, confidence, target_pct, stop_pct, hold_min}
 _PENDING_ZONE: dict[str, dict] = {}  # coin → {oid, is_buy, size_usd, ...} non-blocking zone orders
+_ENTRY_SNAP: dict[str, dict] = {}  # coin → entry edge snapshot (conviction/composite/regime/leverage) for the close ledger
 _last_trade_time: float = time.time()  # updated on open/close; drives starvation bypass (30+ min idle → relax gates)
 
 # ── STOP-LOSS COOLING ──
@@ -1478,7 +1479,7 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
                          stop_price: float, tp_levels: list[dict] | None = None,
                          reason: str = "", vwap_sigma: float = 0.0,
                          entry_zone: float = 0.0, entry_type: str = "market",
-                         invalidation: str = "") -> bool:
+                         invalidation: str = "", composite_score: float = 0.0) -> bool:
     """Execute a new position DIRECTLY on Hyperliquid, bypassing the
     pending_actions -> validator -> executor pipeline.
 
@@ -1592,39 +1593,56 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
         try:
             _rp_ext = get_extremes(coin, mids)
             _rp = getattr(_rp_ext, 'range_pos_1h', 50) if _rp_ext else 50
-            if (is_buy and _rp > 80) or (not is_buy and _rp < 20):
-                _desc = f"{'TOP' if is_buy else 'BOTTOM'} of 1h range ({_rp:.0f}%)"
-                log.warning(f"  🚫 {coin}: {_desc} — {'dip expected' if is_buy else 'bounce expected'} (Aug 11 rule), "
-                           f"refusing market {'buy' if is_buy else 'sell'}")
-                # Try patient limit at the swing level as a last resort
-                _ss_px = _patient_limit_price(coin, is_buy, entry_zone, mids)
-                if _ss_px > 0:
-                    _ss_px = round_price(px_dec, _ss_px, is_buy=is_buy)
-                    _ss_dist = abs(px - _ss_px) / px * 100
-                    # ── KAS lesson: a "swing low" only 0.6% away is NOT a dip — it's the
-                    # top of a tight range. Sitting a limit there buys the falling knife
-                    # (KAS filled and liquidated 16s later). Require the limit to sit a
-                    # MEANINGFUL distance away (≥2%) or skip entirely — don't chase. ──
-                    if _ss_dist < 2.0:
-                        log.warning(f"  🚫 {coin}: range-block limit too close ({_ss_dist:.1f}% {'below' if is_buy else 'above'}) — not a real dip/bounce, skipping")
-                        return False
-                    log.info(f"  🎯 {coin}: patient limit ${_ss_px:.4f} ({_ss_dist:.1f}% "
-                            f"{'below' if is_buy else 'above'}) — {_desc}")
-                    result = hl.order(coin, is_buy, sz, _ss_px, order_type="gtc")
-                    if isinstance(result, dict) and result.get("status") == "err":
-                        log.warning(f"  {coin}: range-block limit rejected — skip")
-                        return False
-                    _oid = _extract_oid(result)
-                    if _oid:
-                        _PENDING_ZONE[coin.upper()] = {
-                            "oid": _oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
-                            "stop_price": stop_price, "tp_levels": tp_levels, "reason": reason,
-                            "leverage": leverage, "placed_at": time.time(),
-                            "timeout_s": 120, "label": "range_position",
-                        }
-                        log.info(f"  📝 {coin}: range-position limit oid={_oid} queued (120s)")
-                        return True
-                return False  # No swing level → skip entirely, don't chase
+            # A momentum breakout long with hot mom5 (aligned, >+1%) and real
+            # composite (≥0.15) IS the trade the strategy exists for — the
+            # mean-reversion chase guards downstream (chase/fade/range) are the
+            # right place to time the entry, not a veto here.
+            _mom_entry = 0.0
+            try:
+                _mom_entry = _calc_momentum(coin, "5m") or 0.0
+            except Exception:
+                pass
+            _hot_mom_long = (is_buy and _mom_entry > 1.0)
+            if _hot_mom_long and composite_score >= 0.15:
+                log.info(f"  🔥 {coin}: range-block WAIVED — hot breakout (mom5={_mom_entry:+.1f}%, comp={composite_score:+.2f}), entering at market")
+            elif (is_buy and _rp > 80) or (not is_buy and _rp < 20):
+                _hot_mom_short = (not is_buy and _mom_entry < -1.0)
+                _comp_ok_short = composite_score <= -0.15
+                if _hot_mom_short and _comp_ok_short:
+                    log.info(f"  🔥 {coin}: range-block WAIVED — hot breakdown (mom5={_mom_entry:+.1f}%, comp={composite_score:+.2f}), entering at market")
+                else:
+                    _desc = f"{'TOP' if is_buy else 'BOTTOM'} of 1h range ({_rp:.0f}%)"
+                    log.warning(f"  🚫 {coin}: {_desc} — {'dip expected' if is_buy else 'bounce expected'} (Aug 11 rule), "
+                               f"refusing market {'buy' if is_buy else 'sell'}")
+                    # Try patient limit at the swing level as a last resort
+                    _ss_px = _patient_limit_price(coin, is_buy, entry_zone, mids)
+                    if _ss_px > 0:
+                        _ss_px = round_price(px_dec, _ss_px, is_buy=is_buy)
+                        _ss_dist = abs(px - _ss_px) / px * 100
+                        # ── KAS lesson: a "swing low" only 0.6% away is NOT a dip — it's the
+                        # top of a tight range. Sitting a limit there buys the falling knife
+                        # (KAS filled and liquidated 16s later). Require the limit to sit a
+                        # MEANINGFUL distance away (≥2%) or skip entirely — don't chase. ──
+                        if _ss_dist < 2.0:
+                            log.warning(f"  🚫 {coin}: range-block limit too close ({_ss_dist:.1f}% {'below' if is_buy else 'above'}) — not a real dip/bounce, skipping")
+                            return False
+                        log.info(f"  🎯 {coin}: patient limit ${_ss_px:.4f} ({_ss_dist:.1f}% "
+                                f"{'below' if is_buy else 'above'}) — {_desc}")
+                        result = hl.order(coin, is_buy, sz, _ss_px, order_type="gtc")
+                        if isinstance(result, dict) and result.get("status") == "err":
+                            log.warning(f"  {coin}: range-block limit rejected — skip")
+                            return False
+                        _oid = _extract_oid(result)
+                        if _oid:
+                            _PENDING_ZONE[coin.upper()] = {
+                                "oid": _oid, "is_buy": is_buy, "size_usd": size_usd, "sz": sz,
+                                "stop_price": stop_price, "tp_levels": tp_levels, "reason": reason,
+                                "leverage": leverage, "placed_at": time.time(),
+                                "timeout_s": 120, "label": "range_position",
+                            }
+                            log.info(f"  📝 {coin}: range-position limit oid={_oid} queued (120s)")
+                            return True
+                    return False  # No swing level → skip entirely, don't chase
         except Exception:
             pass  # Best-effort guard — if extremes fetch fails, allow market entry
 
@@ -2059,15 +2077,47 @@ def _submit_action(action_type: str, coin: str, details: dict):
                 except OSError:
                     pass
 
+    # ENTRY SNAPSHOT: persist the measured edge at open so the close ledger has
+    # real data even when the monitor's in-memory signal is gone (restart, etc).
+    # AI gets ALL data, never 0-fields — the learner must see the same.
+    if action_type in ("buy", "sell"):
+        try:
+            _ENTRY_SNAP[coin.upper()] = {
+                "conviction": float(details.get("confidence", 0) or 0),
+                "composite": float(details.get("composite", 0) or 0),
+                "regime": details.get("regime", "sideways"),
+                "leverage": int(details.get("leverage", BASE_LEVERAGE) or BASE_LEVERAGE),
+            }
+        except Exception:
+            pass
     # ── Record trade for self-learning (close actions only) ──
+    # Sep 17: pass the real measured edge — zero rows train the learner on nothing.
     if action_type == "close":
         try:
+            _snap = _ENTRY_SNAP.pop(coin.upper(), {}) if '_ENTRY_SNAP' in dir() else {}
+            try:
+                _snap_conv = float(details.get("confidence", 0) or _snap.get("conviction", 0) or 0)
+            except Exception:
+                _snap_conv = 0.0
+            try:
+                _snap_comp = float(details.get("composite", 0) or _snap.get("composite", 0) or 0)
+            except Exception:
+                _snap_comp = 0.0
+            _snap_reg = details.get("regime", "sideways") or _snap.get("regime", "sideways")
+            try:
+                _snap_lev = int(details.get("leverage", 0) or _snap.get("leverage", 0) or BASE_LEVERAGE)
+            except Exception:
+                _snap_lev = BASE_LEVERAGE
             _record_close_trade(
                 coin, float(details.get("price", details.get("entry_price", 0))),
                 float(details.get("entry_price", 0)),
                 float(details.get("size_units", details.get("size", 0))),
                 details.get("side", details.get("direction", "LONG")),
                 details.get("reason", "close"),
+                conviction=_snap_conv,
+                regime=_snap_reg,
+                leverage=_snap_lev,
+                composite_score=_snap_comp,
             )
         except Exception:
             pass
@@ -2092,8 +2142,20 @@ def _submit_action(action_type: str, coin: str, details: dict):
 
 def _record_close_trade(coin: str, mid: float, entry: float, szi: float, side: str,
                          reason: str, conviction: float = 0, regime: str = "sideways",
-                         leverage: int = BASE_LEVERAGE):
+                         leverage: int = BASE_LEVERAGE, composite_score: float = 0.0):
     """Record a closed position for self-learning and update layer weights."""
+    # Backfill from the entry snapshot: monitor-path closes pass conviction=0 /
+    # composite=0 because the in-memory signal is gone — the snapshot has the truth.
+    try:
+        _bk = _ENTRY_SNAP.get(coin.upper(), {}) if '_ENTRY_SNAP' in dir() else {}
+        if not conviction and _bk.get("conviction"):
+            conviction = float(_bk["conviction"])
+        if not composite_score and _bk.get("composite"):
+            composite_score = float(_bk["composite"])
+        if (not regime or regime == "sideways") and _bk.get("regime"):
+            regime = _bk["regime"]
+    except Exception:
+        pass
     try:
         pnl = (mid - entry) * abs(szi) * (1 if side == "LONG" else -1)
         pnl_pct = (mid - entry) / entry * 100 * (1 if side == "LONG" else -1)
@@ -2102,7 +2164,7 @@ def _record_close_trade(coin: str, mid: float, entry: float, szi: float, side: s
             coin=coin, side=side, entry_price=entry, exit_price=mid,
             pnl=pnl, pnl_pct=round(net_pnl_pct, 3), entry_time=time.time() - 3600,
             exit_time=time.time(), regime=regime, conviction=conviction,
-            composite_score=0, leverage=leverage, reason=reason,
+            composite_score=composite_score, leverage=leverage, reason=reason,
         ))
         # ── Adaptive layer learning: was the prediction correct? ──
         # Use net PnL (after fees) to judge correctness
@@ -2136,7 +2198,7 @@ def _record_close_trade(coin: str, mid: float, entry: float, szi: float, side: s
                 "coin": coin, "side": side, "entry_price": entry,
                 "exit_price": mid, "pnl_pct": round(net_pnl_pct, 3),
                 "hold_secs": 0, "regime": regime, "conviction": conviction,
-                "composite_score": 0, "leverage": leverage, "reason": reason,
+                "composite_score": composite_score, "leverage": leverage, "reason": reason,
             }
             t = threading.Thread(target=_run_trade_analysis, args=(trade_snapshot,), daemon=True)
             t.start()
@@ -5219,9 +5281,27 @@ def run(dry_run: bool = False):
                     # EXTREME VWAP BLOCK: dont buy overbought, dont sell oversold
                     # OP lesson: SHORT at -1.9σ (oversold) ×3, LONG at +2.5σ (overbought) ×3
                     if sig.side == "BUY" and vwap_sigma > 1.5:
-                        block_reason = f"VWAP:{vwap_sigma:+.1f}σ — overbought, never BUY"
+                        # Momentum-vs-mean-reversion router (Sep 17): the old rule treated
+                        # every +1.5σ long as "overbought, never BUY" — but a breakout long
+                        # with hot momentum (mom5>+1%, composite≥0.15) IS the momentum trade,
+                        # while a stale long with cold momentum is the top-buy. Route by momentum:
+                        # hot = pass to downstream confluence/AI gates, cold = block.
+                        try:
+                            _mom_gate = _calc_momentum(coin, "5m") or 0.0
+                        except Exception:
+                            _mom_gate = 0.0
+                        _hot_breakout = (_mom_gate > 1.0 and sig.composite_score >= 0.15)
+                        if not _hot_breakout:
+                            block_reason = f"VWAP:{vwap_sigma:+.1f}σ — overbought, never BUY"
                     elif sig.side == "SELL" and vwap_sigma < -1.5:
-                        block_reason = f"VWAP:{vwap_sigma:+.1f}σ — oversold, never SELL"
+                        # Symmetric router for breakdown shorts: hot downward momentum passes.
+                        try:
+                            _mom_gate_s = _calc_momentum(coin, "5m") or 0.0
+                        except Exception:
+                            _mom_gate_s = 0.0
+                        _hot_breakdown = (_mom_gate_s < -1.0 and sig.composite_score <= -0.15)
+                        if not _hot_breakdown:
+                            block_reason = f"VWAP:{vwap_sigma:+.1f}σ — oversold, never SELL"
                     if _vwap_dip_long:
                         log.info(f"  📉 {coin}: VWAP DIP BUY — VWAP={vwap_sigma:+.1f}σ oversold, mean reversion LONG")
                     elif _vwap_pump_short:
@@ -5328,15 +5408,17 @@ def run(dry_run: bool = False):
                             log.info(f"  🍽️  {coin}: STARVATION BYPASS ({_last_trade_age:.0f}s idle) — AI={ai_conf_val}% comp={sig.composite_score:+.2f} overrides: {block_reason}")
                             block_reason = None
                         else:
-                            # ── UN-OVERRIDABLE GATES: VWAP extremes, S/R levels, data consensus — no AI bypass ──
+                            # ── UN-OVERRIDABLE GATES: S/R levels, data consensus — no AI bypass ──
                             # Aug 14: S/R added — shorting near support / longing near resistance are
                             # chart-level bounces. The user's own rule: "short at support → bounce expected".
                             # AI cannot override S/R any more than it can override ML contradiction.
-                            _cannot_override = ("VWAP:+" in block_reason and "overbought" in block_reason) or \
-                                              ("VWAP:-" in block_reason and "oversold" in block_reason) or \
-                                              ("all data layers dead" in block_reason) or \
-                                              ("S/R:" in block_reason) or \
-                                              ("COMPOSITE CONTRADICTION" in block_reason)  # comp sign contradicts direction — data conflict, no AI bypass
+                            # Sep 17: VWAP-extreme vetoes moved OUT of this list — the Gate-1
+                            # momentum router above already decided hot-breakout-vs-top-buy with
+                            # live momentum. A cold VWAP veto re-applied here would double-count
+                            # the same evidence (CAKE: every AI pick vetoed pre-market, zero fills).
+                            _cannot_override = (("all data layers dead" in block_reason) or
+                                              ("S/R:" in block_reason) or
+                                              ("COMPOSITE CONTRADICTION" in block_reason))  # comp sign contradicts direction — data conflict, no AI bypass
                             if _cannot_override:
                                 log.info(f"  🛑 {coin}: UN-OVERRIDABLE — {block_reason} (AI={ai_conf_val}% cannot bypass this gate)" +
                                         (f" — starved but {'comp too weak' if _starved and not _starvation_ready else 'composite contradiction'}" if _starved else ""))
@@ -6359,6 +6441,19 @@ def run(dry_run: bool = False):
                         _no_binance = _bs2(coin) is None
                     except Exception:
                         pass
+                    # A hot momentum breakout already routed past the VWAP/range vetoes
+                    # (hot mom5 + real composite) has proven measurable edge — the same
+                    # composite evidence must not be re-litigated here. Skip this floor.
+                    _hot_entry_skip = False
+                    try:
+                        _mom_floor = _calc_momentum(coin, "5m") or 0.0
+                        _hot_long = (_trade_side == "BUY" and _mom_floor > 1.0 and sig.composite_score >= 0.15)
+                        _hot_short = (_trade_side == "SELL" and _mom_floor < -1.0 and sig.composite_score <= -0.15)
+                        if _hot_long or _hot_short:
+                            _hot_entry_skip = True
+                            log.info(f"  🔥 {coin}: composite floor SKIPPED — hot entry already validated (mom5={_mom_floor:+.1f}%, comp={sig.composite_score:+.2f})")
+                    except Exception:
+                        pass
                     _comp_floor = 0.10 if _no_binance else 0.05
                     # AI override with enriched confirmation: relax no-Binance floor to 0.05
                     # XMR bug: comp=0.06, AI=85%, enriched=BUY, CVD+VWAP+L3 aligned, blocked by 0.10 floor
@@ -6391,7 +6486,7 @@ def run(dry_run: bool = False):
                             _bad_entry = False  # explicitly allow
                             # Skip the normal floor check below — use the relaxed ceiling instead
                             _vwap_relaxed_active = True
-                    if not _bad_entry:
+                    if not _bad_entry and not _hot_entry_skip:
                         _vwap_skip_floor = locals().get('_vwap_relaxed_active', False)
                         if _vwap_skip_floor:
                             pass  # VWAP relax already validated composite ceiling
@@ -6414,6 +6509,20 @@ def run(dry_run: bool = False):
                                 _bad_entry = True
                     if _bad_entry:
                         continue
+
+                    # ── SIGNAL SNAPSHOT (AI gets ALL data, never 0-fields) ──
+                    # The trade ledger + AI context must carry the real measured edge
+                    # (composite, conviction, ML, momentum, VWAP, unified) — zero rows
+                    # train the learner on empty data and mislead the next AI read.
+                    _snap_comp = sig.composite_score
+                    _snap_conv = conviction_score if 'conviction_score' in dir() else 0
+                    _snap_ml = f"{ml_dir}@{ml_conf:.0f}%" if 'ml_dir' in dir() and ml_dir else "n/a"
+                    try:
+                        _snap_mom5 = _calc_momentum(coin, "5m") or 0.0
+                    except Exception:
+                        _snap_mom5 = 0.0
+                    _snap_unified = f"{pred.direction}@{pred.confidence:.0f}%" if 'pred' in dir() and pred else "n/a"
+                    log.info(f"  📸 {coin}: edge snapshot comp={_snap_comp:+.2f} conv={_snap_conv:.0f} ML={_snap_ml} mom5={_snap_mom5:+.1f}% unified={_snap_unified} VWAP={vwap_sigma:+.1f}σ")
 
                     risk = full_risk_check(
                         symbol=coin,
@@ -6698,6 +6807,8 @@ def run(dry_run: bool = False):
 
                     try:
                             # Write audit trail (file-based fallback if inline execution fails)
+                            # Sep 17: carry the REAL measured edge (never 0-fields) so the
+                            # learner/AI review train on actual data, not empty rows.
                             _submit_action(
                             "buy" if _trade_side == "BUY" else "sell",
                             coin,
@@ -6714,7 +6825,7 @@ def run(dry_run: bool = False):
                                 "trail_enabled": exit_plan.trail_enabled,
                                 "trail_atr": exit_plan.trail_atr,
                                 "reason": sig.reason,
-                                "confidence": sig.confidence,
+                                "confidence": max(float(sig.confidence or 0), float(ai_conf_final or 0) / 100.0) if 'ai_conf_final' in dir() else sig.confidence,
                                 "regime": sig.regime.value,
                                 "kelly": sig.kelly_fraction,
                                 "composite": sig.composite_score,
@@ -6914,6 +7025,7 @@ def run(dry_run: bool = False):
                             entry_zone=_zone_px,
                             entry_type=_ai_entry_type,
                             invalidation=_ai_invalidation,
+                            composite_score=sig.composite_score,
                             )
                     except Exception as _exec_exc:
                             log.error(f"  💥 {coin}: execution crashed — {type(_exec_exc).__name__}: {_exec_exc}")
@@ -6950,11 +7062,12 @@ def run(dry_run: bool = False):
                     else:
                             log.warning(f"  ⚠️  {coin}: Inline execution FAILED — cooldown 120s to prevent retry spam")
                             _forager_skip_cooldown[coin] = time.time()
-                            # ── Blacklist coins that fail 3+ times in a row ──
-                            _exec_fails[coin] = _exec_fails.get(coin, 0) + 1
-                            if _exec_fails[coin] >= 3:
-                                _coin_blacklist.add(coin.upper())
-                            log.warning(f"  🚫 {coin}: BLACKLISTED after {_exec_fails[coin]} failures")
+                            # ── Execution-failure cooldown, NOT a ban (Sep 17 fix) ──
+                            # "BLACKLIST after 1 failure" banned coins for a downsteam veto
+                            # (VWAP/range-block returning False). Execution veto ≠ broken coin.
+                            # Cooldown 15 min so the pipeline moves on; the 30-min signal
+                            # cooldown above still applies. Permanent blacklist reserved for
+                            # genuine exchange rejections (3+ in the IOC tail).
 
                 # ── Stage 6: While whale signals (optional boost) ──
                 whale_signals = whale_tracker.get_recent_signals(max_age=60)
