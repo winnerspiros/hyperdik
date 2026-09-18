@@ -238,7 +238,7 @@ _ALWAYS_SCAN = {"BTC", "ETH"}
 _rotate_offset = 0
 CYCLE_SECONDS = _cfg("monitoring.cycle_seconds", 3)  # 3s — configurable, fast default
 FAST_MONITOR_SECONDS = 3  # fast exit/monitor thread cadence (decoupled from entry pipeline)
-MIN_TRADE_USD = 3.0  # micro-account floor (was 5.0): $3.36 + leverage can fund one $11 min-notional scalp; blocks dust only
+MIN_TRADE_USD = 2.5  # micro-account floor (Sep 18: was 3.0 — equity sits at $2.97, gate blocked ALL entries; just under live equity per dust-account rule; sizing floor untouched)
 # Minimum notional per trade: $11 floor (HL minimum is $10 + headroom for
 # price drift between sizing and fill). Sep 17: was $20 — that mismatched the
 # $11 sizing floor, so every micro scalp filled as $9 "IOC dust" and got
@@ -387,6 +387,17 @@ _position_entry_times: dict[str, float] = {}  # coin.upper() → epoch timestamp
 _BOT_OWNED: set[str] = set()  # coin.upper() for positions the bot opened this session
 _BOT_OWNED_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "bot_owned.json")
 
+# ── PROTECTION INVARIANT (Sep 18 rework) ──
+# Every open position must have a VERIFIED exchange stop-loss. _SL_OID tracks the
+# live SL oid per coin; the verify loop re-places when it disappears. Replaces are
+# place-first-then-cancel (never naked), except scale-out where the old SL is
+# oversized and must be cancelled first. _SL_REPLACE_TS throttles replaces to
+# avoid 429 cancel/replace spam (trail tightens every cycle otherwise).
+_SL_OID: dict[str, int] = {}        # coin.upper() → live exchange SL oid
+_SL_PX: dict[str, float] = {}         # coin.upper() → last placed SL price
+_SL_REPLACE_TS: dict[str, float] = {}  # coin.upper() → last replace epoch
+_SL_REPLACE_MIN_INTERVAL = 30.0     # seconds between non-forced replaces
+
 
 def _load_bot_owned() -> set[str]:
     try:
@@ -499,18 +510,53 @@ def _cancel_coin_sl(coin: str) -> int:
     return cancelled
 
 
-def _replace_trailing_sl(coin: str, side: str, size: float, new_stop: float, reason: str = "") -> bool:
+def _replace_trailing_sl(coin: str, side: str, size: float, new_stop: float, reason: str = "",
+                         force: bool = False) -> bool:
     """Cancel the existing exchange SL and place a new trailing SL at new_stop.
 
     The Aug 13 regression: update_trail() moved trail_states[coin].current_stop in
     LOCAL memory only — the exchange SL stayed parked at breakeven. This is the actual
     order mutation that makes the trailing stop real.
+
+    Sep 18 rework — PROTECTION INVARIANT + anti-spam:
+    - RATCHET: never move the verified exchange stop backwards (LONG: only up,
+      SHORT: only down). A recomputed chandelier/LeBeau stop worse than the live
+      one is dropped (keep the better stop, return True).
+    - THROTTLE: non-forced replaces (chandelier/LeBeau tighten every cycle) are
+      capped at one per _SL_REPLACE_MIN_INTERVAL (30s) to avoid 429
+      cancel/replace churn that leaves naked windows (SUSHI Sep 17: 429 on
+      cancel+place mid-tighten). Forced replaces (BE-lock, scale-out re-arm)
+      always go through.
+    - VERIFY: success records _SL_OID/_SL_PX so the verify loop can prove
+      protection exists instead of trusting log lines.
+    - SIZE: round to szDecimals first — XPL Sep 17 re-arm died on
+      float_to_wire rounding (125.5148...) and stranded a naked runner.
     """
     cu = coin.upper()
     try:
+        if size <= 0 or new_stop <= 0:
+            return False
+        # ── Ratchet vs the last VERIFIED exchange stop ──
+        _old_px = _SL_PX.get(cu, 0.0)
+        if _old_px > 0:
+            if side == "LONG" and new_stop < _old_px * (1 - 1e-6):
+                return True  # keep the better live stop
+            if side == "SHORT" and new_stop > _old_px * (1 + 1e-6):
+                return True
+        # ── Throttle non-forced replaces (429 guard) ──
+        if not force:
+            _last_rep = _SL_REPLACE_TS.get(cu, 0.0)
+            if time.time() - _last_rep < _SL_REPLACE_MIN_INTERVAL:
+                return True  # live stop is recent; local state already tightened
+        from hyperliquid_execution import round_size as _rs
+        try:
+            _sz_dec = hl._get_sz_decimals(coin)
+            size = _rs(_sz_dec, size)
+        except Exception:
+            pass
         # Cancel existing SL/stop orders for this coin (breakeven-lock SL included).
         _cancel_coin_sl(coin)
-        if size <= 0 or new_stop <= 0:
+        if size <= 0:
             return False
         _px_dec = max(0, int(5 - abs(math.log10(max(new_stop, 0.0001)))))
         sl_px = round_price(_px_dec, new_stop, is_buy=(side == "SHORT"))
@@ -522,6 +568,9 @@ def _replace_trailing_sl(coin: str, side: str, size: float, new_stop: float, rea
         if not _new_oid:
             log.warning(f"  ⚠️ {coin}: trailing SL replace returned no oid ({reason})")
             return False
+        _SL_OID[cu] = _new_oid
+        _SL_PX[cu] = float(sl_px)
+        _SL_REPLACE_TS[cu] = time.time()
         log.info(f"  🛡️ {coin}: trailing SL → ${sl_px:.5f} (oid={_new_oid}) {reason}")
         return True
     except Exception as e:
@@ -553,7 +602,12 @@ def _safe_close(coin: str) -> bool:
                     else:
                         log.error(f"  🚨 {coin}: CRITICAL — position STILL OPEN after 2 close attempts! NAKED!")
                         return False
-            # Position is flat — verified
+            # Position is flat — verified. Drop the SL registry: the stop is gone
+            # with the position (filled/cancelled). A stale _SL_PX would ratchet-
+            # block the NEXT trade's stop on this coin.
+            _SL_OID.pop(cu, None)
+            _SL_PX.pop(cu, None)
+            _SL_REPLACE_TS.pop(cu, None)
             if attempt > 0:
                 log.info(f"  ✓ {coin}: position closed on retry (verified flat)")
             return True
@@ -1460,8 +1514,11 @@ def _execute_direct_close(coin: str, size_fraction: float = 1.0, reason: str = "
     try:
         # Use the already-configured hl module for Hyperliquid operations
         # hl is imported at module level and configured in run()
+        # Sep 18: verified close — unverified closes strand naked dust at 8-10x.
         if size_fraction >= 0.95:
-            result = hl.market_close(coin)
+            if not _safe_close(coin):
+                log.error(f"  DIRECT CLOSE {coin}: verified close FAILED — position may be NAKED")
+                return False
             log.info(f"  DIRECT CLOSE: {coin} full — {reason}")
             # ── Cancel any orphaned TP/SL orders for this coin ──
             # NOTE: hl.Info() here would spawn a NEW WebSocket connection each call
@@ -1943,6 +2000,20 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
             if not oid or oid == 0:
                 log.error(f"  DIRECT OPEN {coin}: no order ID — result={result}")
                 return False
+            # ── Sep 18: fill-verification uses the REAL position, not an estimate.
+            # size_usd/px estimated the fill; with drift it says dust when the
+            # fill was fine (or accepts dust). Read szi from user_state.
+            _fill_px = px
+            try:
+                _fill_state = hl.get_user_state()
+                for _fp in _fill_state.get("assetPositions", []):
+                    _fpp = _fp.get("position", {})
+                    if str(_fpp.get("coin", "")).upper() == coin.upper():
+                        _fill_px = float(_fpp.get("entryPx", 0)) or px
+                        break
+            except Exception:
+                pass
+            _fill_notional = size_usd  # fallback until measured below
             log.info(f"  ✅ DIRECT OPEN: {coin} {'LONG' if is_buy else 'SHORT'} "
                      f"${size_usd:.2f} @ {leverage}x (oid={oid}) — {reason[:60]}")
             _record_entry_time(coin)  # Aug 17: mark bot-owned + record entry (no more adopt-unknown)
@@ -2052,31 +2123,41 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
         try:
             time.sleep(0.8)
             state = hl.get_user_state()
-            # Calculate expected size from current mid price or fallback to entry_price
-            mids_now = hl.get_all_mids()
-            px = float(mids_now.get(coin, 0))
-            if px <= 0:
-                px = size_usd  # Fallback: use notional as rough price estimate
-            expected_sz = size_usd / px if px > 0 else 0.001  # Safety floor
+            # ── Sep 18: measure the REAL fill from user_state (szi × entryPx).
+            # Old code estimated expected_sz = size_usd/mid and compared the live
+            # szi against 50% of that estimate — mid drift between sizing and fill
+            # made good fills read as dust (and vice versa). The dust question is
+            # only: is the position the exchange actually holds ≥ $11 notional?
             for p in state.get("assetPositions", []):
                 pos_coin = p.get("position", {}).get("coin", "")
                 if pos_coin.upper() == coin.upper():
                     szi = abs(float(p["position"].get("szi", 0)))
-                    fill_notional = szi * px
-                    if szi > 0.0001 and (expected_sz <= 0 or szi >= expected_sz * 0.5):
-                        return True  # Position confirmed with reasonable fill
+                    _epx = float(p["position"].get("entryPx", 0) or 0)
+                    _mpx = 0.0
+                    try:
+                        _mpx = float((hl.get_all_mids() or {}).get(coin, 0) or 0)
+                    except Exception:
+                        pass
+                    _vpx = _epx if _epx > 0 else _mpx
+                    fill_notional = szi * _vpx if _vpx > 0 else 0.0
+                    if szi > 0.0001 and fill_notional >= MIN_NOTIONAL_USD:
+                        return True  # real position, real size — confirmed
                     elif szi > 0.0001:
-                        # IOC partial — under 50% fill
-                        if fill_notional >= MIN_NOTIONAL_USD:
-                            log.warning(f"  ⚠️ DIRECT OPEN {coin}: IOC partial ${fill_notional:.2f} — accepted")
-                            return True
-                        else:
-                            log.warning(f"  ⚠️ DIRECT OPEN {coin}: IOC dust ${fill_notional:.2f} < ${MIN_NOTIONAL_USD} — closing")
-                            hl.market_close(coin)
-                            # Blacklist coin for 30 min — thin book, won't improve quickly
+                        # ── Sep 18: DUST CLOSE-FIRST. Old code market_closed then
+                        # blacklisted the coin and returned False — but the close
+                        # was UNVERIFIED (raw market_close, no retry), so the dust
+                        # sat naked and liquidated 15s later (MINA/MET/INIT/KAS).
+                        # Verify via _safe_close; only cooldown/blacklist the coin
+                        # when the close actually flattened. If it won't close,
+                        # say so loudly — never silently hold dust at 8-10x.
+                        log.warning(f"  ⚠️ DIRECT OPEN {coin}: IOC dust ${fill_notional:.2f} < ${MIN_NOTIONAL_USD} — closing first")
+                        if _safe_close(coin):
                             _forager_skip_cooldown[coin.upper()] = time.time() + 1800
-                            log.warning(f"  🚫 {coin}: dust-cooldown 30min (thin order book)")
-                            return False
+                            log.warning(f"  🚫 {coin}: dust closed+verified — cooldown 30min (thin order book)")
+                        else:
+                            log.error(f"  🚨 {coin}: DUST CLOSE FAILED — position still open, cooldown WITHOUT blacklist (will retry verify)")
+                            _forager_skip_cooldown[coin.upper()] = time.time() + 300
+                        return False
             # No position at all — ghost fill (IOC usually prevents this)
             log.warning(f"  ⚠️ DIRECT OPEN {coin}: ghost fill — no position found")
             return False
@@ -2406,10 +2487,20 @@ def _reset_signal_dominance(coin: str):
     _last_tick_action.pop(coin.upper(), None)
 
 def _verify_open_orders(positions: list, mids: dict):
-    """Verify TP/SL orders exist on exchange. Re-place missing ones.
-    
-    NautilusTrader pattern: periodic open_order check catches naked positions.
-    Now runs every cycle but caches result for unchanged positions.
+    """Protection invariant: EVERY open position has a VERIFIED exchange SL.
+
+    Sep 18 rework (NautilusTrader pattern + research memo). The old version only
+    checked \"any open order\" (a TP counted as protection) and re-placed with an
+    unverified fire-and-forget that could itself fail silently. Now:
+    - Match a resting reduce-only TRIGGER SL by coin + correct side + size
+      within 15% of the position (an oversized stale SL after a scale-out
+      does NOT count — Hyperliquid auto-cancels it).
+    - Match syncs the _SL_OID/_SL_PX registry (proof of protection, incl.
+      adoption of pre-restart SLs placed before this daemon booted).
+    - No match → NAKED → re-place via _replace_trailing_sl(force=True) at the
+      trail stop (or entry∓1.5% fallback). Still naked after that → _safe_close.
+      A naked half-runner at 6x is worse than any close.
+    Runs every cycle but caches for unchanged positions (60s) to limit API load.
     """
     cu_names = set()
     for p in positions:
@@ -2419,7 +2510,7 @@ def _verify_open_orders(positions: list, mids: dict):
             cu_names.add(coin.upper())
     if not cu_names:
         return
-    
+
     # Skip if we verified same coins in last 60s (reduces API load)
     _last_verify = getattr(_verify_open_orders, "_last_verify", 0)
     _last_coins = getattr(_verify_open_orders, "_last_coins", set())
@@ -2428,41 +2519,50 @@ def _verify_open_orders(positions: list, mids: dict):
         return
     _verify_open_orders._last_verify = _now
     _verify_open_orders._last_coins = cu_names.copy()
-    
+
+    def _is_sl_order(o: dict) -> bool:
+        try:
+            if not o.get("reduceOnly"):
+                return False
+            _ot = str(o.get("orderType", "") or "").lower()
+            if not _ot:
+                return True  # reduce-only with no type info — count it, verify size/side
+            return ("trigger" in _ot or "sl" in _ot or "tp" in _ot
+                    or "stop" in _ot)
+        except Exception:
+            return False
+
+    def _order_side_is_buy(o: dict) -> bool | None:
+        try:
+            _s = str(o.get("side", "") or "").upper()
+            if _s in ("B", "BUY", "BID"):
+                return True
+            if _s in ("A", "SELL", "ASK"):
+                return False
+        except Exception:
+            pass
+        return None
+
+    def _order_px(o: dict) -> float:
+        for _k in ("triggerPx", "limitPx", "px"):
+            try:
+                _v = float(o.get(_k, 0) or 0)
+                if _v > 0:
+                    return _v
+            except Exception:
+                continue
+        return 0.0
+
     try:
         open_orders = hl.get_open_orders()
-        # Build set of coins that have ANY open order (TP or SL)
-        coins_with_orders = set()
+        by_coin: dict[str, list] = {}
         for o in (open_orders or []):
             oc = (o.get("coin", "") or "").upper()
             if oc:
-                coins_with_orders.add(oc)
-        
-        naked = cu_names - coins_with_orders
-        
-        # Also check for coins that have orders but might have stale prices
-        # (Hummingbot pattern: cancel old TP orders before placing new ones)
-        for cu in coins_with_orders & cu_names:
-            ts = trail_states.get(cu)
-            if not ts:
-                continue
-            coin_orders = [o for o in (open_orders or []) if (o.get("coin","") or "").upper() == cu]
-            # Check if any order is a TP at an outdated price
-            for o in coin_orders:
-                is_tp = "tp" in str(o.get("orderType", "")).lower()
-                if is_tp:
-                    oid = o.get("oid", "")
-                    px = float(o.get("limitPx", 0))
-                    # If TP price doesn't match our current trail state, cancel it
-                    expected_tp = ts.entry_price * (1.02 if ts.is_long else 0.98)
-                    if px > 0 and abs(px - expected_tp) / expected_tp > 0.005:  # >0.5% off
-                        try:
-                            hl.cancel_order(coin, oid)
-                            log.info(f"  🧹 {cu}: cancelled stale TP @ ${px:.4f} (expected ~${expected_tp:.4f})")
-                        except Exception:
-                            pass
-        for cu in naked:
-            pos = next((p for p in positions if (p.get("coin","") or "").upper() == cu), None)
+                by_coin.setdefault(oc, []).append(o)
+
+        for cu in cu_names:
+            pos = next((p for p in positions if (p.get("coin", "") or "").upper() == cu), None)
             if not pos:
                 continue
             coin = pos.get("coin", "")
@@ -2472,24 +2572,60 @@ def _verify_open_orders(positions: list, mids: dict):
                 continue
             is_long = float(pos.get("szi", 0)) > 0
             mid = float(mids.get(coin, entry))
-            
-            # Build TP/SL from trail state if available, else compute
-            ts = trail_states.get(cu)
-            sl_price = ts.current_stop if ts else (entry * 0.985 if is_long else entry * 1.015)
-            tp1_pct = 1.02 if is_long else 0.98
-            
-            log.warning(f"  ⚠️ NAKED {coin}: no open orders — re-placing SL (winners run, no TP)")
+            # LONG's SL is a SELL (is_buy=False); SHORT's SL is a BUY.
+            _need_buy = not is_long
+            _matched_oid = 0
+            _matched_px = 0.0
+            for o in by_coin.get(cu, []):
+                if not _is_sl_order(o):
+                    continue
+                _oside = _order_side_is_buy(o)
+                if _oside is not None and _oside != _need_buy:
+                    continue
+                try:
+                    _osz = abs(float(o.get("sz", 0) or 0))
+                except Exception:
+                    _osz = 0.0
+                if _osz > 0 and abs(_osz - szi) / szi > 0.15:
+                    continue  # stale/oversized SL (post-scale-out) — not protection
+                _matched_oid = o.get("oid", 0) or 0
+                _matched_px = _order_px(o)
+                break
+            if _matched_oid:
+                _SL_OID[cu] = _matched_oid
+                if _matched_px > 0:
+                    _SL_PX[cu] = _matched_px
+                continue  # protected — proof on exchange
+            # ── NAKED: no verified SL resting ──
+            _ts_stop = 0.0
             try:
-                _sz_dec = hl._get_sz_decimals(coin)
-                _px_dec = max(0, int(5 - abs(math.log10(max(mid, 0.0001)))))
-                sl_px = round_price(_px_dec, sl_price, is_buy=not is_long)
-                hl.trigger_order(coin, not is_long, szi, sl_px, order_type="sl", is_market=True, reduce_only=True)
-                if _TAKE_PROFIT_ENABLED:
-                    tp_px = round_price(_px_dec, entry * tp1_pct, is_buy=not is_long)
-                    hl.order(coin, not is_long, szi * 0.5, tp_px, order_type="gtc", reduce_only=True)
-                log.info(f"  ✅ {coin}: SL re-placed — SL=${sl_px:.4f}" + (f" TP=${tp_px:.4f}" if _TAKE_PROFIT_ENABLED else " (no TP — let it run)"))
-            except Exception as e:
-                log.warning(f"  ⚠️ {coin}: re-place SL failed: {e}")
+                _ts = trail_states.get(cu)
+                _ts_stop = float(_ts.current_stop) if _ts else 0.0
+            except Exception:
+                _ts_stop = 0.0
+            if not _ts_stop or _ts_stop <= 0:
+                _ts_stop = entry * (0.985 if is_long else 1.015)
+            else:
+                # Sanity: stop must be on the protective side of mid.
+                if (is_long and _ts_stop >= mid) or (not is_long and _ts_stop <= mid):
+                    _ts_stop = entry * (0.985 if is_long else 1.015)
+            log.warning(f"  ⚠️ NAKED {coin}: no verified SL on exchange — re-placing (protection invariant)")
+            # Registry still holds the LOST stop's price — clear it first or the
+            # ratchet inside _replace_trailing_sl keeps the (dead) better stop
+            # and places nothing.
+            _SL_OID.pop(cu, None)
+            _SL_PX.pop(cu, None)
+            if _replace_trailing_sl(coin, "LONG" if is_long else "SHORT", szi,
+                                    _ts_stop, "naked re-arm", force=True):
+                log.info(f"  ✅ {coin}: SL re-placed — protection restored")
+            else:
+                log.error(f"  🚨 {coin}: SL re-place FAILED — closing (no naked holds at leverage)")
+                try:
+                    _MANUAL_CLOSES[coin] = time.time()
+                    if _safe_close(coin):
+                        _reset_signal_dominance(coin)
+                except Exception as _e:
+                    log.error(f"  🚨 {coin}: naked-close failed: {_e}")
     except Exception as e:
         log.warning(f"  Open order verification error: {type(e).__name__}: {e}")
 
@@ -2556,7 +2692,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                     continue
                 try:
                     _MANUAL_CLOSES[_coin] = time.time()
-                    hl.market_close(_coin)
+                    _safe_close(_coin)
                     log.error(f"  🚨 EMERGENCY CLOSED {_coin}")
                 except Exception as _e:
                     log.error(f"  🚨 Emergency close {_coin} failed: {_e}")
@@ -2590,7 +2726,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
             continue
         try:
             _MANUAL_CLOSES[coin] = time.time()
-            hl.market_close(coin)
+            _safe_close(coin)
             log.error(f"  🚨 EMERGENCY CLOSED {coin} (flash crash)")
         except Exception as _e:
             log.error(f"  🚨 Emergency close {coin} failed: {_e}")
@@ -2676,7 +2812,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                 log.info(f"  ⏰ {coin}: ROI timeout — held {hold_secs/60:.0f}min, gross={pnl_pct:+.2f}% net={net_pnl:+.2f}% — losing beyond {min_profit}% threshold → exiting")
                 try:
                     _MANUAL_CLOSES[coin] = time.time()
-                    hl.market_close(coin)
+                    _safe_close(coin)
                     _reset_signal_dominance(coin)
                 except Exception as e:
                     log.warning(f"  ⏰ {coin}: ROI exit failed: {e}")
@@ -2691,52 +2827,83 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                 log.info(f"  ⏰ {coin}: ROI timeout — held {hold_secs/60:.0f}min, gross={pnl_pct:+.2f}% net={net_pnl:+.2f}% — flat for 60min → exiting")
                 try:
                     _MANUAL_CLOSES[coin] = time.time()
-                    hl.market_close(coin)
+                    _safe_close(coin)
                     _reset_signal_dominance(coin)
                 except Exception as e:
                     log.warning(f"  ⏰ {coin}: ROI exit failed: {e}")
             continue
 
-        # ── ROI TIME LADDER (Freqtrade/maximal_roi pattern, Sep 2026) ──
-        # The Aug 7 "zero-loss" system disabled ALL time-based exits, so a trade that
-        # goes nowhere sits forever tying up margin while fees and funding bleed it.
-        # This ladder only fires on FLAT/LOSING positions (never touches green ones —
-        # those belong to the peak scale-out ladder above), demands progressively
-        # LESS profit the longer we hold, and always routes through
-        # _can_close_position (600s MIN_HOLD) + _safe_close (verified flat):
-        #   20 min held + still below fees → exit (dead trade, free the margin)
-        #   30 min held + net < +1 ATR(5m) → exit (move never came)
-        #   60 min held + net < +2 ATR(5m) → exit (capital better deployed elsewhere)
+        # ── CAPITAL-RECYCLE LADDER (Sep 18 rework of the ROI time ladder) ──
+        # Freqtrade maximal_roi was built for 5m+ spot holds; grid-search over
+        # exit policies finds 48h stale closes beat 12/24h, and production
+        # funding bots use a 7-day timeout as the LAST layer. A 20-min forced
+        # close of a flat-but-valid trade is a capital-rotation bug: the
+        # account's real constraint is free SLOTS (max_pos=1 at <$25 equity),
+        # so the fix is worst-first EVICTION when a better candidate waits —
+        # not a clock that shoots our only position because time passed.
+        # This ladder therefore only fires on FLAT/LOSING positions (never
+        # touches green ones — those belong to the peak scale-out / giveback
+        # / LeBeau layers), and at 20/30min it only TIGHTENS the stop (= the
+        # timer as an escalating tighten, never a market close of green).
+        # Only at 48h stale does it fully close a dead position.
+        #   20 min + still below fees → tighten stop to worst of live stop /
+        #       entry∓0.5xATR (ratchet-only; frees nothing but caps the bleed)
+        #   60 min + net < +1 ATR(5m) → same tighten (move never came)
+        #   48 h held + net < +2 ATR(5m) → close (capital better deployed)
         # Thresholds use live ATR(5m), not hardcoded % — chop tolerates less, trends more.
         if not _manual_mode and not exit_reason and _net_pnl_mon <= _fee_covered_at:
             try:
                 _roi_atr = _calc_atr_pct(coin, _TRAIL_ATR_TF, 14)
                 if _roi_atr > 0:
                     _roi_need = 0.0
-                    if _hold_age_mon >= 3600:
+                    _roi_close = False  # only 48h stale may market-close
+                    if _hold_age_mon >= 172800:
                         _roi_need = 2.0 * _roi_atr * leverage
-                    elif _hold_age_mon >= 1800:
+                        _roi_close = True
+                    elif _hold_age_mon >= 3600:
                         _roi_need = 1.0 * _roi_atr * leverage
                     elif _hold_age_mon >= 1200:
                         _roi_need = _fee_covered_at  # 20min: must at least cover fees
                     if _roi_need > 0 and _net_pnl_mon < _roi_need:
-                        _roi_reason = (f"roi-ladder: held {_hold_age_mon/60:.0f}min, net={_net_pnl_mon:+.2f}% "
-                                       f"< need {_roi_need:+.2f}% — freeing margin")
-                        log.info(f"  ⏰ {coin}: {_roi_reason}")
-                        if _can_close_position(coin, "roi-ladder"):
-                            _MANUAL_CLOSES[coin] = time.time()
-                            if _safe_close(coin):
-                                try:
-                                    _record_close_trade(coin, mid, entry, abs(szi), side,
-                                                        "roi-ladder", conviction=0,
-                                                        regime=regime.value if hasattr(regime, 'value') else "sideways",
-                                                        leverage=leverage)
-                                except Exception:
-                                    pass
-                            _reset_signal_dominance(coin)
-                            continue
+                        _roi_reason = (f"recycle: held {_hold_age_mon/60:.0f}min, net={_net_pnl_mon:+.2f}% "
+                                       f"< need {_roi_need:+.2f}%")
+                        if _roi_close:
+                            log.info(f"  ⏰ {coin}: {_roi_reason} — 48h stale, closing")
+                            if _can_close_position(coin, "recycle-stale"):
+                                _MANUAL_CLOSES[coin] = time.time()
+                                if _safe_close(coin):
+                                    try:
+                                        _record_close_trade(coin, mid, entry, abs(szi), side,
+                                                            "recycle-stale", conviction=0,
+                                                            regime=regime.value if hasattr(regime, 'value') else "sideways",
+                                                            leverage=leverage)
+                                    except Exception:
+                                        pass
+                                _reset_signal_dominance(coin)
+                                continue
+                        else:
+                            # Escalating tighten, not a close: halve the stop-to-entry
+                            # gap (ratchet-only via _replace_trailing_sl), so a flat
+                            # trade's risk shrinks the longer it sits — without
+                            # freeing margin we need for the one slot we have.
+                            try:
+                                _tight_ref = _SL_PX.get(cu, 0.0) or (trail_states[cu].current_stop if cu in trail_states else 0.0)
+                                if _tight_ref:
+                                    _atr_dist = (_roi_atr / 100.0) * mid * 0.5
+                                    if side == "LONG":
+                                        _tight_cand = max(_tight_ref, entry - _atr_dist)
+                                        _tight_cand = min(_tight_cand, mid * 0.999)
+                                    else:
+                                        _tight_cand = min(_tight_ref, entry + _atr_dist)
+                                        _tight_cand = max(_tight_cand, mid * 1.001)
+                                    if _tight_cand != _tight_ref:
+                                        log.info(f"  ⏰ {coin}: {_roi_reason} — tightening stop (no close)")
+                                        _replace_trailing_sl(coin, side, abs(szi), _tight_cand,
+                                                             "recycle-tighten")
+                            except Exception:
+                                pass
             except Exception as _roi_e:
-                log.warning(f"  ⚠️ {coin}: ROI ladder skipped ({type(_roi_e).__name__})")
+                log.warning(f"  ⚠️ {coin}: recycle ladder skipped ({type(_roi_e).__name__})")
 
         # Liquidation warning + survival force-close
         if liq > 0:
@@ -2745,7 +2912,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                 log.error(f"  🚨 {coin} {side}: {liq_dist:.2f}% from LIQUIDATION! Liq=${liq:,.4f} — FORCE CLOSING")
                 try:
                     _MANUAL_CLOSES[coin] = time.time()
-                    hl.market_close(coin)
+                    _safe_close(coin)
                     _reset_signal_dominance(coin)
                     continue
                 except Exception as e:
@@ -2883,16 +3050,53 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                             _be_locked = True
                             setattr(_monitor_positions, _be_key, True)
                             try:
-                                # Cancel existing exchange SL order(s) — hl.info() doesn't exist; use get_open_orders
-                                _cancel_coin_sl(coin)
-                                # Place breakeven stop at entry price
-                                from hyperliquid_execution import round_price
-                                import math as _math
-                                _px_dec = max(0, int(5 - abs(_math.log10(max(entry, 0.0001)))))
-                                _be_px = round_price(_px_dec, entry, is_buy=(side == "SHORT"))
+                                # ── Sep 18: VERIFY the breakeven stop is actually resting on
+                                # the exchange. cancel is best-effort here — do NOT cancel
+                                # first and hope (a failed place = naked + liq).
+                                # _replace_trailing_sl(force=True) verifies + records
+                                # _SL_OID; if it fails, market-close instead of holding.
                                 _be_sz = abs(szi)
-                                hl.trigger_order(coin, (side == "SHORT"), _be_sz, _be_px,
-                                               order_type="sl", is_market=True, reduce_only=True)
+                                try:
+                                    _szd = hl._get_sz_decimals(coin)
+                                    from hyperliquid_execution import round_size as _rs_be
+                                    _be_sz = _rs_be(_szd, _be_sz)
+                                except Exception:
+                                    pass
+                                _placed = False
+                                for _be_try in range(2):
+                                    try:
+                                        _cancel_coin_sl(coin)
+                                    except Exception:
+                                        pass
+                                    try:
+                                        from hyperliquid_execution import round_price
+                                        import math as _math
+                                        _px_dec = max(0, int(5 - abs(_math.log10(max(entry, 0.0001)))))
+                                        _be_px = round_price(_px_dec, entry, is_buy=(side == "SHORT"))
+                                        _be_res = hl.trigger_order(coin, (side == "SHORT"), _be_sz, _be_px,
+                                                                   order_type="sl", is_market=True, reduce_only=True)
+                                        _be_oid = _extract_oid(_be_res)
+                                        if _be_oid:
+                                            _SL_OID[cu] = _be_oid
+                                            _SL_PX[cu] = float(_be_px)
+                                            _SL_REPLACE_TS[cu] = time.time()
+                                            _placed = True
+                                            break
+                                    except Exception:
+                                        pass
+                                    time.sleep(1.0)
+                                if not _placed:
+                                    # Breakeven protection unverifiable — the position is
+                                    # naked at leverage. Close it NOW, don't hold hoping.
+                                    log.error(f"  🚨 {coin}: breakeven lock UNVERIFIED after 2 tries — closing (no naked holds)")
+                                    _MANUAL_CLOSES[coin] = time.time()
+                                    if _can_close_position(coin, "be-lock-unverified"):
+                                        if _safe_close(coin):
+                                            _reset_signal_dominance(coin)
+                                            continue
+                                    setattr(_monitor_positions, _be_key, False)
+                                    _be_locked = False
+                                    continue
                                 # Sync the trail baseline to breakeven so the chandelier trail ratchets
                                 # UP from here and never moves the SL back below breakeven.
                                 if cu in trail_states:
@@ -3001,8 +3205,27 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                             if _close_sz <= 0:
                                 log.info(f"  📐 {coin}: bank skipped — runner already near ${MIN_NOTIONAL_USD} floor, trail/guard own it")
                             else:
+                                _so_res = None
                                 try:
-                                    hl.market_close(coin, sz=_close_sz)
+                                    _so_res = hl.market_close(coin, sz=_close_sz)
+                                except Exception as e:
+                                    log.warning(f"  ⚠️ {coin}: scale-out close threw: {e}")
+                                _so_oid = _extract_oid(_so_res) if isinstance(_so_res, dict) else 0
+                                _so_err = ""
+                                if isinstance(_so_res, dict):
+                                    try:
+                                        _st = _so_res.get("response", {}).get("data", {}).get("statuses", [])
+                                        if _st and "error" in _st[0]:
+                                            _so_err = str(_st[0]["error"])
+                                    except Exception:
+                                        pass
+                                    if _so_res.get("status") == "err":
+                                        _so_err = _so_err or str(_so_res.get("error", "err"))
+                                if _so_err or (isinstance(_so_res, dict) and not _so_oid):
+                                    # Partial did NOT execute — position unchanged, old SL
+                                    # still valid. Do NOT touch the stop; retry next cycle.
+                                    log.warning(f"  ⚠️ {coin}: scale-out NOT filled ({_so_err or 'no oid'}) — keeping live SL, will retry")
+                                else:
                                     log.warning(f"  💰 {coin}: SCALE-OUT {_bank_frac:.0%} — {_so_reason}, banked {_close_sz:.2f}u @ net {_net_pnl_mon:+.2f}%")
                                     # Record the banked fraction for the ledger / self-learning
                                     try:
@@ -3018,9 +3241,27 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                                     # stranding the runner with NO stop. Tighten AND re-place on
                                     # the exchange for the reduced size. (Aug 14: ETHFI runner
                                     # liquidated because the SL died after scale-out.)
+                                    # Sep 18: VERIFY the re-arm. Old code called replace and
+                                    # trusted it; XPL died on float_to_wire rounding. If the
+                                    # re-arm fails, close the REST too — a naked half-runner
+                                    # at 6x is worse than banking early.
+                                    # Size is rounded inside _replace_trailing_sl; the
+                                    # _remain calc here only decides full-vs-partial.
                                     _remain = max(abs(szi) - _close_sz, 0.0)
-                                    if coin in trail_states and _remain > 0:
-                                        _t = trail_states[coin]
+                                    try:
+                                        _px_now2 = mid if mid > 0 else entry
+                                        if 0 < _remain * _px_now2 < MIN_NOTIONAL_USD:
+                                            _remain = 0.0  # dust — close all below, no naked stub
+                                    except Exception:
+                                        pass
+                                    if _remain <= 0:
+                                        log.info(f"  📐 {coin}: runner below ${MIN_NOTIONAL_USD} floor — closing rest too")
+                                        _MANUAL_CLOSES[coin] = time.time()
+                                        if _safe_close(coin):
+                                            _reset_signal_dominance(coin)
+                                            continue
+                                    elif cu in trail_states:
+                                        _t = trail_states[cu]
                                         if side == "LONG":
                                             _aggr = mid - (mid - _t.current_stop) * 0.5
                                             if _aggr > _t.current_stop:
@@ -3029,10 +3270,19 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                                             _aggr = mid + (_t.current_stop - mid) * 0.5
                                             if _aggr < _t.current_stop:
                                                 _t.current_stop = _aggr
-                                        _replace_trailing_sl(coin, side, _remain, _t.current_stop,
-                                                             "scale-out re-arm")
-                                except Exception as e:
-                                    log.warning(f"  ⚠️ {coin}: scale-out failed: {e}")
+                                        if _replace_trailing_sl(coin, side, _remain, _t.current_stop,
+                                                             "scale-out re-arm", force=True):
+                                            try:
+                                                _SL_REPLACE_TS[cu] = 0.0  # re-arm bypassed throttle; allow trail to sync
+                                            except Exception:
+                                                pass
+                                        else:
+                                            log.error(f"  🚨 {coin}: scale-out re-arm FAILED — closing rest (no naked runner)")
+                                            _MANUAL_CLOSES[coin] = time.time()
+                                            if _safe_close(coin):
+                                                _reset_signal_dominance(coin)
+                                                continue
+                                            log.error(f"  🚨 {coin}: rest close FAILED — runner may be NAKED")
 
                     # ── v7 GIVEBACK GUARD (Sep 17) — AI owns the plan, API owns the measurement ──
                     # 0G: peak +6.47%, still green +1.6%, 35min stale, both moms against —
@@ -3182,7 +3432,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                             except Exception:
                                 pass
                             _MANUAL_CLOSES[coin] = time.time()
-                            hl.market_close(coin)
+                            _safe_close(coin)
                             _reset_signal_dominance(coin)
                             continue
                     
@@ -3339,7 +3589,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                             except Exception:
                                 pass
                             _MANUAL_CLOSES[coin] = time.time()
-                            hl.market_close(coin)
+                            _safe_close(coin)
                             _reset_signal_dominance(coin)
                             continue
                         except Exception as de:
@@ -3365,7 +3615,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                             log.warning(f"  🚨 {coin}: EMERGENCY CLOSE — underwater {_net_pnl_mon:+.2f}% with mom5={mom5:+.1f}% against, cutting loss")
                             try:
                                 _MANUAL_CLOSES[coin] = time.time()
-                                hl.market_close(coin)
+                                _safe_close(coin)
                                 _reset_signal_dominance(coin)
                                 continue
                             except Exception as e:
@@ -3807,7 +4057,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                                 f"against LONG — PnL={net_pnl_pct:+.2f}% mom1={raw_mom1:+.2f}%")
                         try:
                             _MANUAL_CLOSES[coin] = time.time()
-                            hl.market_close(coin)
+                            _safe_close(coin)
                             _reset_signal_dominance(coin)
                         except Exception as e:
                             log.warning(f"  🏗️ {coin}: structural exit failed: {e}")
@@ -3835,7 +4085,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                                 f"against SHORT — PnL={net_pnl_pct:+.2f}% mom1={raw_mom1:+.2f}%")
                         try:
                             _MANUAL_CLOSES[coin] = time.time()
-                            hl.market_close(coin)
+                            _safe_close(coin)
                             _reset_signal_dominance(coin)
                         except Exception as e:
                             log.warning(f"  🏗️ {coin}: structural exit failed: {e}")
@@ -3846,7 +4096,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                     log.info(f"  🏗️ {coin} STRUCT+MOM EXIT: {ms_trend} trend + mom1={mom1:+.2f}% against LONG — pre-BOS exit")
                     try:
                         _MANUAL_CLOSES[coin] = time.time()
-                        hl.market_close(coin)
+                        _safe_close(coin)
                         _reset_signal_dominance(coin)
                     except Exception as e:
                         log.warning(f"  🏗️ {coin}: struct+mom exit failed: {e}")
@@ -3855,7 +4105,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                     log.info(f"  🏗️ {coin} STRUCT+MOM EXIT: {ms_trend} trend + mom1={mom1:+.2f}% against SHORT — pre-BOS exit")
                     try:
                         _MANUAL_CLOSES[coin] = time.time()
-                        hl.market_close(coin)
+                        _safe_close(coin)
                         _reset_signal_dominance(coin)
                     except Exception as e:
                         log.warning(f"  🏗️ {coin}: struct+mom exit failed: {e}")
@@ -4154,6 +4404,11 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
             del trail_states[c]
         if c in position_tps:
             del position_tps[c]
+        # Sep 18: SL registry is per-position — drop with it (also cleared in
+        # _safe_close; belt-and-suspenders for TP/SL-flattened exits).
+        _SL_OID.pop(c, None)
+        _SL_PX.pop(c, None)
+        _SL_REPLACE_TS.pop(c, None)
 
     # ── GLOBAL PENDING ORDER TIMEOUT: runs regardless of position state ──
     # Aug 8: was inside position loop, so orders for coins WITHOUT positions
@@ -4262,7 +4517,7 @@ def _fast_monitor_cycle(main_wallet: str) -> None:
                             log.info(f"  ⚡ {coin}: MICRO-CAP SEVERE FADE — peak {_mc_peak:+.2f}% → {pnl_pct:+.2f}%, closing now")
                             if _can_close_position(coin, "microcap-spike-fade"):
                                 _MANUAL_CLOSES[coin] = time.time()
-                                hl.market_close(coin)
+                                _safe_close(coin)
                                 _reset_signal_dominance(coin)
                                 if hasattr(_monitor_positions, _mc_key):
                                     delattr(_monitor_positions, _mc_key)
@@ -5048,7 +5303,61 @@ def run(dry_run: bool = False):
                     log.info(f"  Final selection: {selected}")
                 else:
                     selected = []
-                    log.info(f"  🔄 Rotation: offset={_rotate_offset} (no slots — 1 pos, $64 eq, holding)")
+                    # ── Sep 18: WORST-FIRST EVICTION replaces the timer as the capital
+                    # recycler. When slots are full, the entry pipeline evaluates the
+                    # best waiting candidate against the worst held position and
+                    # rotates if the newcomer is clearly better — the flat trade's
+                    # margin gets freed for edge, not for a clock. Requires:
+                    # full slots, an AI pick with conf>=80 waiting, the held
+                    # position flat-or-losing (never evict a green), and held
+                    # past MIN_HOLD. Eviction routes through _safe_close (verified).
+                    try:
+                        _evict_picks = [p for p in (ai_picks or [])
+                                        if p.get("confidence", 0) >= 80
+                                        and p["coin"] not in active_coins]
+                        if _evict_picks and active:
+                            _worst = None
+                            _worst_net = 0.0
+                            for _ap in active:
+                                _ac = _ap.get("coin", "")
+                                _ae = float(_ap.get("entryPx", 0))
+                                _am = float(mids.get(_ac, 0))
+                                _aszi = float(_ap.get("szi", 0))
+                                if _ae <= 0 or _am <= 0 or abs(_aszi) < 0.0001:
+                                    continue
+                                _agross = ((_am - _ae) / _ae * 100) * (1 if _aszi > 0 else -1)
+                                _alev = _ap.get("leverage", {})
+                                _alev = float(_alev.get("value", BASE_LEVERAGE)) if isinstance(_alev, dict) else BASE_LEVERAGE
+                                _anet = _net_pnl_pct(_agross, leverage=_alev)
+                                if _worst is None or _anet < _worst_net:
+                                    _worst, _worst_net = _ap, _anet
+                            if _worst is not None and _worst_net <= 0:
+                                _wcu = _worst.get("coin", "").upper()
+                                _wfee = ROUNDTRIP_FEE_PCT * (float((_worst.get("leverage", {}) or {}).get("value", BASE_LEVERAGE)) if isinstance(_worst.get("leverage", {}), dict) else BASE_LEVERAGE)
+                                if _worst_net <= _wfee and _wcu in _BOT_OWNED:
+                                    _wage = time.time() - _position_entry_times.get(_wcu, 0)
+                                    if _wage >= MIN_HOLD_SECONDS:
+                                        _best_pick = max(_evict_picks, key=lambda p: p.get("confidence", 0))
+                                        log.warning(f"  🔄 EVICT {_worst.get('coin')}: net={_worst_net:+.2f}% flat/dead, "
+                                                    f"rotating into {_best_pick['coin']} (AI={_best_pick.get('confidence', 0)}%) — worst-first, not timer")
+                                        _MANUAL_CLOSES[_worst.get("coin")] = time.time()
+                                        if _safe_close(_worst.get("coin")):
+                                            try:
+                                                _record_close_trade(_worst.get("coin"), float(mids.get(_worst.get("coin"), 0)),
+                                                                    float(_worst.get("entryPx", 0)), abs(float(_worst.get("szi", 0))),
+                                                                    "LONG" if float(_worst.get("szi", 0)) > 0 else "SHORT",
+                                                                    f"evict-for-{_best_pick['coin']}", conviction=0,
+                                                                    regime="sideways", leverage=BASE_LEVERAGE)
+                                            except Exception:
+                                                pass
+                                            _reset_signal_dominance(_worst.get("coin"))
+                                            selected = [_best_pick["coin"]]
+                                            slots_left = 1
+                                        else:
+                                            log.error(f"  🚨 EVICT {_worst.get('coin')}: close FAILED — keeping position")
+                    except Exception as _ev_e:
+                        log.warning(f"  ⚠️ eviction check skipped ({type(_ev_e).__name__})")
+                    log.info(f"  🔄 Rotation: offset={_rotate_offset} (no slots — holding, eviction armed)")
 
                 # ── Stage 1.5: Continuous Prediction Engine on EXISTING positions ──
                 # Runs ALL 6 layers (order book, volume profile, CVD, multi-TF tech,
