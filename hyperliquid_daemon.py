@@ -233,12 +233,12 @@ TRADABLE_COINS = [
 # ── Coin rotation: scan subset per cycle to avoid 429 rate limits ──
 # BTC/ETH always scanned. Remaining coins rotate in windows of 8 per cycle.
 # Full 177 scanned in ~22 cycles (~66 min at 180s/cycle).
-_ROTATE_WINDOW = 40  # pushing from 35
+_ROTATE_WINDOW = 24  # Sep 19c: was 40 — a 40-wide window made full entry scans 360-500s (Slow cycle), freezing CYCLE/monitor cadence. 24 coins ≈ 60% of the candle+ML cost; rotation still covers the universe in ~8 windows.
 _ALWAYS_SCAN = {"BTC", "ETH"}
 _rotate_offset = 0
 CYCLE_SECONDS = _cfg("monitoring.cycle_seconds", 3)  # 3s — configurable, fast default
 FAST_MONITOR_SECONDS = 3  # fast exit/monitor thread cadence (decoupled from entry pipeline)
-MIN_TRADE_USD = 2.5  # micro-account floor (Sep 18: was 3.0 — equity sits at $2.97, gate blocked ALL entries; just under live equity per dust-account rule; sizing floor untouched)
+MIN_TRADE_USD = 2.0  # Sep 19: was 2.5 — equity sits at $2.49, gate blocked ALL entries; $2.0 lets the micro account trade 1 slot while keeping dust protection
 # Minimum notional per trade: $11 floor (HL minimum is $10 + headroom for
 # price drift between sizing and fill). Sep 17: was $20 — that mismatched the
 # $11 sizing floor, so every micro scalp filled as $9 "IOC dust" and got
@@ -872,11 +872,30 @@ _load_pair_quarantine()
 # ============================================================
 
 def _fetch_candles(coin: str, interval: str = "15m", limit: int = 300) -> list[dict]:
-    """Fetch candles from Hyperliquid API using SDK. Retries on 429."""
+    """Fetch candles from Hyperliquid API using the SHARED client Info. Retries on 429.
+
+    Sep 19c: was constructing a fresh Info() per call (new TLS session +
+    handshake per coin per TF). On a 24-coin window that is ~100 handshakes
+    per scan — the single biggest Slow-cycle driver. Reuse hl._info.
+    """
     import urllib.error
     max_attempts = 3
     for attempt in range(max_attempts):
         try:
+            try:
+                import hyperliquid_client as _hlc
+                _info = getattr(_hlc, "_info", None)
+                if _info is None:
+                    _hlc._autoload()
+                    _info = getattr(_hlc, "_info", None)
+            except Exception:
+                _info = None
+            if _info is not None:
+                end_ms = int(time.time() * 1000)
+                interval_ms = {"1m": 60_000, "5m": 300_000, "15m": 900_000, "1h": 3_600_000, "4h": 14_400_000}
+                start_ms = end_ms - limit * interval_ms.get(interval, 900_000)
+                candles = _info.candles_snapshot(coin, interval, start_ms, end_ms)
+                return candles if isinstance(candles, list) else []
             from hyperliquid.info import Info
             from hyperliquid.utils import constants
             info = Info(constants.MAINNET_API_URL, skip_ws=True)
@@ -1795,12 +1814,16 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
             except Exception:
                 pass
             _hot_mom_long = (is_buy and _mom_entry > 1.0)
-            if _hot_mom_long and composite_score >= 0.15:
+            # Sep 19 AR lesson: mom5=+20% market-buy chased the spike top → liquidated in 27s.
+            # Breakout waiver caps at +5%/5m; beyond that the move is extended — fall through
+            # to patient-limit-or-skip below instead of market-chasing.
+            if _hot_mom_long and composite_score >= 0.15 and _mom_entry <= 5.0:
                 log.info(f"  🔥 {coin}: range-block WAIVED — hot breakout (mom5={_mom_entry:+.1f}%, comp={composite_score:+.2f}), entering at market")
             elif (is_buy and _rp > 80) or (not is_buy and _rp < 20):
                 _hot_mom_short = (not is_buy and _mom_entry < -1.0)
                 _comp_ok_short = composite_score <= -0.15
-                if _hot_mom_short and _comp_ok_short:
+                # Sep 19: mirror of the long-side spike cap — no market-chasing extended dumps.
+                if _hot_mom_short and _comp_ok_short and _mom_entry >= -5.0:
                     log.info(f"  🔥 {coin}: range-block WAIVED — hot breakdown (mom5={_mom_entry:+.1f}%, comp={composite_score:+.2f}), entering at market")
                 else:
                     _desc = f"{'TOP' if is_buy else 'BOTTOM'} of 1h range ({_rp:.0f}%)"
@@ -5120,9 +5143,11 @@ def run(dry_run: bool = False):
                     pass
                 
                 # ── Eigen portfolio regime: PCA on returns to detect market state ──
+                # Sep 19c: every 15th entry-cycle (was 5th). The 1h×80 fetch over up
+                # to 40 coins + PCA ran inside the slow entry scan.
                 try:
                     from hrp_sizing import eigen_regime
-                    if cycle_count % 5 == 0:  # Every 5 cycles
+                    if cycle_count % 15 == 0:  # Every 15 cycles
                         rets_eigen = {}
                         for c in candidates[:40]:
                             c1h_data = _fetch_candles_cached(c, "1h", 80)
@@ -5138,7 +5163,9 @@ def run(dry_run: bool = False):
                 
                 # ── CryptoGAT: graph attention predictions (cross-asset) ──
                 # Runs regardless of open positions. Cross-asset graph signals inform exits too.
-                if cycle_count % 3 == 0:
+                # Sep 19c: every 9th entry-cycle (was 3rd). 5m×80 fetch over up to 50
+                # coins + GAT inference inside the slow scan fed Slow cycles.
+                if cycle_count % 9 == 0:
                     try:
                         from cryptogat_predictor import predict_with_graph as _gat_predict
                         gat_candles = {}
@@ -5180,12 +5207,16 @@ def run(dry_run: bool = False):
                     _BAD_COINS = {"X", "KPEPE", "BABY", "VINE", "KLUNC", "AZTEC", "KBONK", "VIRTUAL"}
                     try:
                         ai_candidates = []
-                        # Scan up to 18 for AI evaluation
+                        # Scan up to 12 for AI evaluation
+                        # Sep 19c: was 18 — each candidate costs 15m+1h candles + OI +
+                        # extremes(5m/1h/4h/24h) + CVD + pandas indicators. 18 wide fed
+                        # the 360-500s Slow cycles. 12 keeps AI choice breadth while
+                        # cutting pre-AI build cost ~33%.
                         _scanned = 0
                         for c in candidates[:25]:
                             if c.upper() in _BAD_COINS:
                                 continue
-                            if _scanned >= 18:
+                            if _scanned >= 12:
                                 break
                             mid = float(mids.get(c, 0))
                             if mid <= 0 or mid > 50000:  # Skip dead coins and BTC-like prices
@@ -5306,6 +5337,43 @@ def run(dry_run: bool = False):
                                 ai_candidates, total_eq,
                                 market_context=_mkt_brief,
                                 recent_trades=_recent_trades)
+                            # ── Sep 19b: AI plan confidence cap (calibration). The ledger
+                            # shows AI 85s winning ~28% — the number is not a probability.
+                            # Cap any AI pick at 75 unless it arrives with measured
+                            # confluence ALREADY visible in the candidate row: composite
+                            # sign-aligned AND (VWAP on its side) AND (mom1/mom5/mom15
+                            # agree in sign OR CVD confirms). 85+ must be earned by data,
+                            # not asserted by the model.
+                            try:
+                                _cand_by_coin = {str(c.get("coin", "")).upper(): c for c in ai_candidates}
+                                for _p in (ai_picks or []):
+                                    try:
+                                        _pc = int(_p.get("confidence", 0) or 0)
+                                        if _pc >= 80:
+                                            _cc = _cand_by_coin.get(str(_p.get("coin", "")).upper(), {}) or {}
+                                            _pdir = str(_p.get("direction", "")).lower()
+                                            _comp = float(_cc.get("composite", 0) or 0)
+                                            _vwap = float(_cc.get("vwap_dist", 0) or 0)
+                                            _m1 = float(_cc.get("mom_1m", 0) or 0)
+                                            _m5 = float(_cc.get("mom_5m", 0) or 0)
+                                            _m15 = float(_cc.get("mom_15m", 0) or 0)
+                                            _cvd = _cc.get("_cvd", {}) or {}
+                                            _cvd_tr = str(_cvd.get("trend", ""))
+                                            if _pdir == "long":
+                                                _aligned = _comp > 0.0 and _vwap <= 1.5
+                                                _mom_ok = ((_m1 > 0 and _m5 > 0) or (_m5 > 0 and _m15 > 0) or _cvd_tr == "rising")
+                                            elif _pdir == "short":
+                                                _aligned = _comp < 0.0 and _vwap >= -1.5
+                                                _mom_ok = ((_m1 < 0 and _m5 < 0) or (_m5 < 0 and _m15 < 0) or _cvd_tr == "falling")
+                                            else:
+                                                _aligned, _mom_ok = False, False
+                                            if not (_aligned and _mom_ok):
+                                                _p["confidence"] = 75
+                                                log.info(f"  📉 {_p.get('coin')}: AI conf {_pc}%→75% (uncalibrated: comp={_comp:+.2f} VWAP={_vwap:+.1f}% m1/m5/m15={_m1:+.1f}/{_m5:+.1f}/{_m15:+.1f} CVD={_cvd_tr or 'n/a'})")
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
                             if ai_skips:
                                 for s in ai_skips:
                                     _forager_skip_cooldown[str(s).upper()] = time.time() + 300
@@ -5316,7 +5384,7 @@ def run(dry_run: bool = False):
                                 pick_strs = []
                                 for p in ai_picks:
                                     pick_strs.append(
-                                        f"{p['coin']}:{p['direction']} tgt={p['target_pct']}% "
+                                        f"{p['coin']}:{p['direction']} conf={p.get('confidence',0)}% tgt={p['target_pct']}% "
                                         f"stop={p['stop_pct']}% hold={p['hold_min']}m"
                                     )
                                 log.info(f"  🧠 AI picks: {' | '.join(pick_strs)}")
@@ -5338,7 +5406,11 @@ def run(dry_run: bool = False):
                     
                     # ── Kronos: foundation model predictions for selected coins ──
                     # Runs after AI selection; supplements targets/stops with real price forecasts
-                    if selected and cycle_count % 5 == 0:  # Every 5th cycle (~7-8 min) — saves compute, model slow
+                    # Sep 19c: every 15th entry-cycle (~25+ min). Was every 5th — the
+                    # mini-transformer forward pass on CPU held the main loop and fed
+                    # the 360-500s Slow cycles. AI plan already carries targets/stops;
+                    # Kronos is a refiner, not a gate, so lower cadence costs nothing.
+                    if selected and cycle_count % 15 == 0:  # Every 15th cycle — saves compute, model slow
                         try:
                             from kronos_predictor import predict_batch as _kpredict
                             kronos_candles = {}
@@ -5419,7 +5491,15 @@ def run(dry_run: bool = False):
                                 _anet = _net_pnl_pct(_agross, leverage=_alev)
                                 if _worst is None or _anet < _worst_net:
                                     _worst, _worst_net = _ap, _anet
-                            if _worst is not None and _worst_net <= 0:
+                            # Sep 19: eviction is churn — each rotate pays entry+exit fees (~0.5%+).
+                            # Dead (<-0.5% net, past the fee band) rotates at conf>=80.
+                            # Flat (-0.5%..0) rotates ONLY for exceptional newcomers (conf>=90):
+                            # evicting flat to chase 85s (ZEN/POL/STX/FIL ledger) is fee bleed.
+                            _ev_best = max(_evict_picks, key=lambda p: p.get("confidence", 0)) if _evict_picks else None
+                            _ev_best_conf = (_ev_best or {}).get("confidence", 0)
+                            _ev_dead = _worst is not None and _worst_net <= -0.5
+                            _ev_flat_upgrade = (_worst is not None and -0.5 < _worst_net <= 0 and _ev_best_conf >= 90)
+                            if _worst is not None and (_ev_dead or _ev_flat_upgrade):
                                 _wcu = _worst.get("coin", "").upper()
                                 _wfee = ROUNDTRIP_FEE_PCT * (float((_worst.get("leverage", {}) or {}).get("value", BASE_LEVERAGE)) if isinstance(_worst.get("leverage", {}), dict) else BASE_LEVERAGE)
                                 if _worst_net <= _wfee and _wcu in _BOT_OWNED:
@@ -5479,12 +5559,30 @@ def run(dry_run: bool = False):
 
                     try:
                         # Gather data for continuous predictor
-                        c1m = _fetch_candles_cached(coin, "1m", 100)
-                        c5m = _fetch_candles_cached(coin, "5m", 100)
-                        c15m = _fetch_candles_cached(coin, "15m", 200)
-                        c1h = _fetch_candles_cached(coin, "1h", 24)
-                        c4h = _fetch_candles_cached(coin, "4h", 50)
-                        c1d = _fetch_candles_cached(coin, "1d", 50)
+                        # Sep 19c: position holds are pure-Python (cached candles) — run
+                        # the full 6-TF fetch + full enrichment ONLY for positions,
+                        # and only every 5th monitor call (~15s at 3s cadence). Light
+                        # ticks still update trails/exits via cached mids below.
+                        _pos_tick = getattr(_monitor_positions, "_pos_tick", 0) + 1
+                        try:
+                            setattr(_monitor_positions, "_pos_tick", _pos_tick)
+                        except Exception:
+                            pass
+                        _pos_deep = (_pos_tick % 5 == 1)
+                        if _pos_deep:
+                            c1m = _fetch_candles_cached(coin, "1m", 100)
+                            c5m = _fetch_candles_cached(coin, "5m", 100)
+                            c15m = _fetch_candles_cached(coin, "15m", 200)
+                            c1h = _fetch_candles_cached(coin, "1h", 24)
+                            c4h = _fetch_candles_cached(coin, "4h", 50)
+                            c1d = _fetch_candles_cached(coin, "1d", 50)
+                        else:
+                            c1m = _fetch_candles_cached(coin, "1m", 20)
+                            c5m = _fetch_candles_cached(coin, "5m", 20)
+                            c15m = _fetch_candles_cached(coin, "15m", 50)
+                            c1h = _fetch_candles_cached(coin, "1h", 10)
+                            c4h = []
+                            c1d = []
                         fund_ctx = funding_sniper.asset_ctx.get(coin, {})
                         fund_rate = float(fund_ctx.get("funding", 0)) if fund_ctx else 0.0
 
@@ -5561,8 +5659,17 @@ def run(dry_run: bool = False):
                             imb_trend = None
 
                         # ── Exhaustion detection (RSI divergence + volume climax) ──
+                        # Sep 19c: deep ticks only. Light ticks reuse last result —
+                        # exhaustion scans 15m swings + BB/RSI per position per call.
                         try:
-                            exhaustion = detect_peak_exhaustion(coin, c15m, mid)
+                            if _pos_deep:
+                                exhaustion = detect_peak_exhaustion(coin, c15m, mid)
+                                try:
+                                    setattr(_monitor_positions, f"_exh:{coin}", exhaustion)
+                                except Exception:
+                                    pass
+                            else:
+                                exhaustion = getattr(_monitor_positions, f"_exh:{coin}", None) if hasattr(_monitor_positions, f"_exh:{coin}") else None
                         except Exception:
                             exhaustion = None
 
@@ -5801,10 +5908,12 @@ def run(dry_run: bool = False):
                             mid_px = float(mids.get(coin, 0))
                             c15 = _fetch_candles_cached(coin, "15m", 50)
                             ft_comp = 0.0
+                            _ft_measured = False
                             if c15 and len(c15) >= 10:
                                 try:
                                     df = add_basic_indicators(candles_to_frame(c15))
                                     ft_comp = compute_composite(df)  # SIGNED: don't fake a positive composite from dead signals
+                                    _ft_measured = True
                                 except Exception:
                                     ft_comp = 0.0
                             else:
@@ -5816,7 +5925,12 @@ def run(dry_run: bool = False):
                             # anyway, after burning AI calls. Direction-signed
                             # fallback: the synthetic at least points the way
                             # the AI voted, and Gate 1.7 still demands |comp|.
-                            if abs(ft_comp) < 0.05:
+                            # Sep 19b: fallback ONLY when no candles measured (BIO case:
+                            # insufficient_data, nothing to contradict). When candles
+                            # exist, keep the measured value even if weak/mismatched —
+                            # overwriting a real contradiction with a direction-signed
+                            # fake hides the conflict from downstream gates.
+                            if abs(ft_comp) < 0.05 and not _ft_measured:
                                 ft_comp = 0.05 if ai_ft_dir == "long" else -0.05
                             ft_side = "BUY" if ai_ft_dir == "long" else "SELL"
                             ft_label = "BUY" if ai_ft_dir == "long" else "SELL"
@@ -6099,7 +6213,22 @@ def run(dry_run: bool = False):
                         # the enemy" + "AI trumps exhaustion gates at >=85% conf + comp >=0.15"
                         _last_trade_age = time.time() - _last_trade_time
                         _starved = _last_trade_age > 1800
+                        # Sep 19: starvation bypass hardened — the ledger shows AI 85% wins ~28%,
+                        # so "starved + 85" is not evidence. Starved trades now need measured
+                        # confluence too: composite aligned AND (unified>=15% aligned OR ML agrees).
                         _starvation_ready = _starved and ai_conf_val >= 85 and abs(sig.composite_score) >= 0.15
+                        try:
+                            _stv_want = "up" if ai_dir == "BUY" else ("down" if ai_dir == "SELL" else "")
+                            _stv_unified = bool(_stv_want and pred.direction == _stv_want and pred.confidence >= 15)
+                        except Exception:
+                            _stv_unified = False
+                        try:
+                            _stv_ml = bool(((ai_dir == "SELL" and ml_pred.direction == "down" and ml_pred.confidence >= 30)
+                                            or (ai_dir == "BUY" and ml_pred.direction == "up" and ml_pred.confidence >= 30)))
+                        except Exception:
+                            _stv_ml = False
+                        if _starvation_ready and not (_stv_unified or _stv_ml):
+                            _starvation_ready = False
                         # ── 4/4 CONFLUENCE BYPASS (Sep 17 backtest): AI≥85% + ML agrees +
                         # composite sign-aligned + enriched direction-aligned → the whole data
                         # stack agrees, so VWAP-position and weak-composite vetoes are noise.
@@ -6359,12 +6488,21 @@ def run(dry_run: bool = False):
                         # SOL lesson: BULL ACCEL forced BUY at unified=flat@1% → 30min drift, -0.23% loss.
                         # Flat unified signals mean NO layer has conviction. Require at least 5% unified or 0.15 composite.
                         _unified_dead_flat = pred.confidence < 5 and sig.composite_score < 0.15
+                        # Sep 19: spike-top guard — bull accel may not market-buy an extended
+                        # breakout (AR: mom5=+20% → liq in 27s). Needs live momentum ≤+5%/5m.
+                        try:
+                            _bull_mom5 = _calc_momentum(coin, "5m") or 0.0
+                        except Exception:
+                            _bull_mom5 = 0.0
+                        _bull_spike = _bull_mom5 > 5.0
                         if _unified_opposes_bull:
                             log.info(f"  🛑 {coin}: BULL ACCEL blocked — unified={pred.direction}@{pred.confidence:.0f}% "
                                     f"opposes BUY (need unified agreement or weak opposition)")
                         elif _unified_dead_flat:
                             log.info(f"  🛑 {coin}: BULL ACCEL blocked — unified dead-flat @{pred.confidence:.0f}% + "
                                     f"composite {sig.composite_score:+.2f} < 0.15 (need either ≥5% unified or ≥0.15 composite)")
+                        elif _bull_spike:
+                            log.info(f"  🛑 {coin}: BULL ACCEL blocked — spike top (mom5={_bull_mom5:+.1f}% > 5%), extended breakout, no market-buy")
                         elif sig.composite_score >= 0.00 and _reason_ok:
                             ai_dir_override = "BUY"
                             log.info(f"  🐂 {coin}: BULL ACCEL — AI={ai_conf_val}% bullish market, "
@@ -7440,9 +7578,13 @@ def run(dry_run: bool = False):
                         if not v.get("ok", True):
                             flags = v.get("flags", [])
                             suggestion = v.get("suggestion", "")
-                            # Aug 7: AI≥80% bypasses ALL validator flags — zero-loss exits protect every trade
+                            # Sep 19: AI bypass is tiered — sizing/leverage math is not opinion.
+                            # AR lesson: AI=85% bypassed lev_high+size_too_large+large → liquidated in 27s.
+                            # Soft flags bypass at AI≥80; sizing flags need AI≥90.
                             _ai_conf_val = _ai_trade_plan.get(coin.upper(), {}).get("confidence", 0)
-                            if _ai_conf_val >= 80:
+                            _sizing_flags = [f for f in flags if str(f).lower() in ("lev_high", "lev_too_high", "size_too_large", "large", "too_large")]
+                            _need = 90 if _sizing_flags else 80
+                            if _ai_conf_val >= _need:
                                 log.info(f"  ⚡ {coin}: AI BYPASS — validator flagged {flags} but AI={_ai_conf_val}% overrides (zero-loss exits protect)")
                                 # Fall through — don't block this trade
                             else:

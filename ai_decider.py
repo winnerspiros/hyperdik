@@ -840,9 +840,11 @@ def _scan_batch(batch: list[dict], equity: float, market_context: str,
         + f'\"skip\":[\"BAD1\"],\"market_note\":\"BTC neutral\",\"strategy\":\"prioritize A\",\"skip_reason\":\"trending_down\"}}\n'
         + f"Pick 2-3 MAX. ONLY pick coins with REAL data. If mom5<0.3% flat, SKIP. If comp near 0, SKIP. If enriched=dead, SKIP. Pick NONE if no good candidates. SHORTS=EQUALLY VALID — pick SHORT when mom5 neg+CVD falling. MUST cite data in reason. Eq=${equity:.0f}. Recent:{recent_str} Mkt:{market_context}\n"
         + "\n".join(lines) + "\n"
-        + f"RULES: tgt>=1.0 stop=0.5-0.6 hold=30-45m. SHORTS=LONGS equally. FEE 0.42%@6x. "
+        + f"RULES: tgt>=1.0(stop=0.5-0.6,hold=30-45m) NETS ONLY ~0.5% after 0.54% 6x fees — prefer tgt>=1.5. "
         + f"LONG: m1>0.5%+m5 pos+CVD rising+comp>0.05. "
         + f"SHORT: m1<-0.5%+m5 neg+CVD falling+comp<-0.05. "
+        + f"CONF CALIBRATION: past 85s won ~28%, not 85%. Score 85+ ONLY when comp sign-aligned AND (unified>=15% aligned OR ML>=30% agrees) AND VWAP on your side (long<=+1.5%, short>=-1.5%). Else cap 75. "
+        + f"MOM QUALITY: prefer m1/m5/m15m same sign. mom5>+5% (long) or <-5% (short) = extended spike — do NOT chase, SKIP. "
         + f"⚠️ VWAP RULES: NEVER buy when VWAP>+1.5% (overbought). NEVER short when VWAP<-1.5% (oversold). "
         + f"Buy dips (VWAP<-1.5%), short pumps (VWAP>+1.5%). "
         + f"Skip: flat mom5(<0.3%), dead enriched, no CVD, m1h>5% exhausted, comp>0.3 extreme. "
