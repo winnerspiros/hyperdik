@@ -344,7 +344,9 @@ _config: dict = {}  # state.config.json loaded at startup; drives entries_enable
 _ai_trade_plan: dict[str, dict] = {}  # coin → {direction, confidence, target_pct, stop_pct, hold_min}
 _PENDING_ZONE: dict[str, dict] = {}  # coin → {oid, is_buy, size_usd, ...} non-blocking zone orders
 _ENTRY_SNAP: dict[str, dict] = {}  # coin → entry edge snapshot (conviction/composite/regime/leverage) for the close ledger
+_CLOSE_DEDUP: dict[tuple, float] = {}  # (coin, entry_minute) → ts — stops evict+monitor recording the same position twice
 _last_trade_time: float = time.time()  # updated on open/close; drives starvation bypass (30+ min idle → relax gates)
+_ai_market: dict = {"bias": "neutral", "tradable": True}  # refreshed every 5th cycle; local default must exist BEFORE first cycle
 
 # ── STOP-LOSS COOLING ──
 _last_stop_loss_at: dict[str, float] = {}  # coin → timestamp
@@ -501,7 +503,9 @@ def _cancel_coin_sl(coin: str) -> int:
                 continue
             if _oo.get("reduceOnly"):
                 try:
-                    hl.cancel(coin, _oo.get("oid", 0))
+                    # cancel_order(coin, oid) is the canonical cancel path used
+                    # everywhere else (direct-close cleanup, pending timeouts).
+                    (hl.cancel_order if hasattr(hl, "cancel_order") else hl.cancel)(coin, _oo.get("oid", 0))
                     cancelled += 1
                 except Exception:
                     pass
@@ -1013,13 +1017,13 @@ def _resolve_exit_plan(coin: str, side: str, leverage: float, atr_pct: float) ->
     if not _EXIT_AI_PLAN:
         return _fb
     try:
-        _plan = _ai_trade_plan.get(coin.upper(), {}) if "_ai_trade_plan" in dir() else {}
+        _plan = _ai_trade_plan.get(coin.upper(), {}) or {}
     except Exception:
         _plan = {}
     if not _plan:
         # Entry snapshot keeps the same keys if the plan dict was rotated out.
         try:
-            _snap = _ENTRY_SNAP.get(coin.upper(), {}) if "_ENTRY_SNAP" in dir() else {}
+            _snap = _ENTRY_SNAP.get(coin.upper(), {}) or {}
         except Exception:
             _snap = {}
         if _snap.get("target_pct") or _snap.get("hold_min"):
@@ -1563,8 +1567,9 @@ def _execute_direct_close(coin: str, size_fraction: float = 1.0, reason: str = "
             # ── Global pause: don't open ANY position for 2 min after a close ──
             _global_pause_until = time.time() + 30  # 30s prevents immediate re-entry (was 120s)
         else:
-            # Partial close — get position size from Hyperliquid
-            state = hl.get_user_state(main_wallet) if 'main_wallet' in dir() else hl.get_user_state(_API_WALLET)
+            # Partial close — get position size from Hyperliquid (main wallet is the
+            # default; never query the API-wallet address — it holds no positions).
+            state = hl.get_user_state()
             positions = state.get("assetPositions", [])
             pos_sz = 0.0
             pos_szi_signed = 0.0
@@ -1674,8 +1679,15 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
         log.info(f"  ⏸️  {coin}: entry paused — entries_enabled=false in config")
         return False
     _halt_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "HALT_ENTRIES")
-    if _global_pause_until > time.time() or os.path.exists(_halt_file):
-        _global_pause_until = float("inf")  # keep it pinned while the flag is present
+    if os.path.exists(_halt_file):
+        _global_pause_until = float("inf")  # keep it pinned while the file flag is present
+        log.info(f"  ⏸️  {coin}: entry paused — HALT_ENTRIES file active")
+        return False
+    if _global_pause_until == float("inf"):
+        # Stale inf from an old pin (pre-fix self-pinning bug) with no file
+        # present and no live timer — release it instead of halting forever.
+        _global_pause_until = 0.0
+    if _global_pause_until > time.time():
         log.info(f"  ⏸️  {coin}: entry paused — global halt active")
         return False
     if not _API_WALLET:
@@ -2143,16 +2155,28 @@ def _execute_direct_open(coin: str, is_buy: bool, size_usd: float, leverage: int
                     if szi > 0.0001 and fill_notional >= MIN_NOTIONAL_USD:
                         return True  # real position, real size — confirmed
                     elif szi > 0.0001:
-                        # ── Sep 18: DUST CLOSE-FIRST. Old code market_closed then
-                        # blacklisted the coin and returned False — but the close
-                        # was UNVERIFIED (raw market_close, no retry), so the dust
-                        # sat naked and liquidated 15s later (MINA/MET/INIT/KAS).
-                        # Verify via _safe_close; only cooldown/blacklist the coin
-                        # when the close actually flattened. If it won't close,
-                        # say so loudly — never silently hold dust at 8-10x.
+                        # ── Sep 19: DUST CLOSE-FIRST, ORDERED. XMR proved the old
+                        # order fatal: the naked-detector fired FIRST (re-armed a
+                        # stop at a stale price), the dust branch's own
+                        # _safe_close then ran 4s later and its flat-verify
+                        # raced the re-arm — the verify saw a live position and
+                        # the dust NEVER flattened (liquidated, ghost in
+                        # bot_owned). Fix, in this order:
+                        # (1) mark _MANUAL_CLOSES BEFORE closing so the liq
+                        #     detector and naked-detector treat this as ours;
+                        # (2) cancel every bracket (TP/SL/trigger) WE just
+                        #     placed — the re-arm must not fight the close;
+                        # (3) _safe_close + flat-verify;
+                        # (4) release ownership/state only when flat.
                         log.warning(f"  ⚠️ DIRECT OPEN {coin}: IOC dust ${fill_notional:.2f} < ${MIN_NOTIONAL_USD} — closing first")
+                        _MANUAL_CLOSES[coin] = time.time()
+                        try:
+                            _cancel_coin_sl(coin)
+                        except Exception:
+                            pass
                         if _safe_close(coin):
                             _forager_skip_cooldown[coin.upper()] = time.time() + 1800
+                            _clear_entry_time(coin)
                             log.warning(f"  🚫 {coin}: dust closed+verified — cooldown 30min (thin order book)")
                         else:
                             log.error(f"  🚨 {coin}: DUST CLOSE FAILED — position still open, cooldown WITHOUT blacklist (will retry verify)")
@@ -2284,6 +2308,7 @@ def _submit_action(action_type: str, coin: str, details: dict):
     # ENTRY SNAPSHOT: persist the measured edge at open so the close ledger has
     # real data even when the monitor's in-memory signal is gone (restart, etc).
     # AI gets ALL data, never 0-fields — the learner must see the same.
+    # NOTE: no dir() guard — dir() inside a function excludes module-level names.
     if action_type in ("buy", "sell"):
         try:
             _ENTRY_SNAP[coin.upper()] = {
@@ -2291,14 +2316,30 @@ def _submit_action(action_type: str, coin: str, details: dict):
                 "composite": float(details.get("composite", 0) or 0),
                 "regime": details.get("regime", "sideways"),
                 "leverage": int(details.get("leverage", BASE_LEVERAGE) or BASE_LEVERAGE),
+                "entry_ts": time.time(),
             }
+            # Sep 19: carry the AI plan's own forecast into the snapshot so
+            # _resolve_exit_plan keeps AI-derived thresholds after the plan
+            # dict rotates out (snapshot is the fallback source it reads).
+            try:
+                _ap = _ai_trade_plan.get(coin.upper(), {}) or {}
+                if _ap.get("target_pct"):
+                    _ENTRY_SNAP[coin.upper()]["target_pct"] = float(_ap["target_pct"])
+                if _ap.get("stop_pct"):
+                    _ENTRY_SNAP[coin.upper()]["stop_pct"] = float(_ap["stop_pct"])
+                if _ap.get("hold_min"):
+                    _ENTRY_SNAP[coin.upper()]["hold_min"] = float(_ap["hold_min"])
+                if _ap.get("kronos_direction"):
+                    _ENTRY_SNAP[coin.upper()]["kronos_direction"] = _ap["kronos_direction"]
+            except Exception:
+                pass
         except Exception:
             pass
     # ── Record trade for self-learning (close actions only) ──
     # Sep 17: pass the real measured edge — zero rows train the learner on nothing.
     if action_type == "close":
         try:
-            _snap = _ENTRY_SNAP.pop(coin.upper(), {}) if '_ENTRY_SNAP' in dir() else {}
+            _snap = _ENTRY_SNAP.pop(coin.upper(), {}) or {}
             try:
                 _snap_conv = float(details.get("confidence", 0) or _snap.get("conviction", 0) or 0)
             except Exception:
@@ -2346,27 +2387,56 @@ def _submit_action(action_type: str, coin: str, details: dict):
 
 def _record_close_trade(coin: str, mid: float, entry: float, szi: float, side: str,
                          reason: str, conviction: float = 0, regime: str = "sideways",
-                         leverage: int = BASE_LEVERAGE, composite_score: float = 0.0):
-    """Record a closed position for self-learning and update layer weights."""
+                         leverage: int = BASE_LEVERAGE, composite_score: float = 0.0,
+                         entry_time: float | None = None,
+                         kind: str = "final"):
+    """Record a closed position for self-learning and update layer weights.
+
+    kind: "final" (full close, eviction, liquidation) or "scale_out" (partial
+    bank — recorded once per peak, never deduped against finals).
+    Duplicate finals for the same position (evict path + monitor path firing
+    on the same entry, e.g. STX/POL/FIL/ZEN double rows) are skipped.
+    """
     # Backfill from the entry snapshot: monitor-path closes pass conviction=0 /
     # composite=0 because the in-memory signal is gone — the snapshot has the truth.
+    # NOTE: no dir() guard — dir() inside a function excludes module-level names.
     try:
-        _bk = _ENTRY_SNAP.get(coin.upper(), {}) if '_ENTRY_SNAP' in dir() else {}
+        _bk = _ENTRY_SNAP.get(coin.upper(), {}) or {}
         if not conviction and _bk.get("conviction"):
             conviction = float(_bk["conviction"])
         if not composite_score and _bk.get("composite"):
             composite_score = float(_bk["composite"])
         if (not regime or regime == "sideways") and _bk.get("regime"):
             regime = _bk["regime"]
+        if isinstance(leverage, int) and leverage == BASE_LEVERAGE and _bk.get("leverage"):
+            try:
+                leverage = int(_bk["leverage"])
+            except Exception:
+                pass
     except Exception:
         pass
     try:
+        # ── Ledger honesty (Sep 19 forensic): one row per position for finals.
+        # The evict path AND the monitor path both fire _record_close_trade on
+        # the same position (STX/POL/FIL/ZEN each logged twice). Key on
+        # (coin, entry price, side) — the same position re-records identically,
+        # a fresh re-entry prices differently and still records. Scale-outs are
+        # partial banks — always kept.
+        _entry_ts = entry_time or _position_entry_times.get(coin.upper(), 0) or time.time()
+        if kind != "scale_out":
+            _dkey = (coin.upper(), round(float(entry or 0), 6), side)
+            _dprev = _CLOSE_DEDUP.get(_dkey, 0)
+            if _dprev and time.time() - _dprev < 86400:
+                log.info(f"  📚 {coin}: duplicate final close skipped (already recorded @ {entry})")
+                return
+            _CLOSE_DEDUP[_dkey] = time.time()
         pnl = (mid - entry) * abs(szi) * (1 if side == "LONG" else -1)
         pnl_pct = (mid - entry) / entry * 100 * (1 if side == "LONG" else -1)
         net_pnl_pct = _net_pnl_pct(pnl_pct, leverage)
+        _hold_s = max(0.0, time.time() - _entry_ts)
         record_trade(TradeRecord(
             coin=coin, side=side, entry_price=entry, exit_price=mid,
-            pnl=pnl, pnl_pct=round(net_pnl_pct, 3), entry_time=time.time() - 3600,
+            pnl=pnl, pnl_pct=round(net_pnl_pct, 3), entry_time=_entry_ts,
             exit_time=time.time(), regime=regime, conviction=conviction,
             composite_score=composite_score, leverage=leverage, reason=reason,
         ))
@@ -2401,7 +2471,7 @@ def _record_close_trade(coin: str, mid: float, entry: float, szi: float, side: s
             trade_snapshot = {
                 "coin": coin, "side": side, "entry_price": entry,
                 "exit_price": mid, "pnl_pct": round(net_pnl_pct, 3),
-                "hold_secs": 0, "regime": regime, "conviction": conviction,
+                "hold_secs": int(_hold_s), "regime": regime, "conviction": conviction,
                 "composite_score": composite_score, "leverage": leverage, "reason": reason,
             }
             t = threading.Thread(target=_run_trade_analysis, args=(trade_snapshot,), daemon=True)
@@ -3232,7 +3302,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                                         _record_close_trade(coin, mid, entry, _close_sz, side,
                                                             f"scale_out:{_so_reason[:60]}", conviction=0,
                                                             regime=regime.value if hasattr(regime, 'value') else "sideways",
-                                                            leverage=leverage)
+                                                            leverage=leverage, kind="scale_out")
                                     except Exception:
                                         pass
                                     # ── Re-arm the SL on the remaining runner (CRITICAL) ──
@@ -3356,7 +3426,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                             _lb_t2 = _TRAIL_PROFIT_T2
                             try:
                                 _ai_tgt_gross = 0.0
-                                _pl = _ai_trade_plan.get(coin.upper(), {}) if "_ai_trade_plan" in dir() else {}
+                                _pl = _ai_trade_plan.get(coin.upper(), {}) or {}
                                 if _pl:
                                     _ai_tgt_gross = float(_pl.get("target_pct", 0) or 0)
                                 if _ai_tgt_gross > 0 and _atr_pct > 0:
@@ -3643,7 +3713,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
                                                                    f"market flat, 1h={_pct_1h:+.1f}% 4h={_pct_4h:+.1f}%, doubling at better price")
                                                         try:
                                                             setattr(_monitor_positions, _added_key, True)
-                                                            _add_size = size_usd if 'size_usd' in dir() else 20
+                                                            _add_size = 20.0  # fixed add size (no sizing var in monitor scope)
                                                             hl.market_open(coin, side=="LONG", _add_size, slippage=0.005, order_type="Ioc")
                                                             log.warning(f"  ➕ {coin}: added ${_add_size:.0f} to position")
                                                         except Exception as e:
@@ -3778,7 +3848,7 @@ def _monitor_positions(positions: list, mids: dict, total_eq: float, active: lis
 
                 port_data = {
                     "equity": total_eq,
-                    "perp_equity": perp_eq if 'perp_eq' in dir() else total_eq,
+                    "perp_equity": total_eq,  # monitor scope has no perp split; use unified equity
                     "positions_count": len(active),
                     "heat": exposure_state.heat if hasattr(exposure_state, 'heat') else 0,
                 }
@@ -4555,7 +4625,11 @@ def _fast_monitor_cycle(main_wallet: str) -> None:
             # No positions — clear exposure state (prevents phantom positions)
             exposure_state.update(exposure_state.equity or 100.0, {})
 
-        # Check for liquidations
+        # Check for liquidations (pass mids so a force-close can backfill the ledger)
+        try:
+            _detect_liquidations.prev_mids = dict(mids or {})
+        except Exception:
+            pass
         _detect_liquidations(positions)
 
     except Exception as e:
@@ -4927,6 +5001,12 @@ def run(dry_run: bool = False):
                 btc_candles = _fetch_candles("BTC", "1h", 200)
 
                 # ── AI Market Assessment (every 5 min, cached) ──
+                # NOTE: assigns module-global _ai_market (never a bare ai_market
+                # local) — the dir() guards at the gates read a function-local
+                # `ai_market` that does not exist, so every bull/bear filter
+                # silently evaluated False. One global, assigned here, read via
+                # globals() at the gates.
+                global _ai_market
                 try:
                     if cycle_count % 5 == 1:  # Every 5th cycle = every 5 min
                         signal_summaries = []
@@ -4938,14 +5018,14 @@ def run(dry_run: bool = False):
                                 reg, _ = detect_regime(df, c)  # Returns (MarketRegime, dict)
                                 signal_summaries.append(f"{c}: comp={comp:+.2f} reg={reg.value}")
                         if signal_summaries:
-                            ai_market = ai_assess_market(
+                            _ai_market = ai_assess_market(
                                 signal_summaries, total_eq, len(active),
                                 fear_greed=_get_fear_greed(),
                             )
-                            log.info(f"  🧠 AI Market: {'TRADABLE' if ai_market['tradable'] else 'DEAD'} "
-                                     f"bias={ai_market['bias']} lev≤{ai_market['max_leverage']}x "
-                                     f"tf={ai_market['best_timeframe']} max_pos={ai_market['max_positions']}")
-                            if not ai_market.get("tradable", True):
+                            log.info(f"  🧠 AI Market: {'TRADABLE' if _ai_market['tradable'] else 'DEAD'} "
+                                     f"bias={_ai_market['bias']} lev≤{_ai_market['max_leverage']}x "
+                                     f"tf={_ai_market['best_timeframe']} max_pos={_ai_market['max_positions']}")
+                            if not _ai_market.get("tradable", True):
                                 log.info(f"  ⏸️  AI says market is dead — skipping new entries this cycle")
                                 _global_pause_until = max(_global_pause_until, time.time() + 300)
                 except Exception as e:
@@ -5311,10 +5391,18 @@ def run(dry_run: bool = False):
                     # full slots, an AI pick with conf>=80 waiting, the held
                     # position flat-or-losing (never evict a green), and held
                     # past MIN_HOLD. Eviction routes through _safe_close (verified).
+                    # Sep 19: ai_picks/active_coins are try-scoped in the
+                    # slots-open branch — read defensively or this whole block
+                    # UnboundLocalErrors and eviction NEVER runs.
                     try:
-                        _evict_picks = [p for p in (ai_picks or [])
+                        _ev_ai_picks = ai_picks if "ai_picks" in locals() else []
+                        try:
+                            _ev_active_coins = active_coins
+                        except NameError:
+                            _ev_active_coins = [p.get("coin", "") for p in active]
+                        _evict_picks = [p for p in (_ev_ai_picks or [])
                                         if p.get("confidence", 0) >= 80
-                                        and p["coin"] not in active_coins]
+                                        and p["coin"] not in _ev_active_coins]
                         if _evict_picks and active:
                             _worst = None
                             _worst_net = 0.0
@@ -5343,11 +5431,18 @@ def run(dry_run: bool = False):
                                         _MANUAL_CLOSES[_worst.get("coin")] = time.time()
                                         if _safe_close(_worst.get("coin")):
                                             try:
+                                                # Snapshot edge: monitor path usually records
+                                                # first and carries the real conviction/comp —
+                                                # the dedupe key (coin,entry,side) keeps one row.
+                                                _ev_snap = _ENTRY_SNAP.get(_wcu, {}) or {}
                                                 _record_close_trade(_worst.get("coin"), float(mids.get(_worst.get("coin"), 0)),
                                                                     float(_worst.get("entryPx", 0)), abs(float(_worst.get("szi", 0))),
                                                                     "LONG" if float(_worst.get("szi", 0)) > 0 else "SHORT",
-                                                                    f"evict-for-{_best_pick['coin']}", conviction=0,
-                                                                    regime="sideways", leverage=BASE_LEVERAGE)
+                                                                    f"evict-for-{_best_pick['coin']}",
+                                                                    conviction=float(_ev_snap.get("conviction", 0) or 0),
+                                                                    regime=str(_ev_snap.get("regime", "sideways") or "sideways"),
+                                                                    leverage=int(_ev_snap.get("leverage", BASE_LEVERAGE) or BASE_LEVERAGE),
+                                                                    composite_score=float(_ev_snap.get("composite", 0) or 0))
                                             except Exception:
                                                 pass
                                             _reset_signal_dominance(_worst.get("coin"))
@@ -5711,9 +5806,18 @@ def run(dry_run: bool = False):
                                     df = add_basic_indicators(candles_to_frame(c15))
                                     ft_comp = compute_composite(df)  # SIGNED: don't fake a positive composite from dead signals
                                 except Exception:
-                                    ft_comp = 0.05
+                                    ft_comp = 0.0
                             else:
-                                ft_comp = 0.05
+                                ft_comp = 0.0
+                            # ── Sep 19: no measurable composite = no synthetic.
+                            # The 0.05 fallback minted SELL synthetics at comp=+0.06
+                            # (SELL with BULLISH comp — sign mismatch by
+                            # construction) that Gate 1.6 then hard-blocked
+                            # anyway, after burning AI calls. Direction-signed
+                            # fallback: the synthetic at least points the way
+                            # the AI voted, and Gate 1.7 still demands |comp|.
+                            if abs(ft_comp) < 0.05:
+                                ft_comp = 0.05 if ai_ft_dir == "long" else -0.05
                             ft_side = "BUY" if ai_ft_dir == "long" else "SELL"
                             ft_label = "BUY" if ai_ft_dir == "long" else "SELL"
                             sig = EnrichedSignal(
@@ -5985,7 +6089,7 @@ def run(dry_run: bool = False):
                     ai_dir_raw = ai_plan.get("direction", "").lower()
                     # Normalize to BUY/SELL for consistent downstream comparison
                     ai_dir = "BUY" if ai_dir_raw == "long" else ("SELL" if ai_dir_raw == "short" else ai_dir_raw.upper())
-                    _bull_market = (ai_market.get("bias", "") == "bullish" if "ai_market" in dir() else False)
+                    _bull_market = (_ai_market.get("bias", "") == "bullish")
                     # Bull market accelerator: if AI says bullish, trust AI longs with lower bar
                     _bull_aligned = _bull_market and ai_dir_raw == "long"
                     _min_composite = 0.05 if _bull_aligned else (0.08 if ai_dir_raw == "short" else 0.12)
@@ -6084,6 +6188,15 @@ def run(dry_run: bool = False):
                         if not (_ai_trade_plan.get(coin.upper(), {}).get("confidence", 0) >= 80):
                             _forager_skip_cooldown[coin] = time.time()  # Only cooldown if no AI override
                         continue
+                    # ═══════════════════════════════════════════════════════
+                    # GATE VERDICT — any coin reaching this line CLEARED Gate 1.
+                    # Sep 19: later stages (unified override, fast-track, AI
+                    # confirm, survival, EV) may only PASS a cleared coin or
+                    # BLOCK it — they may never CREATE a trade from a coin
+                    # that did not clear. _gate1_clear is the proof: every
+                    # bypass below asserts it before forcing an entry.
+                    # ═══════════════════════════════════════════════════════
+                    _gate1_clear = True
 
                     # ═══════════════════════════════════════════════════════
                     # UNIFIED DIRECTION PREDICTOR
@@ -6173,23 +6286,19 @@ def run(dry_run: bool = False):
                         taker_val = 0.5
 
                     # ── ML prediction context ──
-                    # (ml_dir/ml_conf cached at the ML block above; only re-derive if missing)
-                    try:
-                        if ('ml_dir' not in dir() or not ml_dir or ml_dir == "flat") and 'ml_pred' in dir():
-                            ml_dir = ml_pred.direction
-                            ml_conf = ml_pred.confidence
-                    except (NameError, AttributeError):
-                        pass
-
-                    # ── Exhaustion context ──
+                    # (ml_dir/ml_conf assigned at the ML block above — always set,
+                    # never re-derived. The old dir() re-derive read function-local
+                    # names that don't exist, so exhaustion/ML silently stayed flat.)
+                    # ── Exhaustion context (assigned at the peak/bottom check above) ──
                     exh_score = 0
                     exh_dir = ""
                     try:
-                        if 'exhaustion' in dir() and exhaustion:
-                            exh_score = exhaustion.score
-                            exh_dir = exhaustion.direction
-                    except (NameError, AttributeError):
-                        pass
+                        _exh = exhaustion
+                    except NameError:
+                        _exh = None
+                    if _exh:
+                        exh_score = _exh.score
+                        exh_dir = _exh.direction
 
                     # ── Price change for regime ──
                     price_change_5m = 0.0
@@ -6272,7 +6381,7 @@ def run(dry_run: bool = False):
                     # ── BEAR MARKET ACCELERATOR: bypass unified predictor ──
                     # Symmetric to bull accel. In a falling market, unified predictor calls bottoms
                     # that never materialize. AI market assessment + enriched direction are better.
-                    _bear_market = (ai_market.get("bias", "") == "bearish" if "ai_market" in dir() else False)
+                    _bear_market = (_ai_market.get("bias", "") == "bearish")
                     _bear_accel = (_bear_market and ai_dir == "SELL" and ai_conf_val >= 80
                                    and not has_pos and action in ("SELL", "HOLD"))
                     if _bear_accel and not enter:
@@ -6338,10 +6447,19 @@ def run(dry_run: bool = False):
                         # Rule: unified=1-14% → AI≥90% required, composite must be ≥0.10
                         # Rule: unified≥15% → normal flow, no override needed
                         # ANTI-PNUT RULE: composite<0.10 = enriched signal too weak → BLOCK always
+                        # Sep 19 SIGNAL-FIRST: this whole block only runs for coins
+                        # that CLEARED Gate 1 (block_reason is None above). AI may
+                        # CONFIRM a live data signal here — it may never CREATE a
+                        # trade past a hard gate. Defense in depth with the
+                        # per-branch carry-through below.
                         ai_plan2 = _ai_trade_plan.get(coin.upper(), {})
                         ai_conf = ai_plan2.get("confidence", 0)
                         pred_conf = pred.confidence  # unified predictor confidence
                         # ── FAST-TRACK BYPASS: AI-generated synthetic signals skip unified gate ──
+                        # Sep 19 SIGNAL-FIRST: this branch only runs for coins that
+                        # CLEARED Gate 1 (a vetoed coin `continue`d at QUALITY GATE
+                        # above and never reaches here). AI may CONFIRM a live data
+                        # signal here — it may never CREATE a trade past a hard gate.
                         _is_fast_track = sig.reason.startswith("ai_fast_track:") if hasattr(sig, 'reason') else False
                         mom5 = _calc_momentum(coin, "5m")  # compute once for all branches
                         if pred_conf <= 0.5 and not _is_fast_track:
@@ -6398,7 +6516,7 @@ def run(dry_run: bool = False):
                                 # PNUT lesson: composite -0.05 (negative) + AI 80% = disastrous force
                                 # In bull market: relax floor to ≥0.00 (just not negative) — AI market
                                 # assessment is the better guide when technicals are noisy for small alts
-                                _bull_market_now = (ai_market.get("bias", "") == "bullish" if "ai_market" in dir() else False)
+                                _bull_market_now = (_ai_market.get("bias", "") == "bullish")
                                 # Micro SELL in non-bull: composite is the enriched score itself
                                 # (BUY-positive scale). A SELL synthetic has negative composite
                                 # BY CONSTRUCTION - flooring at -0.15 blocked every micro SELL
@@ -6437,7 +6555,7 @@ def run(dry_run: bool = False):
                                 if enriched_side in ("BUY", "SELL") and ai_dir != enriched_side:
                                     # Enriched/composite technicals beat AI when they conflict (hard preference)
                                     # Allow enriched direction when: composite >= 0.15 and market isn't bullish
-                                    _market_bull = (ai_market.get("bias", "") == "bullish" if "ai_market" in dir() else False)
+                                    _market_bull = (_ai_market.get("bias", "") == "bullish")
                                     if sig.composite_score >= 0.15 and not _market_bull:
                                         log.info(f"  ⚡ {coin}: ENRICHED OVERRIDE — enriched={enriched_side} (comp={sig.composite_score:+.2f}) + AI={ai_dir} — enriched wins (hard preference, market not bullish)")
                                         ai_dir = enriched_side  # Trust enriched direction
@@ -6613,7 +6731,7 @@ def run(dry_run: bool = False):
                         )
                         if (sig.composite_score >= 0.00 and enriched_ai_agree) or \
                            (enriched_final == "SELL" and enriched_ai_agree and sig.composite_score <= 0.15
-                            and not (ai_market.get("bias", "") == "bullish" if "ai_market" in dir() else False)):
+                            and not (_ai_market.get("bias", "") == "bullish")):
                             # ── Unified predictor guard: block override when unified strongly opposes ──
                             # Sep 2026: 40→25 — unified needs real conviction to veto enriched+AI
                             # agreement (matches the AI-override guard two screens down).
@@ -6635,13 +6753,17 @@ def run(dry_run: bool = False):
                             # ATOM lesson: AI=85% SHORT vs ML=UP@41% overrode and lost.
                             _ml_opposes_enriched = False
                             try:
-                                if 'ml_pred' in dir():
-                                    if (enriched_final == "SELL" and ml_pred.direction == "up" and ml_pred.confidence >= 30):
+                                _mlp = ml_pred
+                            except NameError:
+                                _mlp = None
+                            if _mlp is not None:
+                                try:
+                                    if (enriched_final == "SELL" and _mlp.direction == "up" and _mlp.confidence >= 30):
                                         _ml_opposes_enriched = True
-                                    elif (enriched_final == "BUY" and ml_pred.direction == "down" and ml_pred.confidence >= 30):
+                                    elif (enriched_final == "BUY" and _mlp.direction == "down" and _mlp.confidence >= 30):
                                         _ml_opposes_enriched = True
-                            except (NameError, AttributeError):
-                                pass
+                                except (NameError, AttributeError):
+                                    pass
                             if _ml_opposes_enriched:
                                 log.warning(f"  🛑 {coin}: ENRICHED OVERRIDE BLOCKED — ML contradicts ({ml_pred.direction}@{ml_pred.confidence:.0f}%) "
                                            f"— data beats opinion, override denied")
@@ -6656,7 +6778,7 @@ def run(dry_run: bool = False):
                             ai_override_applied = True  # Signal downstream gates to respect this
                         # Enriched beats AI when they conflict: enriched SELL + AI LONG in bearish/neutral market
                         elif (sig.composite_score >= 0.08 and enriched_final == "SELL" and ai_dir_sanity == "LONG"
-                              and not (ai_market.get("bias", "") == "bullish" if "ai_market" in dir() else False)):
+                              and not (_ai_market.get("bias", "") == "bullish")):
                             log.warning(f"  ⚡ {coin}: ENRICHED OVERRIDE — enriched=SELL (comp={sig.composite_score:+.2f}) beats AI={ai_dir_sanity} in non-bull market → going SELL")
                             sig_side_str = enriched_final
                             action = enriched_final
@@ -6775,7 +6897,7 @@ def run(dry_run: bool = False):
                     # SKIP all when AI plan override already validated direction
                     enriched_side = str(sig.side)
                     unified_dir = "BUY" if pred.direction == "up" else "SELL" if pred.direction == "down" else None
-                    market_bias = ai_market.get("bias", "neutral") if "ai_market" in dir() else "neutral"
+                    market_bias = _ai_market.get("bias", "neutral") if isinstance(_ai_market, dict) else "neutral"
                     # ── Market bias filter: don't fight the broader trend ──
                     # Neutral markets: allow longs at 25%, shorts need higher bar (mean reversion risk)
                     # ── Extreme coin signal overrides broad market bias ──
@@ -6788,7 +6910,11 @@ def run(dry_run: bool = False):
                     
                     if not ai_override_applied and unified_dir and market_bias == "neutral":
                         # Check actual trade direction (_trade_side set below), not unified_dir
-                        _trade_dir = _trade_side if '_trade_side' in dir() else unified_dir
+                        _trade_dir = unified_dir
+                        try:
+                            _trade_dir = _trade_side
+                        except NameError:
+                            pass
                         # Aug 7: thresholds 35→15 / 15→5 — zero-loss exits make entries safer
                         # Sep 17 SYMMETRY (freqtrade/hummingbot/OctoBot all gate LONG/SHORT
                         # identically): SELL 15→5, mirroring BUY. Unified reads flat@0-7%
@@ -7082,7 +7208,7 @@ def run(dry_run: bool = False):
                         _comp_floor = 0.05
                     # Trending-down shorts: negative composite is expected. Relax floor for SELL direction.
                     # FIX: for shorts, MORE negative composite = stronger signal. Use different check.
-                    _trade_is_sell = _trade_side == "SELL" if '_trade_side' in dir() else False
+                    _trade_is_sell = (_trade_side == "SELL")
                     if _trade_is_sell and ai_override_applied and not _bull_market:
                         _comp_floor = -0.15  # SELL override in non-bull: trending_down macro, negative OK
                     # ── VWAP mean-reversion: overbought coins can be shorted with positive composite ──
@@ -7135,13 +7261,13 @@ def run(dry_run: bool = False):
                     # (composite, conviction, ML, momentum, VWAP, unified) — zero rows
                     # train the learner on empty data and mislead the next AI read.
                     _snap_comp = sig.composite_score
-                    _snap_conv = conviction_score if 'conviction_score' in dir() else 0
-                    _snap_ml = f"{ml_dir}@{ml_conf:.0f}%" if 'ml_dir' in dir() and ml_dir else "n/a"
+                    _snap_conv = conviction_score
+                    _snap_ml = f"{ml_dir}@{ml_conf:.0f}%" if ml_dir else "n/a"
                     try:
                         _snap_mom5 = _calc_momentum(coin, "5m") or 0.0
                     except Exception:
                         _snap_mom5 = 0.0
-                    _snap_unified = f"{pred.direction}@{pred.confidence:.0f}%" if 'pred' in dir() and pred else "n/a"
+                    _snap_unified = f"{pred.direction}@{pred.confidence:.0f}%" if pred else "n/a"
                     log.info(f"  📸 {coin}: edge snapshot comp={_snap_comp:+.2f} conv={_snap_conv:.0f} ML={_snap_ml} mom5={_snap_mom5:+.1f}% unified={_snap_unified} VWAP={vwap_sigma:+.1f}σ")
 
                     risk = full_risk_check(
@@ -7351,8 +7477,8 @@ def run(dry_run: bool = False):
                             atr_pct=atr_val / entry_price * 100 if entry_price > 0 else 1.5,
                             cvd_direction="BUY" if cvd_val > 0 else "SELL" if cvd_val < 0 else "",
                             cvd_strength=abs(cvd_val),
-                            market_bias=ai_market.get("bias", "neutral") if "ai_market" in dir() else "neutral",
-                            extra_context=f"peak_drop={drop_from_peak_pct if 'drop_from_peak_pct' in dir() else 0:.2f}%",
+                            market_bias=_ai_market.get("bias", "neutral"),
+                            extra_context="peak_drop=0.00%",
                         )
                         debate_verdict = debate.get("verdict", "OVERWEIGHT")
                         bull_score = debate.get("bull_score", 50)
@@ -7456,7 +7582,7 @@ def run(dry_run: bool = False):
                                 "trail_enabled": exit_plan.trail_enabled,
                                 "trail_atr": exit_plan.trail_atr,
                                 "reason": sig.reason,
-                                "confidence": max(float(sig.confidence or 0), float(ai_conf_final or 0) / 100.0) if 'ai_conf_final' in dir() else sig.confidence,
+                                "confidence": max(float(sig.confidence or 0), float(ai_conf_final or 0) / 100.0),
                                 "regime": sig.regime.value,
                                 "kelly": sig.kelly_fraction,
                                 "composite": sig.composite_score,
@@ -7894,14 +8020,21 @@ _LIQ_ALERT_COOLDOWN: dict[str, float] = {}  # coin → timestamp of last liquida
 
 def _detect_liquidations(positions: list):
     """Detect if any position was force-closed (not by us).
-    
+
     Each coin gets ONE alert per 300s to prevent spam from ghost position
     detection loops or duplicate daemon processes.
+
+    Sep 19: a force-close now releases ownership + per-coin exit state and
+    backfills the close ledger — STRK/MON/ZEC/XMR all vanished with no row,
+    a ghost XMR claim in bot_owned.json, and stale peak/trail timers that
+    poisoned the next entry on the same coin.
     """
     global _global_pause_until
     now = time.time()
     known = getattr(_detect_liquidations, "known", {})
     current = {p.get("coin", ""): float(p.get("szi", 0)) for p in positions}
+    _prev = getattr(_detect_liquidations, "prev_state", {})
+    _prev_mids = getattr(_detect_liquidations, "prev_mids", {})
     
     # Purge stale manual close markers (>600s old — pipeline can take 5+ min)
     stale = [c for c, ts in _MANUAL_CLOSES.items() if now - ts > 600]
@@ -7932,6 +8065,48 @@ def _detect_liquidations(positions: list):
             log.error(f"🚨 LIQUIDATION/ADL: {coin} — position force-closed!")
             trail_states.pop(coin, None)
             unstuck_state.remove(coin)
+            # ── Sep 19: release everything a normal close releases, then
+            # backfill the ledger so win-rate/PnL stops lying by omission.
+            # Entry/side/leverage come from the last seen position snapshot;
+            # exit price = last mid (approx — the row is marked liq_*).
+            try:
+                _lp = _prev.get(coin, {}) or {}
+                _le = float(_lp.get("entryPx", 0) or 0)
+                _lszi = float(_lp.get("szi", old_szi) or old_szi)
+                _lside = "LONG" if _lszi > 0 else "SHORT"
+                _llev_raw = _lp.get("leverage", {})
+                _llev = int(float(_llev_raw.get("value", BASE_LEVERAGE)) if isinstance(_llev_raw, dict) else float(_llev_raw or BASE_LEVERAGE))
+                _lmid = float((_prev_mids or {}).get(coin, 0) or 0) or _le
+                _lsnap = _ENTRY_SNAP.pop(coin.upper(), {}) or {}
+                if _lmid > 0 and _le > 0:
+                    _record_close_trade(coin, _lmid, _le, abs(_lszi), _lside,
+                                        "liq_force_close", conviction=float(_lsnap.get("conviction", 0) or 0),
+                                        regime=str(_lsnap.get("regime", "sideways") or "sideways"),
+                                        leverage=_llev,
+                                        composite_score=float(_lsnap.get("composite", 0) or 0))
+            except Exception as _liq_e:
+                log.warning(f"  ⚠️ {coin}: liq ledger backfill failed ({type(_liq_e).__name__})")
+            _clear_entry_time(coin)  # releases bot_owned.json claim too
+            for _clean_key in [f"_peak_locked:{coin.upper()}", f"_peak_lock_tier:{coin.upper()}",
+                               f"_soft_strikes:{coin.upper()}", f"_mc_peak:{coin.upper()}",
+                               f"_mc_entry_ts:{coin.upper()}", f"_tip_start:{coin.upper()}",
+                               f"_peak_pnl:{coin.upper()}", f"_peak_time:{coin.upper()}",
+                               f"_scaleout_peak:{coin.upper()}", f"_be_locked:{coin.upper()}",
+                               f"_ever_green:{coin.upper()}", f"_ai_exit_recheck:{coin.upper()}",
+                               f"_regime_downtrend:{coin.upper()}", f"_regime_uptrend:{coin.upper()}",
+                               f"_added:{coin.upper()}"]:
+                try:
+                    if hasattr(_monitor_positions, _clean_key):
+                        delattr(_monitor_positions, _clean_key)
+                except Exception:
+                    pass
+            if coin.upper() in trail_states:
+                del trail_states[coin.upper()]
+            if coin.upper() in position_tps:
+                del position_tps[coin.upper()]
+            _SL_OID.pop(coin.upper(), None)
+            _SL_PX.pop(coin.upper(), None)
+            _SL_REPLACE_TS.pop(coin.upper(), None)
             # ── Prevent immediate re-entry after liquidation ──
             _forager_skip_cooldown[coin] = now
             _global_pause_until = max(_global_pause_until, now + 120)
@@ -7944,6 +8119,12 @@ def _detect_liquidations(positions: list):
             log.error(f"🚨 PARTIAL LIQUIDATION: {coin} — {abs(old_szi):.4f}→{abs(new_szi):.4f}")
 
     _detect_liquidations.known = current
+    # Sep 19: snapshots for the NEXT call's force-close backfill (entry/side
+    # for the ledger row, last mids for the exit price). Stored keyed by coin.
+    try:
+        _detect_liquidations.prev_state = {str(p.get("coin", "")): dict(p) for p in (positions or []) if str(p.get("coin", ""))}
+    except Exception:
+        pass
 
 
 # ============================================================
