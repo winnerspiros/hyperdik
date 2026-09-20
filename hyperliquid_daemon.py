@@ -5315,7 +5315,7 @@ def run(dry_run: bool = False):
                                 "mom_5m": _calc_momentum(c, "5m"),
                                 "mom_15m": _calc_momentum(c, "15m"),
                                 "mom_1h": _calc_momentum(c, "1h"),
-                                "vwap_dist": round(_vwap_sigma * 100, 1),
+                                "vwap_dist": round(_vwap_sigma, 2),  # sigma units — matches ±1.5σ gates/prompt
                                 "_cvd": _cvd,
                                 "oi_delta": round(_oi_delta, 2),
                                 "_range_pct": round(vol * 3, 1),
@@ -5369,7 +5369,7 @@ def run(dry_run: bool = False):
                                                 _aligned, _mom_ok = False, False
                                             if not (_aligned and _mom_ok):
                                                 _p["confidence"] = 75
-                                                log.info(f"  📉 {_p.get('coin')}: AI conf {_pc}%→75% (uncalibrated: comp={_comp:+.2f} VWAP={_vwap:+.1f}% m1/m5/m15={_m1:+.1f}/{_m5:+.1f}/{_m15:+.1f} CVD={_cvd_tr or 'n/a'})")
+                                                log.info(f"  📉 {_p.get('coin')}: AI conf {_pc}%→75% (uncalibrated: comp={_comp:+.2f} VWAP={_vwap:+.2f}σ m1/m5/m15={_m1:+.1f}/{_m5:+.1f}/{_m15:+.1f} CVD={_cvd_tr or 'n/a'})")
                                     except Exception:
                                         pass
                             except Exception:

@@ -789,8 +789,8 @@ def _scan_batch(batch: list[dict], equity: float, market_context: str,
                recent_str: str, batch_id: int) -> list[dict]:
     """Scan one batch of candidates with AI — designed for ThreadPoolExecutor."""
     lines = []
-    vwap_ob_count = 0  # Count overbought (>+1%) coins for direction forcing
-    vwap_os_count = 0  # Count oversold (<-1%) coins
+    vwap_ob_count = 0  # Count overbought (>+1σ) coins for direction forcing
+    vwap_os_count = 0  # Count oversold (<-1σ) coins
     for c in batch:
         vwap_val = c.get('vwap_dist', 0) or 0
         if vwap_val > 1.0:
@@ -799,7 +799,7 @@ def _scan_batch(batch: list[dict], equity: float, market_context: str,
             vwap_os_count += 1
         oi_str = f" OI={c.get('oi_delta',0):+.1f}%" if c.get('oi_delta', 0) != 0 else ""
         fund_str = f" fund={c.get('funding',0):.4f}" if c.get('funding', 0) != 0 else ""
-        vwap_str = f" VWAP={c.get('vwap_dist',0):+.1f}%" if c.get('vwap_dist', 0) != 0 else ""
+        vwap_str = f" VWAP={c.get('vwap_dist',0):+.2f}σ" if c.get('vwap_dist', 0) != 0 else ""
         # CVD data
         _cvd = c.get('_cvd', {}) or {}
         cvd_str = ""
@@ -843,10 +843,10 @@ def _scan_batch(batch: list[dict], equity: float, market_context: str,
         + f"RULES: tgt>=1.0(stop=0.5-0.6,hold=30-45m) NETS ONLY ~0.5% after 0.54% 6x fees — prefer tgt>=1.5. "
         + f"LONG: m1>0.5%+m5 pos+CVD rising+comp>0.05. "
         + f"SHORT: m1<-0.5%+m5 neg+CVD falling+comp<-0.05. "
-        + f"CONF CALIBRATION: past 85s won ~28%, not 85%. Score 85+ ONLY when comp sign-aligned AND (unified>=15% aligned OR ML>=30% agrees) AND VWAP on your side (long<=+1.5%, short>=-1.5%). Else cap 75. "
+        + f"CONF CALIBRATION: past 85s won ~28%, not 85%. Score 85+ ONLY when comp sign-aligned AND (unified>=15% aligned OR ML>=30% agrees) AND VWAP on your side (long<=+1.5σ, short>=-1.5σ). Else cap 75. "
         + f"MOM QUALITY: prefer m1/m5/m15m same sign. mom5>+5% (long) or <-5% (short) = extended spike — do NOT chase, SKIP. "
-        + f"⚠️ VWAP RULES: NEVER buy when VWAP>+1.5% (overbought). NEVER short when VWAP<-1.5% (oversold). "
-        + f"Buy dips (VWAP<-1.5%), short pumps (VWAP>+1.5%). "
+        + f"⚠️ VWAP RULES (σ units): NEVER buy when VWAP>+1.5σ (overbought). NEVER short when VWAP<-1.5σ (oversold). "
+        + f"Buy dips (VWAP<-1.5σ), short pumps (VWAP>+1.5σ). "
         + f"Skip: flat mom5(<0.3%), dead enriched, no CVD, m1h>5% exhausted, comp>0.3 extreme. "
         + f"4h CONTEXT: 4h:+X%/-Y%@Z% means Z% in 4h range (0%=bottom,100%=top). "
         + f"Near 4h high (<5% below)=resistance, short ONLY with mom5 turning down+exhaustion signs. "
